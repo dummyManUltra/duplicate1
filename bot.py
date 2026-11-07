@@ -3397,14 +3397,20 @@ OCR_TIMEOUT = float(os.getenv("OCR_TIMEOUT", "30"))               # seconds per 
 OCR_TIME_BUDGET = float(os.getenv("OCR_TIME_BUDGET", "900"))      # seconds per dedup run; then pixels only
 OCR_MIN_CHARS = 25          # a frame with at least this many letters/digits "has text"
 OCR_NO_TEXT_CHARS = 10      # fewer than this = "no text" (in between = unsure, no opinion)
-OCR_SAME_RATIO = 0.995      # word-sequence similarity needed to call two texts "the same" (effectively: every word identical)
+OCR_MIN_CONF = float(os.getenv("OCR_MIN_CONF", "60"))   # ignore words Tesseract itself isn't sure about (0-100)
+OCR_WORD_MATCH_RATIO = 0.8  # two long words this alike count as the same word (OCR flips a letter or two)
+OCR_ALLOWED_CHANGED_WORDS = 1   # on a text with 12+ words, one stray word of OCR noise is tolerated
+# A cursor / pointer / overlay sitting on top of a word hides it: the text only LOSES
+# (or regains) a few words, nothing is replaced. On a text with 20+ words that is
+# tolerated, as long as it's this few words and one-sided.
+OCR_ALLOWED_ONE_SIDED_WORDS = int(os.getenv("OCR_ALLOWED_ONE_SIDED_WORDS", "2"))
 OCR_SKIP_PIXEL_DIFF = 2     # pixel diff this low = the very same image, no need to read it
-# Pixels differ MORE than the duplicate threshold, but the words are identical
-# (webcam, cursor, animated background...) -> still a duplicate, as long as the
-# frame has plenty of text and the picture didn't change wildly.
+# Pixels differ MORE than the duplicate threshold, but the words are the same
+# (webcam, cursor, laser pointer, animation...) -> still a duplicate, as long as
+# the frame has plenty of text and only a SMALL PART of the picture changed.
 OCR_MERGE_SAME_TEXT = os.getenv("DEDUP_OCR_MERGE", "1") != "0"
-OCR_MERGE_MIN_CHARS = 60
-OCR_MERGE_MAX_PIXEL_DIFF = int(os.getenv("OCR_MERGE_MAX_PIXEL_DIFF", "60"))   # 0-255, same scale as the pixel threshold
+OCR_MERGE_MIN_CHARS = 40
+OCR_MERGE_MAX_CHANGED_AREA = float(os.getenv("OCR_MERGE_MAX_CHANGED_AREA", "0.15"))   # share of the picture allowed to differ
 
 # ============================================================
 # Compression levels
@@ -5443,6 +5449,16 @@ def signature_diff(sig_a: bytes | None, sig_b: bytes | None) -> int | None:
     return max(abs(a - b) for a, b in zip(sig_a, sig_b))
 
 
+def signature_changed_fraction(sig_a: bytes | None, sig_b: bytes | None, cell_threshold: float) -> float | None:
+    """Share (0-1) of the picture's cells that differ by more than cell_threshold — a cursor or webcam box is a few %, a new picture is much more."""
+
+    if not sig_a or not sig_b or len(sig_a) != len(sig_b):
+        return None
+
+    changed = sum(1 for a, b in zip(sig_a, sig_b) if abs(a - b) > cell_threshold)
+    return changed / len(sig_a)
+
+
 def frames_are_near_identical(sig_a: bytes, sig_b: bytes, threshold: float) -> bool:
     """
     Compares the two frames' grids cell-by-cell and looks at the
@@ -5546,12 +5562,42 @@ def ocr_char_count(text: str) -> int:
     return len(text.replace(" ", ""))
 
 
-def ocr_text_ratio(text_a: str, text_b: str) -> float:
-    """0..1 — how much of the two texts' word sequence matches."""
+def ocr_word_differences(text_a: str, text_b: str) -> tuple[int, int]:
+    """
+    (words only in the first text, words only in the second text). Words are lined up
+    in order; where they don't match, look-alike long words (an OCR flipped letter)
+    are paired up and not counted. A truly replaced word shows up on BOTH sides.
+    """
     words_a, words_b = text_a.split(), text_b.split()
-    if not words_a and not words_b:
-        return 1.0
-    return difflib.SequenceMatcher(None, words_a, words_b, autojunk=False).ratio()
+    matcher = difflib.SequenceMatcher(None, words_a, words_b, autojunk=False)
+    only_a = only_b = 0
+
+    for tag, a1, a2, b1, b2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+
+        leftovers = list(words_b[b1:b2])
+        for word in words_a[a1:a2]:
+            match = None
+            if len(word) >= 5:
+                for candidate in leftovers:
+                    if (
+                        len(candidate) >= 5
+                        and difflib.SequenceMatcher(None, word, candidate).ratio() >= OCR_WORD_MATCH_RATIO
+                    ):
+                        match = candidate
+                        break
+            if match is not None:
+                leftovers.remove(match)
+            else:
+                only_a += 1
+        only_b += len(leftovers)
+
+    return only_a, only_b
+
+
+def ocr_changed_word_count(text_a: str, text_b: str) -> int:
+    return sum(ocr_word_differences(text_a, text_b))
 
 
 def ocr_verdict(text_a: str | None, text_b: str | None) -> bool | None:
@@ -5568,7 +5614,19 @@ def ocr_verdict(text_a: str | None, text_b: str | None) -> bool | None:
     a_none, b_none = len_a < OCR_NO_TEXT_CHARS, len_b < OCR_NO_TEXT_CHARS
 
     if a_has and b_has:
-        return ocr_text_ratio(text_a, text_b) >= OCR_SAME_RATIO
+        word_count = max(len(text_a.split()), len(text_b.split()))
+        only_a, only_b = ocr_word_differences(text_a, text_b)
+        changed = only_a + only_b
+
+        if changed <= (OCR_ALLOWED_CHANGED_WORDS if word_count >= 12 else 0):
+            return True
+
+        # One-sided (words only vanished / only reappeared) = something covered them.
+        return (
+            word_count >= 20
+            and min(only_a, only_b) == 0
+            and changed <= OCR_ALLOWED_ONE_SIDED_WORDS
+        )
     if (a_has and b_none) or (b_has and a_none):
         return False
     return None
@@ -5584,7 +5642,7 @@ async def ocr_frame_text(frame_path: str) -> str | None:
 
     try:
         process = await asyncio.create_subprocess_exec(
-            "tesseract", str(frame_path), "stdout", "-l", OCR_LANGS, "--psm", "11",
+            "tesseract", str(frame_path), "stdout", "-l", OCR_LANGS, "--psm", "11", "tsv",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             env=env,
@@ -5607,7 +5665,22 @@ async def ocr_frame_text(frame_path: str) -> str | None:
         logger.warning("OCR failed (exit %s) on %s", process.returncode, frame_path)
         return None
 
-    return ocr_normalize(stdout.decode("utf-8", errors="replace"))
+    # TSV columns: level page block par line word left top width height conf text.
+    # Only words Tesseract is confident about are kept — the shaky ones are the
+    # ones that flicker between two otherwise identical frames.
+    words: list[str] = []
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        columns = line.split("\t")
+        if len(columns) < 12 or columns[0] != "5":
+            continue
+        try:
+            confidence = float(columns[10])
+        except ValueError:
+            continue
+        if confidence >= OCR_MIN_CONF:
+            words.append(columns[11])
+
+    return ocr_normalize(" ".join(words))
 
 
 async def dedup_frames(
@@ -5706,8 +5779,13 @@ async def dedup_frames(
                     if verdict is False:
                         is_duplicate = False
                         ocr_kept += 1
-                elif not is_duplicate and merge_enabled and diff <= OCR_MERGE_MAX_PIXEL_DIFF:
-                    # Pixels moved, but are the words exactly the same?
+                elif (
+                    not is_duplicate
+                    and merge_enabled
+                    and (signature_changed_fraction(signature, last_kept_signature, threshold) or 0.0)
+                    <= OCR_MERGE_MAX_CHANGED_AREA
+                ):
+                    # Only a small part of the picture moved (cursor, webcam...): are the words the same?
                     text_a, text_b = await text_of(last_kept_path), await text_of(path)
                     if (
                         text_a is not None
