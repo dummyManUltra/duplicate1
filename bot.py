@@ -8535,16 +8535,17 @@ async def delete_pdf_slides(
         pdf_bytes = await asyncio.to_thread(img2pdf.convert, [str(path) for path in kept_paths])
         pdf_path.write_bytes(pdf_bytes)
 
-        await with_retries(
-            context.bot.send_document,
-            chat_id=pending["chat_id"],
-            document=str(pdf_path),
-            filename="frames_edited.pdf",
-            caption=MSG_DELETE_SLIDES_DONE.format(
-                deleted=" ".join(map(str, numbers)), remaining=len(kept_paths)
-            ),
-            reply_markup=post_pdf_keyboard(message_id, dedup_available=len(kept_paths) > 1),
-        )
+        with named_for_upload(pdf_path, "frames_edited.pdf") as send_path:
+            await with_retries(
+                context.bot.send_document,
+                chat_id=pending["chat_id"],
+                document=str(send_path),
+                filename="frames_edited.pdf",
+                caption=MSG_DELETE_SLIDES_DONE.format(
+                    deleted=" ".join(map(str, numbers)), remaining=len(kept_paths)
+                ),
+                reply_markup=post_pdf_keyboard(message_id, dedup_available=len(kept_paths) > 1),
+            )
         with contextlib.suppress(Exception):
             await status.delete()
 
@@ -8703,6 +8704,35 @@ PDFX_SEND_AN_IMAGE = "I'm waiting for an image — send a photo, or tap Back."
 PDFX_THUMB_FAILED = "⚠️ I couldn't read that image. Please send a normal JPG/PNG picture."
 
 pdf_file_sessions: dict[int, dict] = {}   # chat_id -> the open PDF list
+
+
+@contextlib.contextmanager
+def named_for_upload(path, filename: str | None):
+    """
+    The bot talks to a LOCAL Bot API server, which uploads a file by its path on disk and
+    ignores the `filename=` argument — so the name people see is whatever the temp file is
+    called (in_1.pdf, out_1.pdf, frames.pdf...). This gives the file its intended name just
+    for the upload: a hard link (free, no extra disk) in a throw-away folder, removed after.
+    Use:  with named_for_upload(path, "My name.pdf") as send_path: ... document=str(send_path)
+    """
+    path = Path(path)
+    name = (filename or path.name).replace("/", "-").replace("\\", "-").strip() or path.name
+
+    if len(name) > 150:   # keep well under the 255-byte file-name limit, extension intact
+        suffix = Path(name).suffix[:15]
+        name = name[: 150 - len(suffix)] + suffix
+
+    folder = Path(tempfile.mkdtemp(prefix="send_", dir=path.parent))
+    target = folder / name
+
+    try:
+        try:
+            os.link(path, target)
+        except OSError:
+            shutil.copy2(path, target)   # different filesystem / links not allowed
+        yield target
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def is_pdf_document(document) -> bool:
@@ -9078,14 +9108,15 @@ async def pdf_download(context, entry: dict, path: Path) -> None:
 
 async def pdf_send(context, chat_id: int, session: dict, path: Path, filename: str, caption: str) -> None:
     thumb = session.get("thumb_path")
-    await with_retries(
-        context.bot.send_document,
-        chat_id=chat_id,
-        document=str(path),
-        filename=filename,
-        caption=caption,
-        thumbnail=str(thumb) if thumb and Path(thumb).exists() else None,
-    )
+    with named_for_upload(path, filename) as send_path:
+        await with_retries(
+            context.bot.send_document,
+            chat_id=chat_id,
+            document=str(send_path),
+            filename=filename,
+            caption=caption,
+            thumbnail=str(thumb) if thumb and Path(thumb).exists() else None,
+        )
 
 
 async def run_pdf_job(
@@ -9815,13 +9846,14 @@ async def handle_rar_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE
             await post_status(f"⬆️ Sending {number}/{total}: {path.name[:60]}")
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
 
-            await with_retries(
-                context.bot.send_document,
-                chat_id=chat_id,
-                document=str(path),
-                filename=send_name,
-                caption=f"📦 {relative[:300]} · {format_size(file_size)}",
-            )
+            with named_for_upload(path, send_name) as send_path:
+                await with_retries(
+                    context.bot.send_document,
+                    chat_id=chat_id,
+                    document=str(send_path),
+                    filename=send_name,
+                    caption=f"📦 {relative[:300]} · {format_size(file_size)}",
+                )
             sent_count += 1
 
             # Free the space right away, before the next file.
@@ -10577,21 +10609,22 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 pdf_path.write_bytes(pdf_bytes)
                 del pdf_bytes
 
-                await with_retries(
-                    context.bot.send_document,
-                    chat_id=chat_id,
-                    document=str(pdf_path),
-                    filename=f"frames_part{part}.pdf",
-                    caption=MSG_PDF3_PART_CAPTION.format(
-                        part=part,
-                        start=start_text,
-                        end=end_text,
-                        kept=len(kept_paths),
-                        sampled=len(candidate_paths),
-                        interval=interval,
-                        threshold=threshold_used,
-                    ),
-                )
+                with named_for_upload(pdf_path, f"frames_part{part}.pdf") as send_path:
+                    await with_retries(
+                        context.bot.send_document,
+                        chat_id=chat_id,
+                        document=str(send_path),
+                        filename=f"frames_part{part}.pdf",
+                        caption=MSG_PDF3_PART_CAPTION.format(
+                            part=part,
+                            start=start_text,
+                            end=end_text,
+                            kept=len(kept_paths),
+                            sampled=len(candidate_paths),
+                            interval=interval,
+                            threshold=threshold_used,
+                        ),
+                    )
 
                 total_kept += len(kept_paths)
 
@@ -10679,16 +10712,17 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             pdf_bytes = img2pdf.convert([str(path) for path in kept_paths])
             pdf_path.write_bytes(pdf_bytes)
 
-            await with_retries(
-                context.bot.send_document,
-                chat_id=chat_id,
-                document=str(pdf_path),
-                filename="frames_deduped.pdf",
-                caption=(
-                    MSG_REMOVED_NEAR_DUPLICATE_FRAME_S.format(count_removed_paths=len(removed_paths), count_kept_paths=len(kept_paths), threshold_used=threshold_used)
-                ),
-                reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
-            )
+            with named_for_upload(pdf_path, "frames_deduped.pdf") as send_path:
+                await with_retries(
+                    context.bot.send_document,
+                    chat_id=chat_id,
+                    document=str(send_path),
+                    filename="frames_deduped.pdf",
+                    caption=(
+                        MSG_REMOVED_NEAR_DUPLICATE_FRAME_S.format(count_removed_paths=len(removed_paths), count_kept_paths=len(kept_paths), threshold_used=threshold_used)
+                    ),
+                    reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
+                )
 
         except Exception as error:
             logger.exception("Error deduplicating frames:")
