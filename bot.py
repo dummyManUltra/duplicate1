@@ -3412,6 +3412,20 @@ OCR_MERGE_SAME_TEXT = os.getenv("DEDUP_OCR_MERGE", "1") != "0"
 OCR_MERGE_MIN_CHARS = 40
 OCR_MERGE_MAX_CHANGED_AREA = float(os.getenv("OCR_MERGE_MAX_CHANGED_AREA", "0.15"))   # share of the picture allowed to differ
 
+# ---- laser pointer / cursor dot ----
+# Lecture videos are full of a small coloured dot (laser pointer) wandering over an
+# otherwise identical slide. It's recognised by shape, no OCR needed: a handful of
+# changed cells on a fine colour grid, in 1-3 small blobs, each with a strongly
+# coloured cell. A real edit (a word, a number, a new line) is wider or not coloured.
+POINTER_ENABLED = os.getenv("DEDUP_POINTER", "1") != "0"
+POINTER_GRID_W, POINTER_GRID_H = 160, 90
+POINTER_CELL_DIFF = 30          # a grid cell counts as changed from this colour difference (0-255)
+POINTER_MAX_CELLS = 24          # more changed cells than this = a real change, not a dot
+POINTER_MAX_CLUSTERS = 3        # the dot's old spot + its new spot (+ one spare)
+POINTER_MAX_SPAN = 6            # a blob is at most this many cells wide / tall (~4% of the frame width)
+POINTER_MIN_COLOUR = int(os.getenv("POINTER_MIN_COLOUR", "40"))   # a blob needs one cell this colourful (strongest channel minus the next)
+POINTER_COARSE_GATE = 0.05      # only look closer when under 5% of the coarse grid changed
+
 # ============================================================
 # Compression levels
 # ============================================================
@@ -5554,8 +5568,14 @@ def compute_auto_threshold(diffs: list[int]) -> float:
 # using pixels only.
 
 def ocr_normalize(text: str) -> str:
-    """Lowercase words only (letters/digits of any language), single-spaced; 1-char tokens are OCR noise."""
-    return " ".join(token for token in re.findall(r"\w+", (text or "").lower()) if len(token) >= 2)
+    """Lowercase words only (letters/digits of any language), single-spaced; tiny tokens are OCR noise."""
+    tokens = []
+    for token in re.findall(r"\w+", (text or "").lower()):
+        has_digit = any(ch.isdigit() for ch in token)
+        # Stray 1-2 letter "words" are almost always OCR junk (a pointer dot read as "wy"); numbers are kept.
+        if len(token) >= (2 if has_digit else 3):
+            tokens.append(token)
+    return " ".join(tokens)
 
 
 def ocr_char_count(text: str) -> int:
@@ -5579,11 +5599,13 @@ def ocr_word_differences(text_a: str, text_b: str) -> tuple[int, int]:
         leftovers = list(words_b[b1:b2])
         for word in words_a[a1:a2]:
             match = None
-            if len(word) >= 5:
+            if len(word) >= 3 and not any(ch.isdigit() for ch in word):
+                needed = OCR_WORD_MATCH_RATIO if len(word) >= 5 else 0.66   # short words: one flipped letter is allowed
                 for candidate in leftovers:
                     if (
-                        len(candidate) >= 5
-                        and difflib.SequenceMatcher(None, word, candidate).ratio() >= OCR_WORD_MATCH_RATIO
+                        len(candidate) >= 3
+                        and not any(ch.isdigit() for ch in candidate)
+                        and difflib.SequenceMatcher(None, word, candidate).ratio() >= needed
                     ):
                         match = candidate
                         break
@@ -5683,6 +5705,85 @@ async def ocr_frame_text(frame_path: str) -> str | None:
     return ocr_normalize(" ".join(words))
 
 
+async def compute_fine_signature(frame_path: str) -> bytes | None:
+    """160x90 RGB thumbnail (raw bytes) — fine enough to see a laser-pointer dot."""
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(frame_path),
+        "-vf", f"scale={POINTER_GRID_W}:{POINTER_GRID_H}:flags=area,format=rgb24",
+        "-f", "rawvideo", "-frames:v", "1", "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+
+    if process.returncode != 0 or len(stdout) != POINTER_GRID_W * POINTER_GRID_H * 3:
+        return None
+
+    return stdout
+
+
+def pointer_only_change(fine_a: bytes | None, fine_b: bytes | None) -> bool:
+    """
+    True when the ONLY difference between two frames is a pointer-like dot: a few
+    changed cells forming 1-3 small blobs, each containing a strongly coloured cell
+    (in either frame). Anything bigger, wider, or plain black/grey is not a pointer.
+    """
+    if not fine_a or not fine_b or len(fine_a) != len(fine_b) or fine_a == fine_b:
+        return False
+
+    width = POINTER_GRID_W
+    changed: list[int] = []
+
+    for cell in range(POINTER_GRID_W * POINTER_GRID_H):
+        j = cell * 3
+        if (
+            abs(fine_a[j] - fine_b[j]) >= POINTER_CELL_DIFF
+            or abs(fine_a[j + 1] - fine_b[j + 1]) >= POINTER_CELL_DIFF
+            or abs(fine_a[j + 2] - fine_b[j + 2]) >= POINTER_CELL_DIFF
+        ):
+            changed.append(cell)
+            if len(changed) > POINTER_MAX_CELLS:
+                return False
+
+    if not changed:
+        return False
+
+    # Group changed cells into blobs (cells within 2 steps of each other belong together).
+    remaining = set(changed)
+    clusters: list[list[int]] = []
+    while remaining:
+        stack = [remaining.pop()]
+        blob = list(stack)
+        while stack:
+            cell = stack.pop()
+            cx, cy = cell % width, cell // width
+            for other in list(remaining):
+                if abs(other % width - cx) <= 2 and abs(other // width - cy) <= 2:
+                    remaining.discard(other)
+                    stack.append(other)
+                    blob.append(other)
+        clusters.append(blob)
+
+    if len(clusters) > POINTER_MAX_CLUSTERS:
+        return False
+
+    def colour_margin(buffer: bytes, cell: int) -> int:
+        j = cell * 3
+        top, second = sorted((buffer[j], buffer[j + 1], buffer[j + 2]), reverse=True)[:2]
+        return top - second
+
+    for blob in clusters:
+        xs = [cell % width for cell in blob]
+        ys = [cell // width for cell in blob]
+        if max(xs) - min(xs) + 1 > POINTER_MAX_SPAN or max(ys) - min(ys) + 1 > POINTER_MAX_SPAN:
+            return False
+        if max(max(colour_margin(fine_a, c), colour_margin(fine_b, c)) for c in blob) < POINTER_MIN_COLOUR:
+            return False
+
+    return True
+
+
 async def dedup_frames(
     frame_paths: list[Path],
     threshold: float | None = None,
@@ -5757,6 +5858,15 @@ async def dedup_frames(
         text_cache[path] = await ocr_frame_text(str(path))
         return text_cache[path]
 
+    fine_cache: dict[Path, bytes | None] = {}
+
+    async def fine_of(path: Path) -> bytes | None:
+        if path not in fine_cache:
+            fine_cache[path] = await compute_fine_signature(str(path))
+        return fine_cache[path]
+
+    pointer_merged = 0   # frames dropped because only a pointer dot moved
+
     kept: list[Path] = []
     removed: list[Path] = []
     last_kept_signature: bytes | None = None
@@ -5769,7 +5879,27 @@ async def dedup_frames(
             and frames_are_near_identical(signature, last_kept_signature, threshold)
         )
 
-        if ocr_on and last_kept_path is not None and signature is not None and last_kept_signature is not None:
+        pointer_hit = False
+        if (
+            POINTER_ENABLED
+            and last_kept_path is not None
+            and signature is not None
+            and last_kept_signature is not None
+        ):
+            coarse_area = signature_changed_fraction(signature, last_kept_signature, POINTER_CELL_DIFF)
+            if coarse_area is not None and coarse_area <= POINTER_COARSE_GATE:
+                if pointer_only_change(await fine_of(last_kept_path), await fine_of(path)):
+                    pointer_hit = True
+                    is_duplicate = True
+                    pointer_merged += 1
+
+        if (
+            ocr_on
+            and not pointer_hit
+            and last_kept_path is not None
+            and signature is not None
+            and last_kept_signature is not None
+        ):
             diff = signature_diff(signature, last_kept_signature)
 
             if diff is not None:
@@ -5809,10 +5939,11 @@ async def dedup_frames(
             last_kept_signature = signature
             last_kept_path = path
 
-    if ocr_kept or ocr_merged:
+    if ocr_kept or ocr_merged or pointer_merged:
         logger.info(
-            "OCR check: kept %s frame(s) whose words changed, dropped %s extra frame(s) with identical words.",
-            ocr_kept, ocr_merged,
+            "Dedup extras: %s frame(s) dropped because only a pointer dot moved; OCR kept %s frame(s) whose "
+            "words changed and dropped %s extra frame(s) with identical words.",
+            pointer_merged, ocr_kept, ocr_merged,
         )
 
     return kept, removed, threshold
