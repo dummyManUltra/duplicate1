@@ -28,7 +28,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1108,6 +1108,7 @@ def build_database_zip() -> bytes:
         archive.writestr(QUOTA_ENTRY_NAME, quota_json_bytes())
         archive.writestr(SUBS_ENTRY_NAME, subscriptions_json_bytes())
         archive.writestr(REFERRALS_ENTRY_NAME, referrals_json_bytes())
+        archive.writestr(EVENT_ENTRY_NAME, event_json_bytes())
 
     return buffer.getvalue()
 
@@ -1116,7 +1117,7 @@ def database_fingerprint() -> str:
     """Changes only when the saved data changes (zip bytes carry timestamps, so hash the data)."""
     return hashlib.sha256(
         approved_users_json_bytes() + b"|" + stats_json_bytes() + b"|" + quota_json_bytes()
-        + b"|" + subscriptions_json_bytes() + b"|" + referrals_json_bytes()
+        + b"|" + subscriptions_json_bytes() + b"|" + referrals_json_bytes() + b"|" + event_json_bytes()
     ).hexdigest()
 
 
@@ -1164,6 +1165,12 @@ def read_database_bytes(raw: bytes) -> int:
                     merge_referrals_bytes(archive.read(REFERRALS_ENTRY_NAME))
                 except ValueError:
                     logger.warning("Database.zip has an unreadable %s — skipping the invites.", REFERRALS_ENTRY_NAME)
+
+            if EVENT_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_event_bytes(archive.read(EVENT_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the event.", EVENT_ENTRY_NAME)
 
             return added
     except zipfile.BadZipFile as error:
@@ -1988,6 +1995,7 @@ async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ------------------------------------------------------------
 SUBS_ENTRY_NAME = "subscriptions.json"
 REFERRALS_ENTRY_NAME = "referrals.json"
+EVENT_ENTRY_NAME = "event.json"
 SUBSCRIBE_CONTACT = os.getenv("SUBSCRIBE_CONTACT", "")   # e.g. "@yourusername" — shown to people who hit a limit
 
 # Subscribe buttons stay switched off until this is set to "1" (env SUBSCRIPTIONS_ENABLED).
@@ -2006,6 +2014,9 @@ TIERS: dict[str, dict] = {
 }
 
 subscriptions: dict[str, dict] = {}   # user id (text) -> {"tier": "plus", "until": unix time}
+
+# Global event (/event): while it runs, EVERYONE gets this tier's limits (if it's better than theirs).
+event: dict = {}   # {"tier": "pro", "until": unix time, "started": unix time} — empty = no event
 
 # Invite rewards (/invite). Saved inside Database.zip (referrals.json).
 referrals: dict = {
@@ -2054,20 +2065,27 @@ def _active_bonus(user_id: int | None) -> dict | None:
     return entry
 
 
+def _active_event() -> dict | None:
+    """The running /event, or None (an expired event is cleared)."""
+    if not event:
+        return None
+
+    if float(event.get("until", 0)) <= time.time() or event.get("tier") not in TIERS:
+        event.clear()
+        return None
+
+    return event
+
+
 def active_subscription(user_id: int | None) -> dict | None:
-    paid = _paid_subscription(user_id)
-    bonus = _active_bonus(user_id)
-
-    if paid is None:
-        return bonus
-
-    if bonus is None:
-        return paid
+    if user_id is None:
+        return None
 
     def rank(entry: dict) -> tuple:
         return (TIERS[entry["tier"]]["priority"], float(entry["until"]))
 
-    return bonus if rank(bonus) > rank(paid) else paid
+    candidates = [entry for entry in (_paid_subscription(user_id), _active_bonus(user_id), _active_event()) if entry]
+    return max(candidates, key=rank) if candidates else None
 
 
 def get_tier(user_id: int | None) -> str:
@@ -2201,6 +2219,171 @@ def merge_subscriptions_bytes(raw: bytes) -> int:
             changed += 1
 
     return changed
+
+
+def event_json_bytes() -> bytes:
+    return json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def merge_event_bytes(raw: bytes) -> bool:
+    """Load the running event from a Database.zip (the later end wins). Raises ValueError if unusable."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"event is not valid JSON ({error})") from error
+
+    if not isinstance(data, dict):
+        raise ValueError("not an event file")
+
+    if not data:
+        return False
+
+    try:
+        until = float(data["until"])
+        started = float(data.get("started", time.time()))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("event has no valid end time") from None
+
+    if data.get("tier") not in TIERS or until <= time.time():
+        return False
+
+    if not event or until > float(event.get("until", 0)):
+        event.clear()
+        event.update({"tier": data["tier"], "until": until, "started": started})
+        return True
+
+    return False
+
+
+MSG_EVENT_STARTED = (
+    "🎉 A special event has started!\n"
+    "\n"
+    "For the next {duration}, everyone gets the {plan_tier} limits — for free:\n"
+    "• {size_daily_mb} per day\n"
+    "• files up to {size_max_file_mb}\n"
+    "\n"
+    "Event ends: {date_until}\n"
+    "Send me a video or audio file and enjoy! 🚀"
+)
+MSG_EVENT_USAGE = (
+    "Usage:\n"
+    "/event <plus|pro> <days> — start an event for everyone\n"
+    "/event off — end the running event\n"
+    "/event — show the running event\n"
+    "Example: /event pro 7"
+)
+MSG_EVENT_NONE = "ℹ️ There is no event running right now.\n\n"
+MSG_EVENT_RUNNING = "🎉 Event running: {plan_tier} limits for everyone until {date_until} ({days_left} left)."
+MSG_EVENT_ENDED = "🛑 The event was ended."
+MSG_EVENT_BROADCAST_START = "📣 Event started ({plan_tier}, {days}). Sending the announcement to {total} user(s)..."
+MSG_EVENT_BROADCAST_DONE = "✅ Announcement finished: {sent} delivered, {failed} couldn't be reached."
+
+EVENT_MAX_DAYS = 365
+_event_broadcast_task: asyncio.Task | None = None
+
+
+def event_audience() -> list[int]:
+    """Everyone the bot knows: people who used it and approved users."""
+    ids: set[int] = set()
+
+    for key in list(stats["users"]):
+        with contextlib.suppress(ValueError):
+            ids.add(int(key))
+
+    ids.update(int(user_id) for user_id in approved_users)
+    ids.add(ADMIN_USER_ID)
+    return sorted(ids)
+
+
+async def _send_event_announcement(bot, text: str, admin_chat_id: int, header: str) -> None:
+    recipients = event_audience()
+    sent = failed = 0
+
+    with contextlib.suppress(Exception):
+        await bot.send_message(chat_id=admin_chat_id, text=header.format(total=len(recipients)))
+
+    for user_id in recipients:
+        for attempt in range(2):
+            try:
+                await bot.send_message(chat_id=user_id, text=text)
+                sent += 1
+                break
+            except RetryAfter as error:
+                await asyncio.sleep(float(error.retry_after) + 1)   # Telegram asked us to slow down — then retry once
+            except Exception:
+                failed += 1   # blocked the bot, deleted their account, ...
+                break
+        else:
+            failed += 1
+
+        await asyncio.sleep(0.05)   # stay well under Telegram's ~30 messages/second
+
+    with contextlib.suppress(Exception):
+        await bot.send_message(chat_id=admin_chat_id, text=MSG_EVENT_BROADCAST_DONE.format(sent=sent, failed=failed))
+
+
+def event_status_text(entry: dict) -> str:
+    days_left = max(0.0, (float(entry["until"]) - time.time()) / 86400)
+    return MSG_EVENT_RUNNING.format(plan_tier=tier_label(entry["tier"]), date_until=format_until(entry["until"]), days_left=f"{days_left:.1f} days")
+
+
+async def event_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/event <plus|pro> <days> | off — admin only: give EVERYONE a plan's limits for a while."""
+    global _event_broadcast_task
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    args = [arg.lower() for arg in context.args]
+    running = _active_event()
+
+    if not args:
+        await message.reply_text(event_status_text(running) if running else MSG_EVENT_NONE + MSG_EVENT_USAGE)
+        return
+
+    if args[0] in ("off", "stop", "end", "cancel"):
+        if running is None:
+            await message.reply_text(MSG_EVENT_NONE.strip())
+            return
+
+        event.clear()
+        save_approved_users()
+        await message.reply_text(MSG_EVENT_ENDED)
+        return
+
+    tier = args[0]
+
+    try:
+        days = int(args[1]) if len(args) > 1 else 0
+    except ValueError:
+        days = 0
+
+    if tier not in ("plus", "pro") or not 1 <= days <= EVENT_MAX_DAYS:
+        await message.reply_text(MSG_EVENT_USAGE)
+        return
+
+    now = time.time()
+    until = now + days * 86400
+    event.clear()
+    event.update({"tier": tier, "until": until, "started": now})
+    save_approved_users()
+
+    info = TIERS[tier]
+    announcement = MSG_EVENT_STARTED.format(
+        duration=_days_text(days),
+        plan_tier=tier_label(tier),
+        size_daily_mb=format_size(int(info["daily_mb"] * 1024 * 1024)),
+        size_max_file_mb=format_size(int(info["max_file_mb"] * 1024 * 1024)),
+        date_until=format_until(until),
+    )
+    header = MSG_EVENT_BROADCAST_START.format(plan_tier=tier_label(tier), days=_days_text(days), total="{total}")
+
+    # Send in the background so the bot keeps working while thousands of messages go out.
+    _event_broadcast_task = asyncio.create_task(
+        _send_event_announcement(context.bot, announcement, message.chat_id, header)
+    )
 
 
 def find_user_id(target: str) -> int | None:
@@ -2748,7 +2931,7 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text(MSG_USAGE_REVOKE_USER_NUMERIC_ID)
         return
 
-    if active_subscription(user_id) is None:
+    if _paid_subscription(user_id) is None and _active_bonus(user_id) is None:
         await message.reply_text(MSG_HAS_NO_ACTIVE_PLAN.format(name=display_name_for(user_id), user_id=user_id))
         return
 
@@ -4179,7 +4362,10 @@ def format_duration(seconds: float) -> str:
 
 
 def get_video_filter(max_width: int) -> str:
-    return f"scale='min({max_width},iw)':-2"
+    # format=yuv420p: the one pixel format every phone/Telegram player can show.
+    # Without it, sources stored as 4:4:4 / 4:2:2 / 10-bit (screen recordings, some
+    # cameras) are encoded as-is and play as a BLACK picture with sound only.
+    return f"scale='min({max_width},iw)':-2,format=yuv420p"
 
 
 def estimate_audio_bytes(bitrate: str, duration: float | None) -> int | None:
@@ -11523,6 +11709,7 @@ def main() -> None:
     application.add_handler(CommandHandler("subscribe", subscribe_command))
     application.add_handler(CommandHandler("grant", grant_command))
     application.add_handler(CommandHandler("revoke", revoke_command))
+    application.add_handler(CommandHandler("event", event_command))
     application.add_handler(CommandHandler("subs", subs_command))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
