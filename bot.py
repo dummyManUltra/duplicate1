@@ -7747,7 +7747,7 @@ async def process_audio_replacement(
 #   • otherwise everything is re-encoded to the first video's size and frame
 #     rate (smaller videos get black bars, videos without sound get silence).
 
-MERGE_MAX_VIDEOS = int(os.getenv("MERGE_MAX_VIDEOS", "10"))
+MERGE_MAX_VIDEOS = int(os.getenv("MERGE_MAX_VIDEOS", "0"))   # 0 = no limit
 MERGE_CRF = os.getenv("MERGE_CRF", "23")
 MERGE_PRESET = os.getenv("MERGE_PRESET", "veryfast")
 MERGE_MAX_WIDTH = int(os.getenv("MERGE_MAX_WIDTH", "1920"))
@@ -7764,11 +7764,11 @@ BTN_MERGE_UNDO = "↩️ Remove last"
 MSG_MERGE_INTRO = (
     "🎞 Merge videos\n\n"
     "Send me the videos you want to join, in the order you want them "
-    "(2 to {max} videos). You can send them one by one or forward several at once.\n\n"
+    "(at least 2 videos{up_to}). You can send them one by one or forward several at once.\n\n"
     "While merge mode is on, videos you send are added here instead of being compressed. "
     "Tap Cancel to leave merge mode."
 )
-MSG_MERGE_LIST_HEADER = "🎞 Merge videos — {count} added (max {max})"
+MSG_MERGE_LIST_HEADER = "🎞 Merge videos — {count} added{max_note}"
 MSG_MERGE_LIST_FOOTER = "Send the next video, or tap Merge when you're done. They're joined in the order you sent them."
 MSG_MERGE_NEED_TWO = "Add at least 2 videos first, then tap Merge."
 MSG_MERGE_FULL = "That's the maximum of {max} videos for one merge. Tap Merge to join them."
@@ -7803,7 +7803,7 @@ MSG_MERGE_IDLE_EXPIRED_REFUNDED = (
 )
 
 # ---- audio merge: same flow as the video merge, with its own wording ----
-MERGE_MAX_AUDIOS = int(os.getenv("MERGE_MAX_AUDIOS", "20"))
+MERGE_MAX_AUDIOS = int(os.getenv("MERGE_MAX_AUDIOS", "0"))   # 0 = no limit
 MERGE_AUDIO_ONLY_BITRATE = os.getenv("MERGE_AUDIO_ONLY_BITRATE", "128k")
 MERGE_AUDIO_COPY_CODECS = {"aac", "mp3"}
 
@@ -7818,11 +7818,11 @@ AUDIO_MERGE_TEXT = {
     "MSG_MERGE_INTRO": (
         "🎧 Merge audios\n\n"
         "Send me the audio files you want to join, in the order you want them "
-        "(2 to {max} audios). You can send them one by one or forward several at once.\n\n"
+        "(at least 2 audios{up_to}). You can send them one by one or forward several at once.\n\n"
         "While merge mode is on, audios you send are added here instead of being compressed. "
         "Tap Cancel to leave merge mode."
     ),
-    "MSG_MERGE_LIST_HEADER": "🎧 Merge audios — {count} added (max {max})",
+    "MSG_MERGE_LIST_HEADER": "🎧 Merge audios — {count} added{max_note}",
     "MSG_MERGE_LIST_FOOTER": "Send the next audio, or tap Merge when you're done. They're joined in the order you sent them.",
     "MSG_MERGE_NEED_TWO": "Add at least 2 audios first, then tap Merge.",
     "MSG_MERGE_FULL": "That's the maximum of {max} audios for one merge. Tap Merge to join them.",
@@ -7847,7 +7847,13 @@ def mm(kind: str, name: str) -> str:
 
 
 def merge_max_items(kind: str) -> int:
-    return MERGE_MAX_AUDIOS if kind == "audio" else MERGE_MAX_VIDEOS
+    """How many files one merge may hold. 0 = no limit."""
+    return max(0, MERGE_MAX_AUDIOS if kind == "audio" else MERGE_MAX_VIDEOS)
+
+
+def merge_is_full(session: dict) -> bool:
+    limit = merge_max_items(session.get("kind", "video"))
+    return bool(limit) and len(session["items"]) >= limit
 
 
 def merge_busy_text(chat_id: int) -> str:
@@ -7865,17 +7871,29 @@ class MergeRefused(Exception):
     """The merge can't go ahead; the message is shown to the person as is."""
 
 
+MERGE_PANEL_SHOWN = 15   # how many of the latest files the panel lists (the rest are only counted)
+
+
 def merge_panel_text(session: dict) -> str:
     items = session["items"]
     kind = session.get("kind", "video")
     max_items = merge_max_items(kind)
+    notes = {
+        "max": max_items,
+        "max_note": f" (max {max_items})" if max_items else "",
+        "up_to": f", up to {max_items}" if max_items else "",
+    }
 
     if not items:
-        return mm(kind, "MSG_MERGE_INTRO").format(max=max_items)
+        return mm(kind, "MSG_MERGE_INTRO").format(**notes)
 
-    lines = [mm(kind, "MSG_MERGE_LIST_HEADER").format(count=len(items), max=max_items), ""]
+    lines = [mm(kind, "MSG_MERGE_LIST_HEADER").format(count=len(items), **notes), ""]
+    first_shown = max(0, len(items) - MERGE_PANEL_SHOWN)
 
-    for number, item in enumerate(items, start=1):
+    if first_shown:
+        lines.append(f"… {first_shown} earlier file(s) not shown")
+
+    for number, item in enumerate(items[first_shown:], start=first_shown + 1):
         name = item["filename"]
         if len(name) > 32:
             name = name[:29] + "..."
@@ -7926,24 +7944,85 @@ def merge_refund_all(session: dict) -> str:
     return ""
 
 
-async def send_merge_panel(bot, session: dict) -> None:
-    """Show the current list as a fresh message (and take the buttons off the old one)."""
-    async with session["lock"]:
-        old_panel_id = session.get("panel_id")
+MERGE_PANEL_DELAY = 0.7   # seconds: files that arrive together are shown with a single edit
 
-        if old_panel_id is not None:
-            with contextlib.suppress(Exception):
+
+async def render_merge_panel(bot, session: dict, fresh: bool = False) -> None:
+    """
+    Show the list on ONE message: edit it in place. Only the first time (or when
+    fresh=True, e.g. the person asked for the merge screen again) a new message is sent.
+    """
+    async with session["lock"]:
+        if merge_sessions.get(session["chat_id"]) is not session or session.get("running"):
+            return
+
+        text = merge_panel_text(session)
+        markup = merge_keyboard(len(session["items"]), session.get("kind", "video"))
+        panel_id = session.get("panel_id")
+
+        if panel_id is not None and not fresh:
+            try:
+                await bot.edit_message_text(
+                    chat_id=session["chat_id"], message_id=panel_id, text=text, reply_markup=markup
+                )
+                session["last_active"] = time.time()
+                return
+            except RetryAfter as error:
+                await asyncio.sleep(float(error.retry_after) + 0.5)
+                with contextlib.suppress(Exception):
+                    await bot.edit_message_text(
+                        chat_id=session["chat_id"], message_id=panel_id, text=text, reply_markup=markup
+                    )
+                return
+            except BadRequest as error:
+                if "not modified" in str(error).lower():
+                    return
+                # The message was deleted or can't be edited: send a fresh one below.
+            except Exception as error:
+                logger.warning("Couldn't edit the merge list (%s) — sending a new one.", error)
+
+        if panel_id is not None:
+            with contextlib.suppress(Exception):   # take the buttons off the old one
                 await bot.edit_message_reply_markup(
-                    chat_id=session["chat_id"], message_id=old_panel_id, reply_markup=None
+                    chat_id=session["chat_id"], message_id=panel_id, reply_markup=None
                 )
 
-        sent = await bot.send_message(
-            chat_id=session["chat_id"],
-            text=merge_panel_text(session),
-            reply_markup=merge_keyboard(len(session["items"]), session.get("kind", "video")),
-        )
+        sent = await bot.send_message(chat_id=session["chat_id"], text=text, reply_markup=markup)
         session["panel_id"] = sent.message_id
         session["last_active"] = time.time()
+
+
+async def _merge_panel_later(bot, session: dict) -> None:
+    await asyncio.sleep(MERGE_PANEL_DELAY)
+    await render_merge_panel(bot, session)
+
+
+async def send_merge_panel(bot, session: dict, fresh: bool = False) -> None:
+    """
+    Refresh the list. Several files arriving at once (forwarded together) are merged into one
+    edit: every call restarts a short timer and only the last one draws.
+    fresh=True shows it right away as a new message at the bottom of the chat.
+    """
+    task = session.get("refresh_task")
+
+    if task is not None and not task.done():
+        task.cancel()
+
+    if fresh:
+        session["refresh_task"] = None
+        await render_merge_panel(bot, session, fresh=True)
+        return
+
+    session["refresh_task"] = asyncio.create_task(_merge_panel_later(bot, session))
+
+
+def merge_stop_refresh(session: dict) -> None:
+    task = session.get("refresh_task")
+
+    if task is not None and not task.done():
+        task.cancel()
+
+    session["refresh_task"] = None
 
 
 def new_merge_session(chat_id: int, owner_id: int | None, kind: str) -> dict:
@@ -7955,6 +8034,7 @@ def new_merge_session(chat_id: int, owner_id: int | None, kind: str) -> dict:
         "panel_id": None,
         "last_active": time.time(),
         "running": False,
+        "refresh_task": None,
         "lock": asyncio.Lock(),
     }
 
@@ -7975,10 +8055,11 @@ async def begin_merge(bot, chat_id: int, user, kind: str = "video") -> None:
             return
 
         if existing.get("kind", "video") == kind:
-            await send_merge_panel(bot, existing)
+            await send_merge_panel(bot, existing, fresh=True)
             return
 
         # They asked for the OTHER kind of merge: drop the old list (bytes are given back).
+        merge_stop_refresh(existing)
         merge_refund_all(existing)
         merge_sessions.pop(chat_id, None)
 
@@ -7988,7 +8069,7 @@ async def begin_merge(bot, chat_id: int, user, kind: str = "video") -> None:
 
     session = new_merge_session(chat_id, user_id, kind)
     merge_sessions[chat_id] = session
-    await send_merge_panel(bot, session)
+    await send_merge_panel(bot, session, fresh=True)
 
 
 async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -8046,7 +8127,7 @@ async def merge_add_video(
 
     kind = session.get("kind", "video")
 
-    if len(session["items"]) >= merge_max_items(kind):
+    if merge_is_full(session):
         await message.reply_text(mm(kind, "MSG_MERGE_FULL").format(max=merge_max_items(kind)))
         return
 
@@ -8075,6 +8156,7 @@ async def merge_add_video(
     # Several videos forwarded at once can be handled out of order: Telegram's
     # message ids always grow in the order they were sent, so sort by them.
     session["items"].sort(key=lambda item: item["message_id"])
+    session["last_active"] = time.time()
 
     await send_merge_panel(context.bot, session)
 
@@ -8095,13 +8177,14 @@ async def merge_seed_from_audio(query, context: ContextTypes.DEFAULT_TYPE, chat_
         return
 
     if existing is not None and existing.get("kind", "video") != "audio":
+        merge_stop_refresh(existing)
         merge_refund_all(existing)
         merge_sessions.pop(chat_id, None)
         existing = None
 
     session = existing or new_merge_session(chat_id, user_id, "audio")
 
-    if len(session["items"]) >= MERGE_MAX_AUDIOS:
+    if merge_is_full(session):
         await query.message.reply_text(AUDIO_MERGE_TEXT["MSG_MERGE_FULL"].format(max=MERGE_MAX_AUDIOS))
         return
 
@@ -8158,6 +8241,7 @@ async def handle_merge_callback(query, context: ContextTypes.DEFAULT_TYPE, comma
             await query.message.reply_text(MSG_MERGE_CANCEL_WHILE_RUNNING)
             return
 
+        merge_stop_refresh(session)
         refunded = merge_refund_all(session)
         merge_sessions.pop(chat_id, None)
         text = (
@@ -8201,6 +8285,7 @@ async def handle_merge_callback(query, context: ContextTypes.DEFAULT_TYPE, comma
 
         # Set BEFORE any await so a double tap can't start two merges.
         session["running"] = True
+        merge_stop_refresh(session)
 
         with contextlib.suppress(Exception):
             await query.edit_message_reply_markup(reply_markup=None)
@@ -8223,6 +8308,7 @@ async def expire_idle_merge_sessions(bot) -> int:
         if now - session.get("last_active", now) < MERGE_IDLE_MINUTES * 60:
             continue
 
+        merge_stop_refresh(session)
         refunded = merge_refund_all(session)
         merge_sessions.pop(chat_id, None)
         removed += 1
@@ -8522,7 +8608,7 @@ async def run_merge(context: ContextTypes.DEFAULT_TYPE, session: dict, user) -> 
     owner_id = session.get("owner_id")
     kind = session.get("kind", "video")
     is_audio_merge = kind == "audio"
-    items = list(session["items"])
+    items = sorted(session["items"], key=lambda item: item["message_id"])   # the order they were sent
     count = len(items)
     key = -next(_merge_job_keys)   # negative: can never clash with a real message id
 
