@@ -553,6 +553,24 @@ BTN_REPLACE_AUDIO_SEND_A_RECORDING = "🔁 Replace audio (send a recording)"
 BTN_SET_VIDEO_COVER_SEND_AN = "🖼 Set video cover (send an image)"
 BTN_EXTRACT_TO_PDF = "📄 Extract to PDF"
 BTN_EXTRACT_AUDIO = "🎵 Extract audio"
+BTN_SPLIT_VIDEO = "✂️ Split video"
+MSG_SPLIT_ASK = (
+    "✂️ Where should I split the video?\n\n"
+    "Send the time of the cut as hours:minutes:seconds, like 0:05:30. "
+    "Hour 2 is 2:00:00. (Minutes and seconds alone work too, like 5:30.)\n\n"
+    "This video is {length} long ({clock}). It becomes two videos: from the start to the cut, and from the cut to the end."
+)
+MSG_SPLIT_BAD_TIME = "⚠️ I couldn't read that time. Send it like 0:05:30 (hours:minutes:seconds), or tap Cancel."
+MSG_SPLIT_OUT_OF_RANGE = "⚠️ The cut must be inside the video (between 0:00:01 and {clock}). Send another time, or tap Cancel."
+MSG_SPLIT_NO_LENGTH = "⚠️ I couldn't read this video's length, so I can't split it."
+MSG_SPLIT_BUSY = "⏳ This video is already being worked on — please wait for it to finish."
+MSG_SPLIT_CUTTING = "✂️ Cutting part {part}/2 ({start} → {end})"
+MSG_SPLIT_SENDING = "📤 Sending part {part}/2…"
+MSG_SPLIT_CAPTION = "✂️ Part {part}/2 — {start} → {end}\nLength: {length}\nSize: {size}"
+MSG_SPLIT_TOO_BIG = "Part {part} would be bigger than Telegram's 2 GB upload limit, so I couldn't send it."
+MSG_SPLIT_FAILED = "😕 Something went wrong while splitting: {error}"
+MSG_SPLIT_CANCELLED = "❌ Split cancelled."
+MSG_SPLIT_DONE = "✅ Split at {clock}. The original is still here — you can compress it or choose anything else from its menu."
 MSG_EXTRACT_AUDIO_PICK_QUALITY = (
     "🎵 Extracting the audio from your video into an audio file.\n\n"
     "Pick the audio quality (estimated size of the audio file):"
@@ -787,6 +805,8 @@ MSG_BOT_RESTARTED_RESTORED_APPROVED_USER = "♻️ Bot restarted — restored {a
 
 # ---- expire idle files ----
 MSG_I_DELETED_YOUR_VIDEO_BECAUSE = "⌛ I deleted your video because you didn't choose anything for {IDLE_FILE_TTL_MINUTES} minutes. Send it again whenever you're ready."
+MSG_I_DELETED_YOUR_AUDIO_BECAUSE = "⌛ I deleted your audio because you didn't choose anything for {minutes} minutes. Send it again whenever you're ready."
+MSG_I_DELETED_YOUR_AUDIO_REFUNDED = "⌛ I deleted your audio because you didn't choose anything for {minutes} minutes, and {size} was given back to your daily limit. Send it again whenever you're ready."
 MSG_I_DELETED_YOUR_VIDEO_REFUNDED = "⌛ I deleted your video because you didn't choose anything for {IDLE_FILE_TTL_MINUTES} minutes, and {size} was given back to your daily limit. Send it again whenever you're ready."
 MSG_EVICTED_MAKE_ROOM = "⌛ I had to delete your video to make room for other people's files. Send it again whenever you're ready."
 MSG_EVICTED_MAKE_ROOM_REFUNDED = "⌛ I had to delete your video to make room for other people's files, and {size} was given back to your daily limit. Send it again whenever you're ready."
@@ -2737,7 +2757,10 @@ def home_text(user) -> str:
 
 def home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(BTN_MERGE_VIDEOS, callback_data="merge:start:0")],
+        [
+            InlineKeyboardButton(BTN_MERGE_VIDEOS, callback_data="merge:start:0"),
+            InlineKeyboardButton(BTN_MERGE_AUDIOS, callback_data="merge:starta:0"),
+        ],
         [InlineKeyboardButton(BTN_SUBSCRIBE, callback_data=subscribe_callback("home:subscribe:0"))],
         [
             InlineKeyboardButton(BTN_USAGE, callback_data="home:usage:0"),
@@ -2770,7 +2793,11 @@ def subscribe_page_text(user_id: int | None) -> str:
 
 
 def about_text() -> str:
-    idle = f" or after {IDLE_FILE_TTL_MINUTES} minutes without any action" if IDLE_FILE_TTL_MINUTES > 0 else ""
+    idle = (
+        f" or after {IDLE_FILE_TTL_MINUTES} minutes without any action ({IDLE_OTHER_TTL_MINUTES} for audio and other files)"
+        if IDLE_FILE_TTL_MINUTES > 0
+        else ""
+    )
 
     return (
         MSG_ABOUT_THIS_BOT_COMPRESSES_VIDEOS.format(idle=idle)
@@ -4110,7 +4137,9 @@ def clear_pending(message_id: int) -> None:
 #    right after we make our own copy.
 #  - at startup, leftovers from before a restart are swept away.
 # ------------------------------------------------------------
-IDLE_FILE_TTL_MINUTES = int(os.getenv("IDLE_FILE_TTL_MINUTES", "5"))
+IDLE_FILE_TTL_MINUTES = int(os.getenv("IDLE_FILE_TTL_MINUTES", "5"))          # stored VIDEOS
+# Anything that isn't a video (audio files; merge and PDF lists have their own 15 min timers).
+IDLE_OTHER_TTL_MINUTES = int(os.getenv("IDLE_OTHER_TTL_MINUTES", "15"))
 
 
 def delete_server_copy(telegram_file) -> None:
@@ -4151,14 +4180,16 @@ async def expire_idle_files(bot) -> int:
         return 0
 
     now = time.time()
-    limit = IDLE_FILE_TTL_MINUTES * 60
     removed = 0
 
     for message_id, pending in list(pending_compressions.items()):
         if message_id in active_job_ids:
             continue   # being analyzed / queued / compressed right now
 
-        if now - pending.get("last_active", now) < limit:
+        is_video = pending.get("media_type", "video") == "video"
+        minutes = IDLE_FILE_TTL_MINUTES if is_video else IDLE_OTHER_TTL_MINUTES
+
+        if now - pending.get("last_active", now) < minutes * 60:
             continue
 
         chat_id = pending.get("chat_id")
@@ -4180,11 +4211,17 @@ async def expire_idle_files(bot) -> int:
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        MSG_I_DELETED_YOUR_VIDEO_REFUNDED.format(
-                            IDLE_FILE_TTL_MINUTES=IDLE_FILE_TTL_MINUTES, size=refunded_text
+                        (
+                            MSG_I_DELETED_YOUR_VIDEO_REFUNDED.format(IDLE_FILE_TTL_MINUTES=minutes, size=refunded_text)
+                            if refunded_text
+                            else MSG_I_DELETED_YOUR_VIDEO_BECAUSE.format(IDLE_FILE_TTL_MINUTES=minutes)
                         )
-                        if refunded_text
-                        else MSG_I_DELETED_YOUR_VIDEO_BECAUSE.format(IDLE_FILE_TTL_MINUTES=IDLE_FILE_TTL_MINUTES)
+                        if is_video
+                        else (
+                            MSG_I_DELETED_YOUR_AUDIO_REFUNDED.format(minutes=minutes, size=refunded_text)
+                            if refunded_text
+                            else MSG_I_DELETED_YOUR_AUDIO_BECAUSE.format(minutes=minutes)
+                        )
                     ),
                 )
 
@@ -4453,6 +4490,10 @@ def estimate_keyboard(
     ])
 
     rows.append([
+        InlineKeyboardButton(BTN_SPLIT_VIDEO, callback_data=f"splitask:_:{message_id}")
+    ])
+
+    rows.append([
         InlineKeyboardButton(BTN_EXTRACT_AUDIO, callback_data=f"audioextract:_:{message_id}")
     ])
 
@@ -4495,6 +4536,11 @@ def audio_keyboard(
                 BTN_AUDIO_KEYBOARD.format(original_info_label=original_info['label'], size_estimates_original_audio=format_size(estimates.get(ORIGINAL_AUDIO)), original_info_detail=original_info['detail']),
                 callback_data=f"audioset:{level}|{ORIGINAL_AUDIO}:{message_id}",
             )
+        ])
+
+    if level == AUDIO_ONLY_LEVEL and not from_video:
+        rows.append([
+            InlineKeyboardButton(BTN_MERGE_AUDIO_WITH_OTHERS, callback_data=f"merge:audio:{message_id}")
         ])
 
     if level == AUDIO_ONLY_LEVEL:
@@ -6814,10 +6860,10 @@ async def handle_incoming(
     # Merge mode: every video this chat sends is added to the merge list
     # instead of being compressed.
     if chat_id in merge_sessions:
-        if media_type == "video":
+        if media_type == merge_sessions[chat_id].get("kind", "video"):
             await merge_add_video(update, context, file_id, original_size, filename)
         else:
-            await message.reply_text(MSG_MERGE_VIDEOS_ONLY)
+            await message.reply_text(merge_busy_text(chat_id))
         return
 
     # The user tapped "Replace audio" and this chat is now waiting for
@@ -6944,6 +6990,7 @@ async def handle_incoming(
                     "chat_id": chat_id,
                     "duration": duration,
                     "media_type": "audio",
+                    "file_id": file_id,              # lets "Merge with other audios" reuse this file
                     "owner_id": sender_id,           # who was charged ...
                     "charged_bytes": charged_bytes,  # ... and how much (for refunds)
                 },
@@ -7755,6 +7802,60 @@ MSG_MERGE_IDLE_EXPIRED_REFUNDED = (
     "and gave {size} back to your daily limit."
 )
 
+# ---- audio merge: same flow as the video merge, with its own wording ----
+MERGE_MAX_AUDIOS = int(os.getenv("MERGE_MAX_AUDIOS", "20"))
+MERGE_AUDIO_ONLY_BITRATE = os.getenv("MERGE_AUDIO_ONLY_BITRATE", "128k")
+MERGE_AUDIO_COPY_CODECS = {"aac", "mp3"}
+
+BTN_MERGE_AUDIOS = "🎧 Merge audios"
+BTN_MERGE_AUDIO_WITH_OTHERS = "🔗 Merge with other audios"
+MSG_MERGE_AUDIO_ADDED = "🔗 Added to your audio merge list — send the other audios now."
+MSG_MERGE_AUDIO_EXPIRED = "⚠️ That audio isn't available anymore — please send it again."
+MSG_MERGE_AUDIO_TITLE = "Merged audio"
+
+# Wording that differs for audio (looked up by the name of the video text it replaces).
+AUDIO_MERGE_TEXT = {
+    "MSG_MERGE_INTRO": (
+        "🎧 Merge audios\n\n"
+        "Send me the audio files you want to join, in the order you want them "
+        "(2 to {max} audios). You can send them one by one or forward several at once.\n\n"
+        "While merge mode is on, audios you send are added here instead of being compressed. "
+        "Tap Cancel to leave merge mode."
+    ),
+    "MSG_MERGE_LIST_HEADER": "🎧 Merge audios — {count} added (max {max})",
+    "MSG_MERGE_LIST_FOOTER": "Send the next audio, or tap Merge when you're done. They're joined in the order you sent them.",
+    "MSG_MERGE_NEED_TWO": "Add at least 2 audios first, then tap Merge.",
+    "MSG_MERGE_FULL": "That's the maximum of {max} audios for one merge. Tap Merge to join them.",
+    "MSG_MERGE_VIDEOS_ONLY": "🎧 Audio merge mode is on — please send audio files only, or tap Cancel to leave merge mode.",
+    "MSG_MERGE_CANCELLED": "❌ Merge cancelled. Audios you send now will be handled as usual.",
+    "MSG_MERGE_DOWNLOADING": "⬇️ Downloading audio {index} of {total} ({size})…",
+    "MSG_MERGE_CHECKING": "🔍 Checking your audios…",
+    "MSG_MERGE_JOINING": "🔗 Merging {count} audios — joining them without re-encoding (original quality)",
+    "MSG_MERGE_REENCODING": "🔗 Merging {count} audios — re-encoding so they match",
+    "MSG_MERGE_SENDING": "📤 Sending the merged audio…",
+    "MSG_MERGE_NOT_A_VIDEO": "Audio {index} couldn't be read — it may be damaged or not a real audio file. Nothing was merged.",
+    "MSG_MERGE_TOO_BIG": "The merged audio would be bigger than Telegram's 2 GB upload limit. Try merging fewer or shorter audios.",
+    "MSG_MERGE_DONE_CAPTION": "✅ Merged {count} audios ({mode})\n\nLength: {length}\nSize: {size}",
+}
+
+
+def mm(kind: str, name: str) -> str:
+    """A merge message in the wording for this kind of merge ("video" or "audio")."""
+    if kind == "audio" and name in AUDIO_MERGE_TEXT:
+        return AUDIO_MERGE_TEXT[name]
+    return globals()[name]
+
+
+def merge_max_items(kind: str) -> int:
+    return MERGE_MAX_AUDIOS if kind == "audio" else MERGE_MAX_VIDEOS
+
+
+def merge_busy_text(chat_id: int) -> str:
+    """What to say when a file of the wrong kind arrives while this chat is in merge mode."""
+    session = merge_sessions.get(chat_id)
+    return mm(session.get("kind", "video") if session else "video", "MSG_MERGE_VIDEOS_ONLY")
+
+
 # chat_id -> the merge list that chat is building (or merging right now).
 merge_sessions: dict[int, dict] = {}
 _merge_job_keys = itertools.count(1)
@@ -7766,11 +7867,13 @@ class MergeRefused(Exception):
 
 def merge_panel_text(session: dict) -> str:
     items = session["items"]
+    kind = session.get("kind", "video")
+    max_items = merge_max_items(kind)
 
     if not items:
-        return MSG_MERGE_INTRO.format(max=MERGE_MAX_VIDEOS)
+        return mm(kind, "MSG_MERGE_INTRO").format(max=max_items)
 
-    lines = [MSG_MERGE_LIST_HEADER.format(count=len(items), max=MERGE_MAX_VIDEOS), ""]
+    lines = [mm(kind, "MSG_MERGE_LIST_HEADER").format(count=len(items), max=max_items), ""]
 
     for number, item in enumerate(items, start=1):
         name = item["filename"]
@@ -7787,15 +7890,18 @@ def merge_panel_text(session: dict) -> str:
     if total:
         lines += ["", f"Total: {format_size(total)}"]
 
-    lines += ["", MSG_MERGE_LIST_FOOTER]
+    lines += ["", mm(kind, "MSG_MERGE_LIST_FOOTER")]
     return "\n".join(lines)
 
 
-def merge_keyboard(count: int) -> InlineKeyboardMarkup:
+def merge_keyboard(count: int, kind: str = "video") -> InlineKeyboardMarkup:
     rows = []
 
     if count >= 2:
-        rows.append([InlineKeyboardButton(BTN_MERGE_NOW.format(count=count), callback_data="merge:go:0")])
+        button = BTN_MERGE_NOW.format(count=count)
+        if kind == "audio":
+            button = button.replace("videos", "audios")
+        rows.append([InlineKeyboardButton(button, callback_data="merge:go:0")])
 
     last_row = []
     if count >= 1:
@@ -7834,14 +7940,27 @@ async def send_merge_panel(bot, session: dict) -> None:
         sent = await bot.send_message(
             chat_id=session["chat_id"],
             text=merge_panel_text(session),
-            reply_markup=merge_keyboard(len(session["items"])),
+            reply_markup=merge_keyboard(len(session["items"]), session.get("kind", "video")),
         )
         session["panel_id"] = sent.message_id
         session["last_active"] = time.time()
 
 
-async def begin_merge(bot, chat_id: int, user) -> None:
-    """Start merge mode for a chat (home button or /merge)."""
+def new_merge_session(chat_id: int, owner_id: int | None, kind: str) -> dict:
+    return {
+        "chat_id": chat_id,
+        "owner_id": owner_id,
+        "kind": kind,
+        "items": [],
+        "panel_id": None,
+        "last_active": time.time(),
+        "running": False,
+        "lock": asyncio.Lock(),
+    }
+
+
+async def begin_merge(bot, chat_id: int, user, kind: str = "video") -> None:
+    """Start merge mode for a chat (home button or /merge, /mergeaudio)."""
     user_id = user.id if user is not None else None
 
     if update_mode["on"] and not is_admin(user_id):
@@ -7853,23 +7972,21 @@ async def begin_merge(bot, chat_id: int, user) -> None:
     if existing is not None:
         if existing.get("running"):
             await bot.send_message(chat_id=chat_id, text=MSG_MERGE_ALREADY_RUNNING)
-        else:
+            return
+
+        if existing.get("kind", "video") == kind:
             await send_merge_panel(bot, existing)
-        return
+            return
+
+        # They asked for the OTHER kind of merge: drop the old list (bytes are given back).
+        merge_refund_all(existing)
+        merge_sessions.pop(chat_id, None)
 
     # Merge mode takes over: forget any half-finished "send me the audio/name/cover" prompt.
     awaiting_audio_replacement.pop(chat_id, None)
     awaiting_input.pop(chat_id, None)
 
-    session = {
-        "chat_id": chat_id,
-        "owner_id": user_id,
-        "items": [],
-        "panel_id": None,
-        "last_active": time.time(),
-        "running": False,
-        "lock": asyncio.Lock(),
-    }
+    session = new_merge_session(chat_id, user_id, kind)
     merge_sessions[chat_id] = session
     await send_merge_panel(bot, session)
 
@@ -7886,6 +8003,20 @@ async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     await begin_merge(context.bot, message.chat_id, user)
+
+
+async def mergeaudio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    if not is_allowed(user.id):
+        await reject_unauthorized(message, user.id)
+        return
+
+    await begin_merge(context.bot, message.chat_id, user, "audio")
 
 
 async def merge_add_video(
@@ -7913,8 +8044,10 @@ async def merge_add_video(
         await message.reply_text(UPDATE_BUSY_TEXT)
         return
 
-    if len(session["items"]) >= MERGE_MAX_VIDEOS:
-        await message.reply_text(MSG_MERGE_FULL.format(max=MERGE_MAX_VIDEOS))
+    kind = session.get("kind", "video")
+
+    if len(session["items"]) >= merge_max_items(kind):
+        await message.reply_text(mm(kind, "MSG_MERGE_FULL").format(max=merge_max_items(kind)))
         return
 
     charged = int(size or 0)
@@ -7929,12 +8062,12 @@ async def merge_add_video(
 
     quota_consume(sender_id, charged)
 
-    video = message.video
+    media = message.video or message.audio or message.voice
     session["items"].append({
         "file_id": file_id,
         "size": size,
         "filename": filename,
-        "duration": getattr(video, "duration", None) if video is not None else None,
+        "duration": getattr(media, "duration", None) if media is not None else None,
         "message_id": message.message_id,
         "charged": charged,
         "sender_id": sender_id,
@@ -7946,7 +8079,57 @@ async def merge_add_video(
     await send_merge_panel(context.bot, session)
 
 
-async def handle_merge_callback(query, context: ContextTypes.DEFAULT_TYPE, command: str) -> None:
+async def merge_seed_from_audio(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
+    """The "🔗 Merge with other audios" button under an audio the person just sent."""
+    pending = pending_compressions.get(message_id)
+
+    if pending is None or not pending.get("file_id"):
+        await query.message.reply_text(MSG_MERGE_AUDIO_EXPIRED)
+        return
+
+    user_id = query.from_user.id if query.from_user else None
+    existing = merge_sessions.get(chat_id)
+
+    if existing is not None and existing.get("running"):
+        await query.message.reply_text(MSG_MERGE_ALREADY_RUNNING)
+        return
+
+    if existing is not None and existing.get("kind", "video") != "audio":
+        merge_refund_all(existing)
+        merge_sessions.pop(chat_id, None)
+        existing = None
+
+    session = existing or new_merge_session(chat_id, user_id, "audio")
+
+    if len(session["items"]) >= MERGE_MAX_AUDIOS:
+        await query.message.reply_text(AUDIO_MERGE_TEXT["MSG_MERGE_FULL"].format(max=MERGE_MAX_AUDIOS))
+        return
+
+    # The audio was already counted against the daily limit when it arrived: that charge moves
+    # to the merge list (so cancelling the merge gives it back), and the stored copy is deleted
+    # because the merge downloads its files again when it starts.
+    session["items"].append({
+        "file_id": pending["file_id"],
+        "size": pending.get("original_size"),
+        "filename": pending.get("filename") or f"audio_{message_id}.m4a",
+        "duration": pending.get("duration"),
+        "message_id": message_id,
+        "charged": int(pending.get("charged_bytes") or 0),
+        "sender_id": pending.get("owner_id", user_id),
+    })
+    session["items"].sort(key=lambda item: item["message_id"])
+    merge_sessions[chat_id] = session
+    awaiting_audio_replacement.pop(chat_id, None)
+    awaiting_input.pop(chat_id, None)
+    clear_pending(message_id)
+
+    with contextlib.suppress(Exception):
+        await query.edit_message_text(MSG_MERGE_AUDIO_ADDED)
+
+    await send_merge_panel(context.bot, session)
+
+
+async def handle_merge_callback(query, context: ContextTypes.DEFAULT_TYPE, command: str, message_id: int = 0) -> None:
     chat_id = query.message.chat_id if query.message else None
 
     if chat_id is None:
@@ -7954,6 +8137,14 @@ async def handle_merge_callback(query, context: ContextTypes.DEFAULT_TYPE, comma
 
     if command == "start":
         await begin_merge(context.bot, chat_id, query.from_user)
+        return
+
+    if command == "starta":
+        await begin_merge(context.bot, chat_id, query.from_user, "audio")
+        return
+
+    if command == "audio":
+        await merge_seed_from_audio(query, context, chat_id, message_id)
         return
 
     session = merge_sessions.get(chat_id)
@@ -7969,7 +8160,11 @@ async def handle_merge_callback(query, context: ContextTypes.DEFAULT_TYPE, comma
 
         refunded = merge_refund_all(session)
         merge_sessions.pop(chat_id, None)
-        text = MSG_MERGE_CANCELLED_REFUNDED.format(size=refunded) if refunded else MSG_MERGE_CANCELLED
+        text = (
+            MSG_MERGE_CANCELLED_REFUNDED.format(size=refunded)
+            if refunded
+            else mm(session.get("kind", "video"), "MSG_MERGE_CANCELLED")
+        )
 
         try:
             await query.edit_message_text(text)
@@ -7991,7 +8186,8 @@ async def handle_merge_callback(query, context: ContextTypes.DEFAULT_TYPE, comma
 
         try:
             await query.edit_message_text(
-                merge_panel_text(session), reply_markup=merge_keyboard(len(session["items"]))
+                merge_panel_text(session),
+                reply_markup=merge_keyboard(len(session["items"]), session.get("kind", "video")),
             )
         except Exception as error:
             if "not modified" not in str(error).lower():
@@ -8000,7 +8196,7 @@ async def handle_merge_callback(query, context: ContextTypes.DEFAULT_TYPE, comma
 
     if command == "go":
         if len(session["items"]) < 2:
-            await query.message.reply_text(MSG_MERGE_NEED_TWO)
+            await query.message.reply_text(mm(session.get("kind", "video"), "MSG_MERGE_NEED_TWO"))
             return
 
         # Set BEFORE any await so a double tap can't start two merges.
@@ -8107,6 +8303,100 @@ async def probe_merge_signature(path: str) -> dict | None:
         "video_codec": (video.get("codec_name") or "").lower(),
         "audio_codec": (audio.get("codec_name") or "").lower() if audio else "",
     }
+
+
+async def probe_audio_merge_signature(path: str) -> dict | None:
+    """What has to match between audio files for them to be joined without re-encoding."""
+    command = ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", path]
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("ffprobe (audio merge) failed: %s", stderr.decode(errors="replace"))
+        return None
+
+    try:
+        data = json.loads(stdout.decode(errors="replace"))
+    except ValueError:
+        return None
+
+    audio = next((s for s in (data.get("streams") or []) if s.get("codec_type") == "audio"), None)
+
+    if audio is None:
+        return None
+
+    codec = (audio.get("codec_name") or "").lower()
+    sample_rate = _to_int(audio.get("sample_rate"))
+    channels = _to_int(audio.get("channels"))
+
+    return {
+        "has_audio": True,
+        "audio_codec": codec,
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "match": (codec, audio.get("profile"), sample_rate, channels),
+    }
+
+
+def merge_audio_can_copy(signatures: list[dict]) -> bool:
+    """True when every audio is the same AAC / MP3 kind, so they can simply be joined."""
+    first = signatures[0]
+
+    if first["audio_codec"] not in MERGE_AUDIO_COPY_CODECS:
+        return False
+
+    return all(sig["match"] == first["match"] for sig in signatures)
+
+
+def build_merge_audio_copy_command(paths: list[Path], list_path: Path, output_path: Path) -> list[str]:
+    list_path.write_text(
+        "".join(f"file '{path.resolve().as_posix()}'\n" for path in paths),
+        encoding="utf-8",
+    )
+
+    command = [
+        "ffmpeg", "-y",
+        "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", str(list_path),
+        "-map", "0:a:0", "-vn", "-c", "copy",
+    ]
+
+    if output_path.suffix.lower() == ".m4a":
+        command += ["-movflags", "+faststart"]
+
+    return command + ["-max_muxing_queue_size", "1024", str(output_path)]
+
+
+def build_merge_audio_reencode_command(
+    paths: list[Path],
+    signatures: list[dict],
+    output_path: Path,
+) -> list[str]:
+    all_mono = all((sig.get("channels") or 2) == 1 for sig in signatures)
+    first_rate = signatures[0].get("sample_rate")
+    rate = first_rate if first_rate in (32000, 44100, 48000) else 44100
+    layout = "mono" if all_mono else "stereo"
+
+    command = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    for path in paths:
+        command += ["-threads", DECODER_THREADS, "-i", str(path)]
+
+    parts = [
+        f"[{index}:a:0]aformat=sample_rates={rate}:channel_layouts={layout},asetpts=PTS-STARTPTS[a{index}]"
+        for index in range(len(paths))
+    ]
+    parts.append("".join(f"[a{index}]" for index in range(len(paths))) + f"concat=n={len(paths)}:v=0:a=1[a]")
+
+    command += [
+        "-filter_complex", ";".join(parts),
+        "-map", "[a]", "-vn",
+        "-c:a", "aac", "-b:a", MERGE_AUDIO_ONLY_BITRATE,
+        "-threads", FFMPEG_THREADS,
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        str(output_path),
+    ]
+    return command
 
 
 def merge_can_stream_copy(signatures: list[dict]) -> bool:
@@ -8230,6 +8520,8 @@ async def run_merge(context: ContextTypes.DEFAULT_TYPE, session: dict, user) -> 
 
     chat_id = session["chat_id"]
     owner_id = session.get("owner_id")
+    kind = session.get("kind", "video")
+    is_audio_merge = kind == "audio"
     items = list(session["items"])
     count = len(items)
     key = -next(_merge_job_keys)   # negative: can never clash with a real message id
@@ -8272,10 +8564,12 @@ async def run_merge(context: ContextTypes.DEFAULT_TYPE, session: dict, user) -> 
         paths: list[Path] = []
 
         for index, item in enumerate(items, start=1):
-            await post_status(MSG_MERGE_DOWNLOADING.format(
+            await post_status(mm(kind, "MSG_MERGE_DOWNLOADING").format(
                 index=index, total=count, size=format_size(item.get("size"))
             ))
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+            await context.bot.send_chat_action(
+                chat_id=chat_id, action=ChatAction.UPLOAD_VOICE if is_audio_merge else ChatAction.UPLOAD_VIDEO
+            )
 
             path = work_dir / f"part_{index}"
             telegram_file = await with_retries(context.bot.get_file, item["file_id"])
@@ -8300,16 +8594,19 @@ async def run_merge(context: ContextTypes.DEFAULT_TYPE, session: dict, user) -> 
             paths.append(path)
 
         # ---- look at every video ----
-        await post_status(MSG_MERGE_CHECKING)
+        await post_status(mm(kind, "MSG_MERGE_CHECKING"))
 
         signatures: list[dict] = []
         durations: list[float | None] = []
 
         for index, path in enumerate(paths, start=1):
-            signature = await probe_merge_signature(str(path))
+            if is_audio_merge:
+                signature = await probe_audio_merge_signature(str(path))
+            else:
+                signature = await probe_merge_signature(str(path))
 
             if signature is None:
-                raise MergeRefused(MSG_MERGE_NOT_A_VIDEO.format(index=index))
+                raise MergeRefused(mm(kind, "MSG_MERGE_NOT_A_VIDEO").format(index=index))
 
             signatures.append(signature)
             durations.append(await get_duration(str(path)))
@@ -8373,8 +8670,29 @@ async def run_merge(context: ContextTypes.DEFAULT_TYPE, session: dict, user) -> 
 
             await admin_watch.start()
 
-            if merge_can_stream_copy(signatures):
-                await show_bar(MSG_MERGE_JOINING.format(count=count))
+            if is_audio_merge and merge_audio_can_copy(signatures):
+                copy_output = work_dir / ("merged.mp3" if signatures[0]["audio_codec"] == "mp3" else "merged.m4a")
+                await show_bar(mm(kind, "MSG_MERGE_JOINING").format(count=count))
+
+                try:
+                    await run_ffmpeg_with_progress(
+                        build_merge_audio_copy_command(paths, work_dir / "list.txt", copy_output),
+                        total_duration,
+                        progress_callback,
+                    )
+                    used_copy = copy_output.exists() and copy_output.stat().st_size > 0
+                except JobCancelled:
+                    raise
+                except Exception:
+                    logger.warning("Joining audios without re-encoding failed — re-encoding instead.", exc_info=True)
+
+                if used_copy:
+                    output_path = copy_output
+                else:
+                    copy_output.unlink(missing_ok=True)
+
+            if not is_audio_merge and merge_can_stream_copy(signatures):
+                await show_bar(mm(kind, "MSG_MERGE_JOINING").format(count=count))
 
                 try:
                     await run_ffmpeg_with_progress(
@@ -8392,12 +8710,15 @@ async def run_merge(context: ContextTypes.DEFAULT_TYPE, session: dict, user) -> 
                     output_path.unlink(missing_ok=True)
 
             if not used_copy:
-                await show_bar(MSG_MERGE_REENCODING.format(count=count))
-                await run_ffmpeg_with_progress(
-                    build_merge_reencode_command(paths, signatures, durations, output_path),
-                    total_duration,
-                    progress_callback,
-                )
+                await show_bar(mm(kind, "MSG_MERGE_REENCODING").format(count=count))
+
+                if is_audio_merge:
+                    output_path = work_dir / "merged.m4a"
+                    reencode_command = build_merge_audio_reencode_command(paths, signatures, output_path)
+                else:
+                    reencode_command = build_merge_reencode_command(paths, signatures, durations, output_path)
+
+                await run_ffmpeg_with_progress(reencode_command, total_duration, progress_callback)
 
             encode_seconds = time.monotonic() - encode_started
         finally:
@@ -8411,33 +8732,48 @@ async def run_merge(context: ContextTypes.DEFAULT_TYPE, session: dict, user) -> 
         merged_size = output_path.stat().st_size
 
         if merged_size > TELEGRAM_UPLOAD_LIMIT_BYTES:
-            raise MergeRefused(MSG_MERGE_TOO_BIG)
+            raise MergeRefused(mm(kind, "MSG_MERGE_TOO_BIG"))
 
         output_duration = await get_duration(str(output_path))
-        output_width, output_height = await get_video_dimensions(str(output_path))
-        thumbnail_path = work_dir / "thumb.jpg"
-        has_thumbnail = await generate_thumbnail(str(output_path), str(thumbnail_path), output_duration)
-
-        await status_message.edit_text(MSG_MERGE_SENDING)
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-
-        await send_video_with_cover(
-            context.bot,
-            None,
-            chat_id=chat_id,
-            video=str(output_path),
-            supports_streaming=True,
-            width=output_width,
-            height=output_height,
-            duration=round(output_duration) if output_duration else None,
-            thumbnail=str(thumbnail_path) if has_thumbnail else None,
-            caption=MSG_MERGE_DONE_CAPTION.format(
-                count=count,
-                mode=MSG_MERGE_MODE_COPY if used_copy else MSG_MERGE_MODE_REENCODE,
-                length=format_duration(output_duration) if output_duration else "unknown",
-                size=format_size(merged_size),
-            ),
+        done_caption = mm(kind, "MSG_MERGE_DONE_CAPTION").format(
+            count=count,
+            mode=MSG_MERGE_MODE_COPY if used_copy else MSG_MERGE_MODE_REENCODE,
+            length=format_duration(output_duration) if output_duration else "unknown",
+            size=format_size(merged_size),
         )
+
+        await status_message.edit_text(mm(kind, "MSG_MERGE_SENDING"))
+
+        if is_audio_merge:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+
+            with named_for_upload(output_path, f"{MSG_MERGE_AUDIO_TITLE}{output_path.suffix}") as send_path:
+                await with_retries(
+                    context.bot.send_audio,
+                    chat_id=chat_id,
+                    audio=str(send_path),
+                    duration=round(output_duration) if output_duration else None,
+                    title=MSG_MERGE_AUDIO_TITLE,
+                    caption=done_caption,
+                )
+        else:
+            output_width, output_height = await get_video_dimensions(str(output_path))
+            thumbnail_path = work_dir / "thumb.jpg"
+            has_thumbnail = await generate_thumbnail(str(output_path), str(thumbnail_path), output_duration)
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+            await send_video_with_cover(
+                context.bot,
+                None,
+                chat_id=chat_id,
+                video=str(output_path),
+                supports_streaming=True,
+                width=output_width,
+                height=output_height,
+                duration=round(output_duration) if output_duration else None,
+                thumbnail=str(thumbnail_path) if has_thumbnail else None,
+                caption=done_caption,
+            )
 
         admin_outcome = ("done", "")
         with contextlib.suppress(Exception):
@@ -8510,6 +8846,281 @@ async def run_merge(context: ContextTypes.DEFAULT_TYPE, session: dict, user) -> 
         active_job_ids.discard(key)
         await maybe_notify_update_ready(context.bot)
 
+
+
+# ============================================================
+# Split a video in two
+# ============================================================
+#
+# "✂️ Split video" asks for the time of the cut (H:MM:SS), then cuts the stored
+# video into two videos: start → cut, and cut → end. Both parts are re-encoded
+# (near-original quality) so the cut lands exactly where it was asked, not on the
+# nearest keyframe. The original stays in the menu afterwards.
+
+SPLIT_CRF = os.getenv("SPLIT_CRF", "20")
+SPLIT_PRESET = os.getenv("SPLIT_PRESET", "veryfast")
+SPLIT_AUDIO_BITRATE = os.getenv("SPLIT_AUDIO_BITRATE", "160k")
+
+
+def parse_split_time(text: str) -> float | None:
+    """'0:05:30' -> 330.0   ('5:30' and '330' work too). None when it isn't a time."""
+    cleaned = (text or "").strip().replace(",", ".")
+
+    if not cleaned or not re.fullmatch(r"[0-9]+(:[0-9]+){0,2}(\.[0-9]+)?", cleaned):
+        return None
+
+    parts = cleaned.split(":")
+    numbers = [float(part) for part in parts]
+
+    if any(number >= 60 for number in numbers[1:]):   # minutes / seconds after the first part: 0-59
+        return None
+
+    total = 0.0
+    for number in numbers:
+        total = total * 60 + number
+
+    return total
+
+
+def format_clock(seconds: float) -> str:
+    """Seconds -> H:MM:SS (the same way people type it)."""
+    seconds = max(0, int(round(seconds)))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}"
+
+
+def build_split_command(input_path, output_path, start: float, length: float | None) -> list[str]:
+    command = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    if start > 0:
+        command += ["-ss", f"{start:.3f}"]   # before -i: fast, and still frame-accurate when re-encoding
+
+    command += ["-threads", DECODER_THREADS, "-i", str(input_path)]
+
+    if length is not None:
+        command += ["-t", f"{length:.3f}"]
+
+    medium = LEVELS["medium"]   # its low-RAM x264 buffering settings
+    command += [
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-c:v", "libx264", "-preset", SPLIT_PRESET, "-crf", SPLIT_CRF,
+        "-x264-params", f"rc-lookahead={medium['lookahead']}:ref={medium['refs']}:bframes={medium['bframes']}",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",   # even size + a pixel format every player shows
+        "-threads", FFMPEG_THREADS,
+        "-c:a", "aac", "-b:a", SPLIT_AUDIO_BITRATE,
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        str(output_path),
+    ]
+    return command
+
+
+async def start_split_prompt(query, context: ContextTypes.DEFAULT_TYPE, message_id: int) -> None:
+    """The "✂️ Split video" button: ask where to cut."""
+    pending = pending_compressions.get(message_id)
+
+    if pending is None or pending.get("media_type") != "video":
+        await query.message.reply_text(MSG_THAT_VIDEO_ISN_T_IN_2)
+        return
+
+    if message_id in active_job_ids or message_id in running_jobs:
+        await query.message.reply_text(MSG_SPLIT_BUSY)
+        return
+
+    duration = pending.get("duration")
+
+    if not duration or duration < 2:
+        await query.message.reply_text(MSG_SPLIT_NO_LENGTH)
+        return
+
+    chat_id = pending["chat_id"]
+    awaiting_input[chat_id] = {"mid": message_id, "field": "splittime"}
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=MSG_SPLIT_ASK.format(length=format_duration(duration), clock=format_clock(duration)),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(BTN_CANCEL, callback_data=f"ameta:stop:{message_id}")
+        ]]),
+    )
+
+
+async def handle_split_time(update: Update, context: ContextTypes.DEFAULT_TYPE, message_id: int, pending: dict, text: str) -> None:
+    """The person answered with the time of the cut."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    duration = pending.get("duration") or 0
+    split_at = parse_split_time(text)
+
+    if split_at is None:
+        await message.reply_text(MSG_SPLIT_BAD_TIME)
+        return
+
+    if split_at < 1 or split_at > duration - 1:
+        await message.reply_text(MSG_SPLIT_OUT_OF_RANGE.format(clock=format_clock(duration)))
+        return
+
+    awaiting_input.pop(chat_id, None)
+    await run_split(context, chat_id, message_id, pending, split_at, update.effective_user)
+
+
+async def run_split(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, pending: dict, split_at: float, user) -> None:
+    """Cut the stored video at split_at and send the two parts. Holds the shared work slot."""
+    global active_compressions
+
+    if message_id in active_job_ids or message_id in running_jobs:
+        await context.bot.send_message(chat_id=chat_id, text=MSG_SPLIT_BUSY)
+        return
+
+    owner_id = pending.get("owner_id")
+    input_path = pending["input_path"]
+    work_dir = Path(pending["work_dir"])
+    duration = float(pending.get("duration") or 0)
+    parts = [(1, 0.0, split_at), (2, split_at, duration)]
+
+    status_message = None
+    work_slot_held = False
+    admin_watch = AdminJobWatcher(context.bot, user, "split")
+    admin_outcome: tuple[str, str] | None = None
+    job_token = object()
+
+    async def post_status(text: str, markup=None) -> None:
+        nonlocal status_message
+        if status_message is None:
+            status_message = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        else:
+            await status_message.edit_text(text, reply_markup=markup)
+
+    active_job_ids.add(message_id)
+
+    try:
+        await acquire_work_slot(post_status, user_priority(owner_id), user_plan_label(owner_id))
+        work_slot_held = True
+
+        job_handle = {"user_id": owner_id, "cancelled": False, "process": None, "done": False}
+        running_jobs[message_id] = job_handle
+        job_context_token = CURRENT_JOB.set(job_handle)
+        active_compressions += 1
+        active_job_progress[job_token] = {"start_time": time.monotonic(), "duration": duration, "percent": 0.0}
+
+        try:
+            await admin_watch.start()
+
+            for part, start, end in parts:
+                length = end - start
+                label = MSG_SPLIT_CUTTING.format(part=part, start=format_clock(start), end=format_clock(end))
+                output_path = work_dir / f"split_{part}.mp4"
+                state = {"last_percent": -10.0, "last_edit": 0.0, "start": time.monotonic()}
+                active_job_progress[job_token].update(start_time=time.monotonic(), percent=0.0, duration=length)
+                await post_status(f"{label}\n{render_progress_bar(0)}", cancel_job_keyboard(message_id))
+
+                async def on_progress(percent: float, label=label, state=state) -> None:
+                    active_job_progress[job_token]["percent"] = percent
+                    await admin_watch.progress(percent)
+                    now = time.monotonic()
+
+                    if percent - state["last_percent"] < 4 and now - state["last_edit"] < 3 and percent < 100:
+                        return
+
+                    state["last_percent"], state["last_edit"] = percent, now
+                    elapsed = now - state["start"]
+                    eta = f" · ~{format_duration(elapsed * (100 - percent) / percent)} left" if 1 <= percent < 100 and elapsed > 2 else ""
+
+                    try:
+                        await status_message.edit_text(
+                            f"{label}\n{render_progress_bar(percent)}{eta}",
+                            reply_markup=cancel_job_keyboard(message_id),
+                        )
+                    except Exception:
+                        pass   # rate-limit hiccup / "message not modified": never abort the split for it
+
+                await run_ffmpeg_with_progress(
+                    build_split_command(input_path, output_path, start, length if part == 1 else None),
+                    length,
+                    on_progress,
+                )
+
+                size = output_path.stat().st_size
+
+                if size > TELEGRAM_UPLOAD_LIMIT_BYTES:
+                    raise MergeRefused(MSG_SPLIT_TOO_BIG.format(part=part))
+
+                part_duration = await get_duration(str(output_path))
+                width, height = await get_video_dimensions(str(output_path))
+                thumb_path = work_dir / f"split_{part}.jpg"
+                has_thumb = await generate_thumbnail(str(output_path), str(thumb_path), part_duration)
+
+                await status_message.edit_text(MSG_SPLIT_SENDING.format(part=part))
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+                await send_video_with_cover(
+                    context.bot,
+                    pending.get("cover_path"),
+                    chat_id=chat_id,
+                    video=str(output_path),
+                    supports_streaming=True,
+                    width=width,
+                    height=height,
+                    duration=round(part_duration) if part_duration else None,
+                    thumbnail=str(thumb_path) if has_thumb else None,
+                    caption=MSG_SPLIT_CAPTION.format(
+                        part=part, start=format_clock(start), end=format_clock(end),
+                        length=format_duration(part_duration) if part_duration else "?", size=format_size(size),
+                    ),
+                )
+
+                # Free the disk before the next part is made.
+                output_path.unlink(missing_ok=True)
+                thumb_path.unlink(missing_ok=True)
+        finally:
+            job_handle["done"] = True
+            running_jobs.pop(message_id, None)
+            CURRENT_JOB.reset(job_context_token)
+            active_compressions -= 1
+            active_job_progress.pop(job_token, None)
+
+        admin_outcome = ("done", "")
+        with contextlib.suppress(Exception):
+            await status_message.delete()
+        await context.bot.send_message(chat_id=chat_id, text=MSG_SPLIT_DONE.format(clock=format_clock(split_at)))
+
+    except JobCancelled:
+        logger.info("Split cancelled by the user")
+        record_cancel()
+        admin_outcome = ("cancelled", "")
+        if status_message is not None:
+            with contextlib.suppress(Exception):
+                await status_message.edit_text(MSG_SPLIT_CANCELLED)
+
+    except MergeRefused as problem:
+        record_failure(user)
+        admin_outcome = ("failed", "")
+        await context.bot.send_message(chat_id=chat_id, text=str(problem))
+
+    except Exception as error:
+        logger.exception("Error splitting the video:")
+        record_failure(user)
+        admin_outcome = ("failed", "")
+        await context.bot.send_message(chat_id=chat_id, text=MSG_SPLIT_FAILED.format(error=error))
+
+    finally:
+        await admin_watch.finish(admin_outcome)
+        active_job_progress.pop(job_token, None)
+
+        for part, _start, _end in parts:   # whatever a failed / cancelled run left behind
+            (work_dir / f"split_{part}.mp4").unlink(missing_ok=True)
+            (work_dir / f"split_{part}.jpg").unlink(missing_ok=True)
+
+        if work_slot_held:
+            release_work_slot()
+
+        active_job_ids.discard(message_id)
+
+        if pending_compressions.get(message_id) is pending:
+            pending["last_active"] = time.time()   # the original's idle timer restarts
+
+        await maybe_notify_update_ready(context.bot)
 
 
 # ============================================================
@@ -8778,6 +9389,10 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     field = waiting["field"]
     text = message.text.strip()
+
+    if field == "splittime":
+        await handle_split_time(update, context, waiting["mid"], pending, text)
+        return
 
     if field == "name":
         cleaned = sanitize_filename(text)
@@ -9085,7 +9700,7 @@ async def handle_pdf_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id if update.effective_user else None
 
     if chat_id in merge_sessions:
-        await message.reply_text(MSG_MERGE_VIDEOS_ONLY)
+        await message.reply_text(merge_busy_text(chat_id))
         return
 
     if update_mode["on"] and not is_admin(user_id):
@@ -9931,7 +10546,7 @@ async def handle_rar_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE
     archive_name = document.file_name or "archive.rar"
 
     if chat_id in merge_sessions:
-        await message.reply_text(MSG_MERGE_VIDEOS_ONLY)
+        await message.reply_text(merge_busy_text(chat_id))
         return
 
     if update_mode["on"] and not is_admin(user_id):
@@ -10368,7 +10983,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             touched["last_active"] = time.time()
 
     if action == "merge":
-        await handle_merge_callback(query, context, level)
+        await handle_merge_callback(query, context, level, message_id)
         return
 
     if action == "home":
@@ -11102,6 +11717,10 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.reply_text(MSG_AUDIO_REPLACEMENT_CANCELLED)
         return
 
+    if action == "splitask":
+        await start_split_prompt(query, context, message_id)
+        return
+
     if action == "videocover":
         pending = pending_compressions.get(message_id)
 
@@ -11692,6 +12311,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("setlevel", setlevel))
     application.add_handler(CommandHandler("merge", merge_command))
+    application.add_handler(CommandHandler("mergeaudio", mergeaudio_command))
     application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("ram", ram_command))
     application.add_handler(CommandHandler("ram_clean", ram_clean_command))
