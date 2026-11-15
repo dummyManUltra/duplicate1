@@ -16,6 +16,7 @@ import itertools
 import hashlib
 import io
 import zipfile
+import subprocess
 import posixpath
 import struct
 from xml.etree import ElementTree as _ET
@@ -5571,11 +5572,12 @@ class AdminJobWatcher:
         if not self.enabled or self.message_id is None:
             return
 
-        state, refunded = outcome or ("stopped", "")
+        state, refunded, *extra = outcome or ("stopped", "")
+        summary = extra[0] if extra else ""
         refund_note = MSG_ADMIN_JOB_REFUND_NOTE.format(size=refunded) if refunded else ""
 
         if state == "done":
-            line = MSG_ADMIN_JOB_DONE.format(kind=self.kind)
+            line = MSG_ADMIN_JOB_DONE.format(kind=self.kind) + (f"\n{summary}" if summary else "")
         elif state == "cancelled":
             line = MSG_ADMIN_JOB_CANCELLED.format(kind=self.kind, refund_note=refund_note)
         elif state == "failed":
@@ -7704,9 +7706,72 @@ async def run_compression(
     encode_seconds: float | None = None
     queue_wait_seconds: float | None = None
 
+    def admin_summary() -> str:
+        """The few lines the admin sees when a job is done: size saved, time spent, tools used."""
+        lines: list[str] = []
+        is_real_compression = not (is_audio_copy or is_video_audio_edit or is_video_audio_replace or is_cover_only)
+
+        if is_real_compression and original_size and compressed_size is not None:
+            difference = original_size - compressed_size
+            if difference >= 0:
+                lines.append(
+                    f"📉 {format_size(original_size)} → {format_size(compressed_size)} · "
+                    f"saved {format_size(difference)} ({difference / original_size * 100:.0f}%)"
+                )
+            else:
+                lines.append(
+                    f"📈 {format_size(original_size)} → {format_size(compressed_size)} · "
+                    f"{format_size(-difference)} bigger"
+                )
+
+        times = [f"total {format_duration(time.monotonic() - job_started)}"]
+        if queue_wait_seconds and queue_wait_seconds >= 1:
+            times.append(f"waited {format_duration(queue_wait_seconds)}")
+        if encode_seconds:
+            times.append(f"encoding {format_duration(encode_seconds)}")
+        if duration:
+            times.append(f"media length {format_duration(duration)}")
+        lines.append("⏱ " + " · ".join(times))
+
+        tools: list[str] = []
+        if is_cover_only:
+            tools.append("no encoding — cover only")
+        else:
+            tools.append("FFmpeg")
+            if level_info is not None:
+                tools.append(
+                    f"libx264 {level_info['label']} (CRF {level_info['crf']}, {level_info['preset']}, "
+                    f"max {level_info['max_width']}px)"
+                )
+            elif is_video_audio_edit or is_video_audio_replace:
+                tools.append("video copied, not re-encoded")
+
+            if is_audio_copy or copy_audio:
+                tools.append("audio copied as is")
+            elif audio_bitrate:
+                tools.append(f"AAC {audio_bitrate.rstrip('k')} kbps")
+
+            if max_fps:
+                tools.append(f"{max_fps} fps cap")
+            if noise_reduction:
+                tools.append("noise reduction")
+            if voice_enhancement:
+                tools.append("voice enhancement")
+            if volume_boost_percent:
+                tools.append(f"+{volume_boost_percent}% volume")
+            if smart:
+                tools.append("🧠 smart compression")
+
+        lines.append("🛠 " + " · ".join(tools))
+        return "\n".join(lines)
+
     def log_success() -> None:
         nonlocal admin_outcome
         admin_outcome = ("done", "")
+        try:
+            admin_outcome = ("done", "", admin_summary())
+        except Exception:
+            logger.exception("Couldn't build the admin summary")
         try:
             record_job(
                 user=stats_user,
@@ -11408,11 +11473,43 @@ def pptx_error_line(stderr: str) -> str:
     return lines[-1][:200] if lines else "unknown error"
 
 
-def pptx_extract_slide_audio(source: Path, media_dir: Path) -> list[list[Path]]:
+PPTX_NOT_AUDIO_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".jfif", ".gif", ".bmp", ".tif", ".tiff", ".emf", ".wmf", ".svg", ".webp",
+    ".wdp", ".psd", ".bin", ".xml", ".rels", ".fntdata", ".ttf", ".otf", ".txt", ".json",
+)
+
+
+def pptx_is_audio_only_file(path: Path) -> bool:
+    """For a media file with an unusual extension (.mp4, .3gp, .amr ...): does it hold sound and NO picture?"""
+    if not shutil.which("ffprobe"):
+        return False
+
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return False
+
+    kinds = {line.strip().split(",")[0] for line in result.stdout.splitlines() if line.strip()}
+    return "audio" in kinds and "video" not in kinds
+
+
+def pptx_extract_slide_audio(source: Path, media_dir: Path) -> tuple[list[list[Path]], list[str], str]:
     """
     Open the .pptx (a zip) and, for every slide in PRESENTATION order, pull out the audio
-    files that slide plays (in the order they appear on the slide). Returns one list of
-    extracted files per slide — an empty list for a slide with no recording.
+    that slide plays (in the order it appears on the slide).
+
+    Returns (clips, notes, media_summary):
+      clips         one list of extracted files per slide — empty for a slide with no recording
+      notes         things worth telling the person (e.g. recordings had to be matched by order)
+      media_summary what is inside the file's media folder, for the "nothing found" message
+
+    Two ways to find the recordings:
+      1. the normal way — the slide itself links to its recording (PowerPoint does this);
+      2. if no slide links to any — look inside ppt/media like you would by hand (rename the file
+         to .zip and open the media folder) and give the recordings to the slides in order.
     """
     rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
     p_ns = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
@@ -11425,6 +11522,7 @@ def pptx_extract_slide_audio(source: Path, media_dir: Path) -> list[list[Path]]:
 
     with archive:
         names = set(archive.namelist())
+        notes: list[str] = []
 
         def resolve(base_dir: str, target: str) -> str:
             if target.startswith("/"):
@@ -11461,10 +11559,51 @@ def pptx_extract_slide_audio(source: Path, media_dir: Path) -> list[list[Path]]:
         if len(slide_parts) > PPTX_MAX_SLIDES:
             raise RuntimeError(f"it has more than {PPTX_MAX_SLIDES} slides")
 
+        # What is in the media folder (for the message when nothing is found).
+        extension_counts: dict[str, int] = {}
+        for name in names:
+            if name.startswith("ppt/media/") and not name.endswith("/"):
+                extension = Path(name).suffix.lower() or "(none)"
+                extension_counts[extension] = extension_counts.get(extension, 0) + 1
+        media_summary = (
+            ", ".join(f"{ext} × {count}" for ext, count in sorted(extension_counts.items()))
+            if extension_counts else "no media files at all"
+        )
+
         media_dir.mkdir(parents=True, exist_ok=True)
-        total_bytes = 0
+        state = {"total_bytes": 0, "counter": 0}
+
+        def try_extract(member: str, label: str) -> Path | None:
+            """Copy one file out of the zip if it is a recording. Returns its path, or None if it isn't audio."""
+            extension = Path(member).suffix.lower()
+
+            if extension in PPTX_NOT_AUDIO_EXTENSIONS or not extension:
+                return None
+
+            info = archive.getinfo(member)
+            known_audio = extension in PPTX_AUDIO_EXTENSIONS
+
+            if not known_audio and info.file_size > 200 * 1024 * 1024:
+                return None   # a big unknown file is far more likely a video clip than a recording
+
+            state["total_bytes"] += info.file_size
+            if state["total_bytes"] > PPTX_MAX_AUDIO_MB * 1024 * 1024:
+                raise RuntimeError(f"the recordings add up to more than {PPTX_MAX_AUDIO_MB} MB")
+
+            state["counter"] += 1
+            dest = media_dir / f"{label}_{state['counter']:04d}{extension}"
+            with archive.open(member) as source_file, open(dest, "wb") as out_file:
+                shutil.copyfileobj(source_file, out_file)
+
+            if not known_audio and not pptx_is_audio_only_file(dest):
+                dest.unlink(missing_ok=True)
+                return None
+
+            return dest
+
         per_slide: list[list[Path]] = []
 
+        # ---- way 1: each slide links to its own recording ----
         for number, part in enumerate(slide_parts, 1):
             rels = read_rels(part)
             xml_text = archive.read(part).decode("utf-8", errors="ignore")
@@ -11472,28 +11611,49 @@ def pptx_extract_slide_audio(source: Path, media_dir: Path) -> list[list[Path]]:
             seen: set[str] = set()
 
             # Every r:link / r:embed on the slide, in the order it appears: the recording is one of them.
-            for rel_id in re.findall(r'[A-Za-z0-9_]+:(?:link|embed)="([^"]+)"', xml_text):
+            for rel_id in re.findall(r'[A-Za-z0-9_]+:(?:link|embed|id)="([^"]+)"', xml_text):
                 target = rels.get(rel_id)
                 if not target:
                     continue
 
                 member = resolve(posixpath.dirname(part), target)
-                if member in seen or member not in names or not member.lower().endswith(PPTX_AUDIO_EXTENSIONS):
+                if member in seen or member not in names:
                     continue
                 seen.add(member)
 
-                total_bytes += archive.getinfo(member).file_size
-                if total_bytes > PPTX_MAX_AUDIO_MB * 1024 * 1024:
-                    raise RuntimeError(f"the recordings add up to more than {PPTX_MAX_AUDIO_MB} MB")
-
-                dest = media_dir / f"s{number:04d}_{len(clips) + 1}{Path(member).suffix.lower()}"
-                with archive.open(member) as source_file, open(dest, "wb") as out_file:
-                    shutil.copyfileobj(source_file, out_file)
-                clips.append(dest)
+                clip = try_extract(member, f"s{number:04d}")
+                if clip is not None:
+                    clips.append(clip)
 
             per_slide.append(clips)
 
-        return per_slide
+        # ---- way 2: nothing was linked — read the media folder the way you would by hand ----
+        if not any(per_slide):
+            candidates = sorted(
+                (name for name in names if name.startswith("ppt/media/") and not name.endswith("/")),
+                key=lambda name: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name.lower())],
+            )
+            found: list[Path] = []
+
+            for member in candidates:
+                clip = try_extract(member, "media")
+                if clip is not None:
+                    found.append(clip)
+
+            if found:
+                slide_total = len(slide_parts)
+
+                if len(found) == slide_total:
+                    notes.append("ℹ️ The recordings weren't linked to their slides inside the file, so I matched them to the slides in order.")
+                else:
+                    notes.append(
+                        f"⚠️ I found {len(found)} recordings for {slide_total} slides and they weren't linked to slides, "
+                        "so I matched them in order — please check the result."
+                    )
+
+                per_slide = [[found[i]] if i < len(found) else [] for i in range(slide_total)]
+
+        return per_slide, notes, media_summary
 
 
 async def pptx_normalise_audio(clips: list[Path], output: Path) -> None:
@@ -11813,15 +11973,22 @@ async def run_pptx_job(query, context: ContextTypes.DEFAULT_TYPE, pending: dict,
 
         if need_recordings:
             await post_status("🔎 Looking for the recordings in your slides…")
-            slide_clips = await asyncio.to_thread(pptx_extract_slide_audio, source, work_dir / "media")
+            slide_clips, found_notes, media_summary = await asyncio.to_thread(
+                pptx_extract_slide_audio, source, work_dir / "media"
+            )
+            notes.extend(found_notes)
             slide_count = len(slide_clips)
             slides_with_audio = sum(1 for clips in slide_clips if clips)
 
             if slides_with_audio == 0 and kind == "audio":
-                raise RuntimeError("I couldn't find any recordings in this file")
+                raise RuntimeError(
+                    f"I couldn't find any recordings in this file ({slide_count} slides; media folder: {media_summary})"
+                )
 
             if slides_with_audio == 0:
-                notes.append("ℹ️ I couldn't find any recordings in this file, so the video has silent slides.")
+                notes.append(
+                    f"ℹ️ I couldn't find any recordings in this file (media folder: {media_summary}), so the video has silent slides."
+                )
 
             audio_dir = work_dir / "audio"
             audio_dir.mkdir(exist_ok=True)
