@@ -5,7 +5,7 @@ FROM aiogram/telegram-bot-api:latest AS botapi
 FROM python:3.12-alpine
 
 RUN apk add --no-cache ffmpeg ca-certificates qpdf ghostscript 7zip libarchive-tools \
-    tesseract-ocr tesseract-ocr-data-eng
+    tesseract-ocr tesseract-ocr-data-eng libreoffice-impress font-noto font-noto-arabic ttf-dejavu
 
 # Bring in the telegram-bot-api server binary from stage 1
 COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
