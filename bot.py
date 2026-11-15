@@ -16,7 +16,11 @@ import itertools
 import hashlib
 import io
 import zipfile
+import posixpath
+import struct
+from xml.etree import ElementTree as _ET
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 from pathlib import Path
 from urllib.parse import quote
 
@@ -25,6 +29,9 @@ from telegram import (
     Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    LinkPreviewOptions,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatAction
@@ -179,15 +186,35 @@ MSG_ABOUT_THIS_BOT_COMPRESSES_VIDEOS = (
 # ---- payment steps text ----
 MSG_30_DAYS_PER_DAY_FILES = (
     "{plan_tier} — 30 days\n"
-    "• {size_daily_mb} per day · files up to {size_max_file_mb}\n"
+    "• {size_daily_mb} per day - files up to {size_max_file_mb} - {perk}\n"
     "\n"
     "💳 How to pay:\n"
     "{how_to_pay}\n"
     "\n"
-    "📸 Then send me a screenshot of the payment here, as a photo, and I'll pass it to the owner. You'll get a message here as soon as your plan is active.\n"
+    "📸 Then send a screenshot of the payment here\n"
+    "OR\n"
+    "💬 in the Direct messages of the {channel_link} + your ID\n"
+    "You'll get a message here as soon as your plan is active. 🫶\n"
     "\n"
-    "{dm_text}"
+    "🆔 YOUR ID: {user_id}"
 )
+MSG_PAYMENT_MAIN_CHANNEL = "main channel"
+
+# The same instructions in Arabic — shown under the English ones in the same message.
+MSG_PAYMENT_ARABIC = (
+    "💳 طريقة الدفع:\n"
+    "{how_to_pay}\n"
+    "\n"
+    "📸 بعد كده ابعت سكرين شوت للدفع هنا\n"
+    "أو\n"
+    "💬 ابعته في رسائل الـ Direct بتاعة {channel_link} + الـ ID بتاعك\n"
+    "هتوصلك رسالة هنا أول ما باقتك تتفعّل. 🫶\n"
+    "\n"
+    "🆔 الـ ID بتاعك: {user_id}"
+)
+MSG_PAYMENT_MAIN_CHANNEL_AR = "القناة الرئيسية"
+MSG_PAYMENT_NO_DETAILS_AR = "اسأل المالك عن تفاصيل الدفع."
+MSG_PAYMENT_DIVIDER = "━━━━━━━━━━━━"
 
 # ---- maybe handle payment proof ----
 MSG_PAYMENT_PROOF_FROM_ID_WANTS = (
@@ -753,7 +780,9 @@ MSG_YOU_RE_NOW_ON_THE = (
 
 # ---- home keyboard ----
 BTN_USAGE = "📊 Usage"
-BTN_SUBSCRIBE = "💎 Subscribe"
+BTN_SUBSCRIBE = "💎 Subscribe!"
+BTN_PLANS = "📦 Plans"
+BTN_HOW_TO_USE = "❓ How to use"
 BTN_ABOUT_THE_BOT = "ℹ️ About the bot"
 
 # ---- about keyboard ----
@@ -1129,6 +1158,7 @@ def build_database_zip() -> bytes:
         archive.writestr(SUBS_ENTRY_NAME, subscriptions_json_bytes())
         archive.writestr(REFERRALS_ENTRY_NAME, referrals_json_bytes())
         archive.writestr(EVENT_ENTRY_NAME, event_json_bytes())
+        archive.writestr(PRICES_ENTRY_NAME, prices_json_bytes())
 
     return buffer.getvalue()
 
@@ -1138,6 +1168,7 @@ def database_fingerprint() -> str:
     return hashlib.sha256(
         approved_users_json_bytes() + b"|" + stats_json_bytes() + b"|" + quota_json_bytes()
         + b"|" + subscriptions_json_bytes() + b"|" + referrals_json_bytes() + b"|" + event_json_bytes()
+        + b"|" + prices_json_bytes()
     ).hexdigest()
 
 
@@ -1191,6 +1222,12 @@ def read_database_bytes(raw: bytes) -> int:
                     merge_event_bytes(archive.read(EVENT_ENTRY_NAME))
                 except ValueError:
                     logger.warning("Database.zip has an unreadable %s — skipping the event.", EVENT_ENTRY_NAME)
+
+            if PRICES_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_prices_bytes(archive.read(PRICES_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the prices.", PRICES_ENTRY_NAME)
 
             return added
     except zipfile.BadZipFile as error:
@@ -2016,16 +2053,27 @@ async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 SUBS_ENTRY_NAME = "subscriptions.json"
 REFERRALS_ENTRY_NAME = "referrals.json"
 EVENT_ENTRY_NAME = "event.json"
+PRICES_ENTRY_NAME = "prices.json"
 SUBSCRIBE_CONTACT = os.getenv("SUBSCRIBE_CONTACT", "")   # e.g. "@yourusername" — shown to people who hit a limit
 
-# Subscribe buttons stay switched off until this is set to "1" (env SUBSCRIPTIONS_ENABLED).
-SUBSCRIPTIONS_ENABLED = os.getenv("SUBSCRIPTIONS_ENABLED", "0") == "1"
+# Subscriptions are ON by default. To switch the Subscribe buttons off again
+# (they turn into a "coming soon" notice), set SUBSCRIPTIONS_ENABLED=0 in Railway.
+SUBSCRIPTIONS_ENABLED = os.getenv("SUBSCRIPTIONS_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 FREE_MAX_FILE_MB = float(os.getenv("FREE_MAX_FILE_MB", "200"))
 
 # How people pay: the text you want shown to them (account numbers, prices...).
 # Set PAYMENT_INSTRUCTIONS in Railway; use \n for a new line.
-PAYMENT_INSTRUCTIONS = os.getenv("PAYMENT_INSTRUCTIONS", "").replace("\\n", "\n")
+PAYMENT_INSTRUCTIONS = os.getenv(
+    "PAYMENT_INSTRUCTIONS",
+    "send {price} using Vodafone cash to this number: 01016471909",
+).replace("\\n", "\n")
+
+# The Arabic version of the line above (shown under it). {price} works here too.
+PAYMENT_INSTRUCTIONS_AR = os.getenv(
+    "PAYMENT_INSTRUCTIONS_AR",
+    "ابعت {price} على فودافون كاش على الرقم ده: 01016471909",
+).replace("\\n", "\n")
 
 TIERS: dict[str, dict] = {
     "free": {"label": MSG_FREE, "emoji": "🆓", "daily_mb": DAILY_LIMIT_MB, "max_file_mb": FREE_MAX_FILE_MB, "priority": 0},
@@ -2046,6 +2094,60 @@ referrals: dict = {
     "rewards": {},    # inviter (text id) -> how many times they earned the reward
     "bonus": {},      # user (text id) -> {"tier": ..., "until": ...} free days; runs next to a paid plan
 }
+
+
+# Plan prices (/price). Saved inside Database.zip (prices.json), so a redeploy keeps them.
+PRICE_CURRENCY = os.getenv("PRICE_CURRENCY", "EGP")
+PRICE_MAX = 1_000_000
+prices: dict = {"plus": 10, "pro": None, "updated": 0}   # "updated" = unix time of the last /price change
+
+
+PRICE_CURRENCY_AR = os.getenv("PRICE_CURRENCY_AR", "جنيه" if PRICE_CURRENCY.upper() == "EGP" else PRICE_CURRENCY)
+
+
+def price_text(tier: str, arabic: bool = False) -> str:
+    """'10 EGP' ('10 جنيه' in Arabic), or a stand-in sentence while that plan has no price yet."""
+    value = prices.get(tier)
+
+    if not value:
+        return "سعر الباقة (اسأل المالك)" if arabic else "the plan price (ask the owner)"
+
+    return f"{float(value):g} {PRICE_CURRENCY_AR if arabic else PRICE_CURRENCY}"
+
+
+def prices_json_bytes() -> bytes:
+    return json.dumps(prices, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def merge_prices_bytes(raw: bytes) -> bool:
+    """Load prices from a Database.zip. The copy changed most recently wins. Raises ValueError if unusable."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"prices are not valid JSON ({error})") from error
+
+    if not isinstance(data, dict):
+        raise ValueError("not a prices file")
+
+    try:
+        updated = float(data.get("updated") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("prices have no valid timestamp") from None
+
+    if updated <= float(prices.get("updated") or 0):
+        return False
+
+    loaded: dict = {"updated": updated}
+
+    for tier in ("plus", "pro"):
+        try:
+            value = float(data.get(tier))
+        except (TypeError, ValueError):
+            value = None
+        loaded[tier] = value if value and 0 < value <= PRICE_MAX else None
+
+    prices.update(loaded)
+    return True
 
 
 def tier_label(tier: str) -> str:
@@ -2181,9 +2283,12 @@ def plans_text(user_id: int | None) -> str:
             "plus": "served before Free users",
             "pro": "served first",
         }[tier]
-        lines.append(
-            MSG_DAY_FILES_UP_TO.format(emoji=info['emoji'], label=info['label'], size_daily_mb=format_size(int(info['daily_mb'] * 1024 * 1024)), size_max_file_mb=format_size(int(info['max_file_mb'] * 1024 * 1024)), perk=perk)
-        )
+        line = MSG_DAY_FILES_UP_TO.format(emoji=info['emoji'], label=info['label'], size_daily_mb=format_size(int(info['daily_mb'] * 1024 * 1024)), size_max_file_mb=format_size(int(info['max_file_mb'] * 1024 * 1024)), perk=perk)
+
+        if tier != "free" and prices.get(tier):
+            line += f" · {price_text(tier)}"
+
+        lines.append(line)
 
     lines += ["", MSG_YOUR_PLAN.format(plan=plan_status_text(user_id))]
 
@@ -2489,6 +2594,7 @@ MSG_INVITE_DONE_INVITER = (
 )
 MSG_INVITE_DONE_INVITEE = "🎁 {name}'s invite just reached {target}/{target} — you got {invitee_days} of {invitee_tier}!"
 BTN_SHARE_INVITE = "📤 Share my link"
+BTN_INVITE_TO_WIN = "🎁 Invite to win!"
 MSG_SHARE_INVITE_TEXT = "Free video & audio compressor on Telegram (مش هكر والله 😁❤️)"
 
 
@@ -2663,6 +2769,31 @@ async def credit_referral(bot, user) -> None:
             )
 
 
+def invite_page(bot, user_id: int, with_back: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
+    """The invite screen (text + buttons). with_back adds a Back button for the home-menu version."""
+    back_row = [[ui_button(BTN_BACK, callback_data="home:back:0")]] if with_back else []
+
+    if invite_limit_reached(user_id):
+        text = MSG_INVITE_LIMIT_REACHED.format(max_rewards=INVITE_MAX_REWARDS)
+        return text, (InlineKeyboardMarkup(back_row) if back_row else None)
+
+    link = invite_link(bot, user_id)
+    text = MSG_INVITE_PAGE.format(
+        link=link,
+        target=INVITE_TARGET,
+        inviter_days=_days_text(INVITER_DAYS), inviter_tier=tier_label(INVITER_TIER),
+        invitee_days=_days_text(INVITEE_DAYS), invitee_tier=tier_label(INVITEE_TIER),
+        progress=len(referrals["progress"].get(str(user_id), [])),
+        rewards=int(referrals["rewards"].get(str(user_id), 0)),
+        max_rewards=INVITE_MAX_REWARDS,
+    )
+    share_row = [ui_button(
+        BTN_SHARE_INVITE,
+        url=f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(MSG_SHARE_INVITE_TEXT)}",
+    )]
+    return text, InlineKeyboardMarkup([share_row] + back_row)
+
+
 async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/invite — your personal link and how far along you are."""
     message = update.effective_message
@@ -2671,27 +2802,8 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if message is None or user is None:
         return
 
-    if invite_limit_reached(user.id):
-        await message.reply_text(MSG_INVITE_LIMIT_REACHED.format(max_rewards=INVITE_MAX_REWARDS))
-        return
-
-    link = invite_link(context.bot, user.id)
-    text = MSG_INVITE_PAGE.format(
-        link=link,
-        target=INVITE_TARGET,
-        inviter_days=_days_text(INVITER_DAYS), inviter_tier=tier_label(INVITER_TIER),
-        invitee_days=_days_text(INVITEE_DAYS), invitee_tier=tier_label(INVITEE_TIER),
-        progress=len(referrals["progress"].get(str(user.id), [])),
-        rewards=int(referrals["rewards"].get(str(user.id), 0)),
-        max_rewards=INVITE_MAX_REWARDS,
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            BTN_SHARE_INVITE,
-            url=f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(MSG_SHARE_INVITE_TEXT)}",
-        )
-    ]])
-    await message.reply_text(text, reply_markup=keyboard)
+    text = invite_page(context.bot, user.id)[0]
+    await with_style_fallback(lambda: message.reply_text(text, reply_markup=invite_page(context.bot, user.id)[1]))
 
 
 # ---- /subscribe: pick a plan, pay, send a screenshot -> the admin approves with one tap
@@ -2755,18 +2867,216 @@ def home_text(user) -> str:
     )
 
 
+# ---- button colours ----
+# Telegram can colour an inline button: "primary" = blue, "success" = green, "danger" = red.
+# Menu buttons are blue; Subscribe is green. If the Bot API server ever rejects coloured
+# buttons, with_style_fallback() switches the colours off (once) and resends plain buttons.
+UI_BUTTON_STYLE = {"on": True}
+
+
+def ui_button(text: str, style: str | None = "primary", **kwargs) -> InlineKeyboardButton:
+    if style and UI_BUTTON_STYLE["on"]:
+        kwargs["api_kwargs"] = {"style": style}
+
+    return InlineKeyboardButton(text, **kwargs)
+
+
+def is_style_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return "not modified" not in text and any(hint in text for hint in ("style", "button", "markup"))
+
+
+async def with_style_fallback(make_call):
+    """
+    make_call() builds AND awaits a Telegram call that carries coloured buttons. If Telegram
+    rejects the colours, they are switched off for good and the call is made again plain.
+    """
+    try:
+        return await make_call()
+    except BadRequest as error:
+        if not (UI_BUTTON_STYLE["on"] and is_style_error(error)):
+            raise
+
+        UI_BUTTON_STYLE["on"] = False
+        logger.warning("Telegram rejected coloured buttons (%s) — sending plain buttons from now on.", error)
+        return await make_call()
+
+
 def home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [ui_button(BTN_INVITE_TO_WIN, callback_data="home:invite:0")],
         [
-            InlineKeyboardButton(BTN_MERGE_VIDEOS, callback_data="merge:start:0"),
-            InlineKeyboardButton(BTN_MERGE_AUDIOS, callback_data="merge:starta:0"),
+            ui_button(BTN_PLANS, callback_data="home:plans:0"),
+            ui_button(BTN_SUBSCRIBE, "success", callback_data=subscribe_callback("home:subscribe:0")),
         ],
-        [InlineKeyboardButton(BTN_SUBSCRIBE, callback_data=subscribe_callback("home:subscribe:0"))],
         [
-            InlineKeyboardButton(BTN_USAGE, callback_data="home:usage:0"),
-            InlineKeyboardButton(BTN_ABOUT_THE_BOT, callback_data="home:about:0"),
+            ui_button(BTN_USAGE, callback_data="home:usage:0"),
+            ui_button(BTN_HOW_TO_USE, callback_data="home:howto:0"),
         ],
     ])
+
+
+# ---- the menu in Telegram's own keyboard (the one you type with) ----
+# Same five buttons as the homepage, but they sit above the typing box like a normal keyboard.
+# Tapping one sends its label as a message; reply_menu_button() below answers it.
+# Colours work here too: blue for everything, green ("success") for Subscribe.
+def ui_reply_button(text: str, style: str | None = "primary") -> KeyboardButton:
+    if style and UI_BUTTON_STYLE["on"]:
+        return KeyboardButton(text, api_kwargs={"style": style})
+
+    return KeyboardButton(text)
+
+
+def home_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [ui_reply_button(BTN_INVITE_TO_WIN)],
+            [ui_reply_button(BTN_PLANS), ui_reply_button(BTN_SUBSCRIBE, "success")],
+            [ui_reply_button(BTN_USAGE), ui_reply_button(BTN_HOW_TO_USE)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+REPLY_MENU_LABELS = (BTN_INVITE_TO_WIN, BTN_PLANS, BTN_SUBSCRIBE, BTN_USAGE, BTN_HOW_TO_USE)
+
+
+def _ar_days(days: int) -> str:
+    return {1: "يوم", 2: "يومين"}.get(days, f"{days} أيام" if 3 <= days <= 10 else f"{days} يوم")
+
+
+def how_to_use_text_en() -> str:
+    idle = f"{IDLE_FILE_TTL_MINUTES} minutes" if IDLE_FILE_TTL_MINUTES > 0 else "a few minutes"
+
+    return (
+        "📖 How to use — the full guide\n"
+        "\n"
+        "🎬 VIDEOS\n"
+        "1️⃣ Send me a video (or forward one).\n"
+        f"2️⃣ I encode a {SAMPLE_SECONDS:.0f}s sample from the middle at each of the 5 levels (Low → Extreme) and send them, "
+        "so you can see the real quality, together with the estimated final size of each level.\n"
+        "3️⃣ \"Smart analysis\" reads your video's resolution, frame rate, codec and bitrate and recommends the best level.\n"
+        "4️⃣ Pick a level, then the audio quality: Low / Medium / High, or Original to keep the sound untouched.\n"
+        "5️⃣ Optional: noise reduction, voice enhancement and a volume boost — you can listen to a preview before choosing.\n"
+        "6️⃣ Get your compressed video ✅ (tap Cancel any time while it's working).\n"
+        "A red level button means that level would make the file bigger, so it's switched off.\n"
+        "\n"
+        "Under a video you'll also find:\n"
+        "• 🎧 Just edit audio — change the sound, the picture stays exactly as it is\n"
+        "• 🔁 Replace audio — send a recording to replace the video's sound\n"
+        "• 🖼 Set video cover — use your own image as the cover\n"
+        "• 📄 Extract to PDF — the video's frames in a PDF (every 15–60 s, or auto-detect changes, or in 3 parts). "
+        "Then remove near-duplicate frames, or delete slides by sending their page numbers\n"
+        "• ✂️ Split video — cut it at a time you choose into two videos\n"
+        "• 🎵 Extract audio — get the soundtrack as an audio file\n"
+        "• 🔗 Merge with other videos — join several videos into one (or use /merge)\n"
+        "\n"
+        "🎧 AUDIO\n"
+        "Send an audio file or a voice message: compress it (Low / Medium / High) or send it as is with no compression. "
+        "You can rename it and set the artist, album and cover, boost or clean up the sound, "
+        "or merge it with other audios (or use /mergeaudio).\n"
+        "\n"
+        "📄 PDF & RAR\n"
+        "Send a PDF to merge PDFs, compress it, delete duplicate pages, or change its name and thumbnail. "
+        "Send a .rar and I'll unpack it and send you the files inside.\n"
+        "\n"
+        "📊 POWERPOINT\n"
+        f"Send a .pptx that has a recording on its slides and choose: a PDF of all the slides, one audio file with all the "
+        f"recordings joined in slide order, or a video where each slide plays with its own recording "
+        f"(slides without a recording are shown for {PPTX_SLIDE_SECONDS:g} s).\n"
+        "\n"
+        "📊 LIMITS & PLANS\n"
+        "• Everyone has a daily data limit and a biggest file size — see 📊 Usage. It resets every day at 12:00 AM.\n"
+        "• 📦 Plans and 💎 Subscribe give bigger limits and a place ahead in the queue (Pro, then Plus, then Free).\n"
+        f"• 🎁 Invite to win: invite {INVITE_TARGET} friends and get {_days_text(INVITER_DAYS)} of Pro free (/invite).\n"
+        "\n"
+        f"🔒 Your files are deleted as soon as they're processed, or after {idle} without any action.\n"
+        "\n"
+        "Commands: /start · /plans · /subscribe · /limit · /invite · /setlevel · /merge · /mergeaudio"
+    )
+
+
+def how_to_use_text_ar() -> str:
+    idle = f"{IDLE_FILE_TTL_MINUTES} دقايق" if IDLE_FILE_TTL_MINUTES > 0 else "كام دقيقة"
+
+    return (
+        "📖 طريقة الاستخدام — الشرح الكامل\n"
+        "\n"
+        "🎬 الفيديو\n"
+        "1️⃣ ابعتلي فيديو (أو حوّل فيديو).\n"
+        f"2️⃣ هعمل عينة قصيرة ({SAMPLE_SECONDS:.0f} ثواني) من نص الفيديو بكل مستوى من الـ5 مستويات (من Low لحد Extreme) "
+        "وأبعتهالك عشان تشوف الجودة بنفسك، مع الحجم المتوقع لكل مستوى.\n"
+        "3️⃣ \"التحليل الذكي\" بيقرا دقة الفيديو وعدد الفريمات والكودك والبت ريت، وبيرشحلك أنسب مستوى.\n"
+        "4️⃣ اختار المستوى، وبعدين جودة الصوت: Low / Medium / High، أو Original لو عايز الصوت زي ما هو.\n"
+        "5️⃣ اختياري: إزالة الضوضاء، تحسين الصوت، ورفع الصوت — وتقدر تسمع معاينة قبل ما تختار.\n"
+        "6️⃣ هيوصلك الفيديو المضغوط ✅ (تقدر تدوس Cancel في أي وقت وهو شغال).\n"
+        "الزرار الأحمر في قايمة المستويات معناه إن المستوى ده هيكبّر حجم الملف، فهو مقفول.\n"
+        "\n"
+        "وتحت الفيديو هتلاقي كمان:\n"
+        "• 🎧 تعديل الصوت فقط — بتغيّر الصوت والصورة زي ما هي\n"
+        "• 🔁 استبدال الصوت — ابعت تسجيل يحل مكان صوت الفيديو\n"
+        "• 🖼 غلاف للفيديو — حط صورة من عندك كغلاف\n"
+        "• 📄 استخراج PDF — صور الفيديو في ملف PDF (كل 15–60 ثانية، أو اكتشاف التغييرات تلقائي، أو على 3 أجزاء). "
+        "وبعدها تقدر تمسح الصور المتشابهة، أو تمسح سلايدات بإنك تبعت أرقام صفحاتها\n"
+        "• ✂️ تقسيم الفيديو — قصّه في الوقت اللي تحدده لفيديوهين\n"
+        "• 🎵 استخراج الصوت — الصوت كملف صوتي\n"
+        "• 🔗 دمج مع فيديوهات تانية — ضم كذا فيديو في فيديو واحد (أو استخدم /merge)\n"
+        "\n"
+        "🎧 الصوت\n"
+        "ابعت ملف صوتي أو رسالة صوتية: اضغطه (Low / Medium / High) أو ابعته زي ما هو من غير ضغط. "
+        "تقدر تغيّر الاسم وتحط الفنان والألبوم والغلاف، وترفع الصوت أو تنضّفه، "
+        "أو تدمجه مع ملفات صوتية تانية (أو استخدم /mergeaudio).\n"
+        "\n"
+        "📄 PDF و RAR\n"
+        "ابعت PDF عشان تدمج ملفات PDF، أو تضغطه، أو تمسح الصفحات المتكررة، أو تغيّر اسمه وصورته المصغرة. "
+        "وابعت ملف .rar وأنا أفكه وأبعتلك الملفات اللي جواه.\n"
+        "\n"
+        "📊 باوربوينت\n"
+        f"ابعت ملف .pptx فيه تسجيلات صوتية على السلايدات واختار: PDF لكل السلايدات، أو ملف صوتي واحد فيه كل التسجيلات "
+        f"ورا بعض بترتيب السلايدات، أو فيديو كل سلايد فيه بيشتغل مع تسجيله (والسلايد اللي من غير تسجيل بيظهر {PPTX_SLIDE_SECONDS:g} ثواني).\n"
+        "\n"
+        "📊 الحدود والباقات\n"
+        "• كل مستخدم له حد يومي للبيانات وأقصى حجم للملف الواحد — شوفهم في 📊 Usage. بيتجدد كل يوم الساعة 12:00 صباحًا.\n"
+        "• 📦 Plans و 💎 Subscribe بيدّوك حدود أكبر وأولوية في الطابور (Pro ثم Plus ثم Free).\n"
+        f"• 🎁 Invite to win: ادعو {INVITE_TARGET} من أصحابك واكسب {_ar_days(INVITER_DAYS)} Pro مجانًا (/invite).\n"
+        "\n"
+        f"🔒 ملفاتك بتتمسح أول ما تخلص معالجتها، أو بعد {idle} من غير أي حركة.\n"
+        "\n"
+        "الأوامر: /start · /plans · /subscribe · /limit · /invite · /setlevel · /merge · /mergeaudio"
+    )
+
+
+def how_to_use_keyboard(with_back: bool = True) -> InlineKeyboardMarkup | None:
+    rows = []
+
+    if REQUIRED_CHANNEL_URL:
+        rows.append([ui_button(BTN_OUR_CHANNEL, url=REQUIRED_CHANNEL_URL)])
+
+    if with_back:
+        rows.append([ui_button(BTN_BACK, callback_data="home:back:0")])
+
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def send_guide(context: ContextTypes.DEFAULT_TYPE, chat_id: int, with_back: bool = True) -> None:
+    """The guide as two messages — English first, then Arabic (the last one carries the buttons)."""
+    await with_retries(context.bot.send_message, chat_id=chat_id, text=how_to_use_text_en())
+    await with_style_fallback(
+        lambda: context.bot.send_message(
+            chat_id=chat_id, text=how_to_use_text_ar(), reply_markup=how_to_use_keyboard(with_back)
+        )
+    )
+
+
+async def send_how_to_use(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The inline "How to use" button on the homepage."""
+    chat_id = query.message.chat_id if query.message else None
+
+    if chat_id is None:
+        return
+
+    await send_guide(context, chat_id)
 
 
 def usage_page_text(user_id: int | None) -> str:
@@ -2778,14 +3088,28 @@ def usage_page_text(user_id: int | None) -> str:
     return text
 
 
-def usage_keyboard(user_id: int | None) -> InlineKeyboardMarkup:
+def usage_keyboard(user_id: int | None, with_back: bool = True) -> InlineKeyboardMarkup | None:
     rows = []
 
     if user_id is not None and not is_unlimited(user_id) and get_tier(user_id) != "pro":
-        rows.append([InlineKeyboardButton(BTN_GET_MORE_SUBSCRIBE, callback_data=subscribe_callback("home:subscribe:0"))])
+        rows.append([ui_button(BTN_GET_MORE_SUBSCRIBE, "success", callback_data=subscribe_callback("home:subscribe:0"))])
 
-    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="home:back:0")])
-    return InlineKeyboardMarkup(rows)
+    if with_back:
+        rows.append([ui_button(BTN_BACK, callback_data="home:back:0")])
+
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def plans_keyboard(user_id: int | None, with_back: bool = True) -> InlineKeyboardMarkup | None:
+    rows = []
+
+    if user_id is not None and not is_unlimited(user_id) and get_tier(user_id) != "pro":
+        rows.append([ui_button(BTN_SUBSCRIBE, "success", callback_data=subscribe_callback("home:subscribe:0"))])
+
+    if with_back:
+        rows.append([ui_button(BTN_BACK, callback_data="home:back:0")])
+
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 def subscribe_page_text(user_id: int | None) -> str:
@@ -2808,26 +3132,73 @@ def about_keyboard() -> InlineKeyboardMarkup:
     rows = []
 
     if REQUIRED_CHANNEL_URL:
-        rows.append([InlineKeyboardButton(BTN_OUR_CHANNEL, url=REQUIRED_CHANNEL_URL)])
+        rows.append([ui_button(BTN_OUR_CHANNEL, url=REQUIRED_CHANNEL_URL)])
 
-    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="home:back:0")])
+    rows.append([ui_button(BTN_BACK, callback_data="home:back:0")])
     return InlineKeyboardMarkup(rows)
 
 
-async def show_page(query, text: str, keyboard: InlineKeyboardMarkup) -> None:
-    """Swap the homepage message for another page (ignoring 'message is not modified')."""
+async def show_page(query, text: str, keyboard) -> None:
+    """
+    Swap the homepage message for another page (ignoring 'message is not modified').
+    keyboard is a markup, or a function returning one (so it can be rebuilt without colours).
+    """
     try:
-        await query.edit_message_text(text, reply_markup=keyboard)
+        await with_style_fallback(
+            lambda: query.edit_message_text(text, reply_markup=keyboard() if callable(keyboard) else keyboard)
+        )
     except Exception as error:
         if "not modified" not in str(error).lower():
             logger.warning("Couldn't show the page: %s", error)
 
 
-def subscribe_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(tier_label("plus"), callback_data=subscribe_callback("subpick:plus:0")),
-        InlineKeyboardButton(tier_label("pro"), callback_data=subscribe_callback("subpick:pro:0")),
-    ], [InlineKeyboardButton(BTN_BACK, callback_data="home:back:0")]])
+def subscribe_keyboard(with_back: bool = True) -> InlineKeyboardMarkup:
+    rows = [[
+        ui_button(tier_label("plus"), callback_data=subscribe_callback("subpick:plus:0")),
+        ui_button(tier_label("pro"), callback_data=subscribe_callback("subpick:pro:0")),
+    ]]
+
+    if with_back:
+        rows.append([ui_button(BTN_BACK, callback_data="home:back:0")])
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def reply_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A tap on one of the five buttons of the Telegram-keyboard menu (see home_reply_keyboard)."""
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None or not message.text:
+        return
+
+    if not is_allowed(user.id):
+        await reject_unauthorized(message, user.id)
+        return
+
+    label = message.text.strip()
+
+    if label == BTN_INVITE_TO_WIN:
+        text = invite_page(context.bot, user.id)[0]
+        await with_style_fallback(lambda: message.reply_text(text, reply_markup=invite_page(context.bot, user.id)[1]))
+    elif label == BTN_PLANS:
+        await with_style_fallback(
+            lambda: message.reply_text(plans_text(user.id), reply_markup=plans_keyboard(user.id, with_back=False))
+        )
+    elif label == BTN_SUBSCRIBE:
+        if not SUBSCRIPTIONS_ENABLED:
+            await message.reply_text(MSG_SUBSCRIPTIONS_COMING_SOON)
+            return
+
+        await with_style_fallback(
+            lambda: message.reply_text(subscribe_page_text(user.id), reply_markup=subscribe_keyboard(with_back=False))
+        )
+    elif label == BTN_USAGE:
+        await with_style_fallback(
+            lambda: message.reply_text(usage_page_text(user.id), reply_markup=usage_keyboard(user.id, with_back=False))
+        )
+    elif label == BTN_HOW_TO_USE:
+        await send_guide(context, message.chat_id, with_back=False)
 
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2838,16 +3209,50 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if message is None or user is None:
         return
 
-    await message.reply_text(subscribe_page_text(user.id), reply_markup=subscribe_keyboard())
+    await with_style_fallback(lambda: message.reply_text(subscribe_page_text(user.id), reply_markup=subscribe_keyboard()))
 
 
-def payment_steps_text(tier: str) -> str:
+PAYMENT_PERKS = {"plus": "priority over free users", "pro": "highest priority"}
+
+
+def payment_steps_text(tier: str, user_id: int | None = None) -> str:
+    """The payment screen. It is sent as HTML (so the channel name is a link) — everything dynamic is escaped."""
     info = TIERS[tier]
-    how_to_pay = PAYMENT_INSTRUCTIONS or "Ask the owner for the payment details (see the last line)."
-
-    return (
-        MSG_30_DAYS_PER_DAY_FILES.format(plan_tier=tier_label(tier), size_daily_mb=format_size(int(info['daily_mb'] * 1024 * 1024)), size_max_file_mb=format_size(int(info['max_file_mb'] * 1024 * 1024)), how_to_pay=how_to_pay, dm_text=dm_text())
+    how_to_pay = (
+        PAYMENT_INSTRUCTIONS.replace("{price}", price_text(tier))   # {price} = this plan's price (/price)
+        or "Ask the owner for the payment details (see the last line)."
     )
+
+    how_to_pay_ar = (
+        PAYMENT_INSTRUCTIONS_AR.replace("{price}", price_text(tier, arabic=True))
+        or MSG_PAYMENT_NO_DETAILS_AR
+    )
+
+    def link_to_channel(label: str) -> str:
+        if REQUIRED_CHANNEL_URL:
+            return f'<a href="{html_escape(REQUIRED_CHANNEL_URL, quote=True)}">{html_escape(label)}</a>'
+        return html_escape(label)
+
+    channel_link = link_to_channel(MSG_PAYMENT_MAIN_CHANNEL)
+    user_id_text = f"<code>{user_id}</code>" if user_id is not None else "—"
+
+    english = MSG_30_DAYS_PER_DAY_FILES.format(
+        plan_tier=html_escape(tier_label(tier)),
+        size_daily_mb=format_size(int(info['daily_mb'] * 1024 * 1024)),
+        size_max_file_mb=format_size(int(info['max_file_mb'] * 1024 * 1024)),
+        perk=PAYMENT_PERKS.get(tier, ""),
+        how_to_pay=html_escape(how_to_pay),
+        channel_link=channel_link,
+        user_id=user_id_text,
+    )
+
+    arabic = MSG_PAYMENT_ARABIC.format(
+        how_to_pay=html_escape(how_to_pay_ar),
+        channel_link=link_to_channel(MSG_PAYMENT_MAIN_CHANNEL_AR),
+        user_id=user_id_text,
+    )
+
+    return f"{english}\n\n{MSG_PAYMENT_DIVIDER}\n\n{arabic}"
 
 
 async def maybe_handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, kind: str) -> bool:
@@ -2993,6 +3398,90 @@ async def subs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines.append(MSG_UNTIL_D_LEFT.format(plan_tier=tier_label(tier), name=display_name_for(user_id), user_id=user_id, date_until=format_until(until), days_left=days_left))
 
     await message.reply_text("\n".join(lines)[:4000])
+
+
+MSG_PRICE_USAGE = (
+    "Usage:\n"
+    "/price — show the current prices\n"
+    "/price plus 10 — set one plan\n"
+    "/price plus 10 pro 25 — set both\n"
+    "/price 10 25 — same, Plus first then Pro\n"
+    "(amounts are in {currency})"
+)
+MSG_PRICE_CURRENT = "💰 Plan prices\n⭐ Plus: {plus}\n💎 Pro: {pro}"
+MSG_PRICE_NOT_SET = "⚠️ {name} has no price yet — set it with /price {tier} <amount>."
+MSG_PRICE_SAVED = "✅ Saved.\n\n"
+MSG_PRICE_BAD = "⚠️ I couldn't read that. The price must be a number above 0 (up to {max}).\n\n"
+
+
+def parse_price(text: str) -> float | None:
+    cleaned = text.strip().lower().replace(",", "").replace(PRICE_CURRENCY.lower(), "").strip()
+
+    if not re.fullmatch(r"\d+(\.\d+)?", cleaned):
+        return None
+
+    value = float(cleaned)
+    return value if 0 < value <= PRICE_MAX else None
+
+
+def price_overview_text() -> str:
+    text = MSG_PRICE_CURRENT.format(
+        plus=price_text("plus") if prices.get("plus") else "not set",
+        pro=price_text("pro") if prices.get("pro") else "not set",
+    )
+
+    for tier, name in (("plus", "Plus"), ("pro", "Pro")):
+        if not prices.get(tier):
+            text += "\n" + MSG_PRICE_NOT_SET.format(name=name, tier=tier)
+
+    return text
+
+
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/price [plus <amount>] [pro <amount>] — admin only: show or set the plan prices (saved)."""
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    args = list(context.args)
+
+    if not args:
+        await message.reply_text(price_overview_text() + "\n\n" + MSG_PRICE_USAGE.format(currency=PRICE_CURRENCY))
+        return
+
+    # "/price 10 25" = Plus 10, Pro 25
+    if len(args) == 2 and all(parse_price(arg) is not None for arg in args):
+        args = ["plus", args[0], "pro", args[1]]
+
+    if len(args) % 2:
+        await message.reply_text(MSG_PRICE_BAD.format(max=f"{PRICE_MAX:,}") + MSG_PRICE_USAGE.format(currency=PRICE_CURRENCY))
+        return
+
+    changes: dict[str, float] = {}
+
+    for tier_name, amount in zip(args[0::2], args[1::2]):
+        tier = tier_name.lower()
+        value = parse_price(amount)
+
+        if tier not in ("plus", "pro") or value is None:
+            await message.reply_text(MSG_PRICE_BAD.format(max=f"{PRICE_MAX:,}") + MSG_PRICE_USAGE.format(currency=PRICE_CURRENCY))
+            return
+
+        changes[tier] = value
+
+    prices.update(changes)          # nothing is changed unless every pair above was valid
+    prices["updated"] = time.time()
+    save_approved_users()
+
+    # Back it up right away, so a restart in the next few minutes can't lose it.
+    try:
+        await backup_database_if_changed(context.bot)
+    except Exception:
+        logger.exception("Couldn't back up right after /price")
+
+    await message.reply_text(MSG_PRICE_SAVED + price_overview_text())
 
 
 async def plans_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4495,6 +4984,10 @@ def estimate_keyboard(
 
     rows.append([
         InlineKeyboardButton(BTN_EXTRACT_AUDIO, callback_data=f"audioextract:_:{message_id}")
+    ])
+
+    rows.append([
+        InlineKeyboardButton(BTN_MERGE_VIDEO_WITH_OTHERS, callback_data=f"merge:video:{message_id}")
     ])
 
     rows.append([
@@ -6819,7 +7312,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reject_unauthorized(update.message, user_id)
         return
 
-    await update.message.reply_text(home_text(update.effective_user), reply_markup=home_keyboard())
+    # The menu now lives in Telegram's own keyboard (it stays there until removed).
+    await with_style_fallback(
+        lambda: update.message.reply_text(home_text(update.effective_user), reply_markup=home_reply_keyboard())
+    )
 
 
 async def setlevel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7016,6 +7512,7 @@ async def handle_incoming(
             "duration": duration,
             "estimates": {},
             "media_type": "video",
+            "file_id": file_id,              # lets "Merge with other videos" reuse this file
             "owner_id": sender_id,           # who was charged ...
             "charged_bytes": charged_bytes,  # ... and how much (for refunds)
         }
@@ -7758,6 +8255,9 @@ MERGE_COPY_VIDEO_CODECS = {"h264", "hevc"}
 TELEGRAM_UPLOAD_LIMIT_BYTES = int(1.95 * 1024 * 1024 * 1024)
 
 BTN_MERGE_VIDEOS = "🎞 Merge videos"
+BTN_MERGE_VIDEO_WITH_OTHERS = "🔗 Merge with other videos"
+MSG_MERGE_VIDEO_ADDED = "🔗 Added to your video merge list — send the other videos now."
+MSG_MERGE_VIDEO_EXPIRED = "⚠️ That video isn't available anymore — please send it again."
 BTN_MERGE_NOW = "✅ Merge {count} videos"
 BTN_MERGE_UNDO = "↩️ Remove last"
 
@@ -7773,7 +8273,7 @@ MSG_MERGE_LIST_FOOTER = "Send the next video, or tap Merge when you're done. The
 MSG_MERGE_NEED_TWO = "Add at least 2 videos first, then tap Merge."
 MSG_MERGE_FULL = "That's the maximum of {max} videos for one merge. Tap Merge to join them."
 MSG_MERGE_VIDEOS_ONLY = "🎞 Merge mode is on — please send videos only, or tap Cancel to leave merge mode."
-MSG_MERGE_NO_SESSION = "There's no merge in progress. Tap 🎞 Merge videos (or send /merge) to start one."
+MSG_MERGE_NO_SESSION = "There's no merge in progress. Send a video and tap “🔗 Merge with other videos” under it (or send /merge) to start one."
 MSG_MERGE_ALREADY_RUNNING = "⏳ Your merge is already running — please wait for it to finish."
 MSG_MERGE_CANCELLED = "❌ Merge cancelled. Videos you send now will be compressed as usual."
 MSG_MERGE_CANCELLED_REFUNDED = "❌ Merge cancelled — {size} was given back to your daily limit."
@@ -8161,12 +8661,14 @@ async def merge_add_video(
     await send_merge_panel(context.bot, session)
 
 
-async def merge_seed_from_audio(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
-    """The "🔗 Merge with other audios" button under an audio the person just sent."""
+async def merge_seed_from_pending(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, kind: str) -> None:
+    """The \"🔗 Merge with other videos / audios\" button under a file the person just sent."""
     pending = pending_compressions.get(message_id)
+    expired_text = MSG_MERGE_AUDIO_EXPIRED if kind == "audio" else MSG_MERGE_VIDEO_EXPIRED
+    added_text = MSG_MERGE_AUDIO_ADDED if kind == "audio" else MSG_MERGE_VIDEO_ADDED
 
-    if pending is None or not pending.get("file_id"):
-        await query.message.reply_text(MSG_MERGE_AUDIO_EXPIRED)
+    if pending is None or not pending.get("file_id") or pending.get("media_type", "video") != kind:
+        await query.message.reply_text(expired_text)
         return
 
     user_id = query.from_user.id if query.from_user else None
@@ -8176,38 +8678,40 @@ async def merge_seed_from_audio(query, context: ContextTypes.DEFAULT_TYPE, chat_
         await query.message.reply_text(MSG_MERGE_ALREADY_RUNNING)
         return
 
-    if existing is not None and existing.get("kind", "video") != "audio":
+    if existing is not None and existing.get("kind", "video") != kind:
+        # They were building the OTHER kind of merge: drop that list (its bytes are given back).
         merge_stop_refresh(existing)
         merge_refund_all(existing)
         merge_sessions.pop(chat_id, None)
         existing = None
 
-    session = existing or new_merge_session(chat_id, user_id, "audio")
+    session = existing or new_merge_session(chat_id, user_id, kind)
 
     if merge_is_full(session):
-        await query.message.reply_text(AUDIO_MERGE_TEXT["MSG_MERGE_FULL"].format(max=MERGE_MAX_AUDIOS))
+        await query.message.reply_text(mm(kind, "MSG_MERGE_FULL").format(max=merge_max_items(kind)))
         return
 
-    # The audio was already counted against the daily limit when it arrived: that charge moves
+    # The file was already counted against the daily limit when it arrived: that charge moves
     # to the merge list (so cancelling the merge gives it back), and the stored copy is deleted
     # because the merge downloads its files again when it starts.
     session["items"].append({
         "file_id": pending["file_id"],
         "size": pending.get("original_size"),
-        "filename": pending.get("filename") or f"audio_{message_id}.m4a",
+        "filename": pending.get("filename") or f"{kind}_{message_id}.{'m4a' if kind == 'audio' else 'mp4'}",
         "duration": pending.get("duration"),
         "message_id": message_id,
         "charged": int(pending.get("charged_bytes") or 0),
         "sender_id": pending.get("owner_id", user_id),
     })
     session["items"].sort(key=lambda item: item["message_id"])
+    session["last_active"] = time.time()
     merge_sessions[chat_id] = session
     awaiting_audio_replacement.pop(chat_id, None)
     awaiting_input.pop(chat_id, None)
     clear_pending(message_id)
 
     with contextlib.suppress(Exception):
-        await query.edit_message_text(MSG_MERGE_AUDIO_ADDED)
+        await query.edit_message_text(added_text)
 
     await send_merge_panel(context.bot, session)
 
@@ -8226,8 +8730,8 @@ async def handle_merge_callback(query, context: ContextTypes.DEFAULT_TYPE, comma
         await begin_merge(context.bot, chat_id, query.from_user, "audio")
         return
 
-    if command == "audio":
-        await merge_seed_from_audio(query, context, chat_id, message_id)
+    if command in ("audio", "video"):
+        await merge_seed_from_pending(query, context, chat_id, message_id, command)
         return
 
     session = merge_sessions.get(chat_id)
@@ -10786,6 +11290,657 @@ async def handle_rar_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE
         await maybe_notify_update_ready(context.bot)
 
 
+# ------------------------------------------------------------
+# PowerPoint (.pptx) with a recording on each slide  ->  PDF / audio / video
+#
+# Send the bot a .pptx and pick what you want:
+#   📄 PDF    every slide in one PDF
+#   🎧 Audio  every slide's recording joined into one audio file, in slide order
+#   🎬 Video  each slide is shown while ITS OWN recording plays
+#   📦 All three
+#
+# How it works: a .pptx is a zip file, so the recordings are read straight out of
+# it (no PowerPoint needed). LibreOffice turns the slides into a PDF, ghostscript
+# turns the PDF pages into pictures, and FFmpeg builds the audio / video.
+# Needs "libreoffice" (the program is called soffice) inside the container —
+# see the Dockerfile line in the notes. Ghostscript and FFmpeg are already used elsewhere.
+# ------------------------------------------------------------
+PPTX_SLIDE_SECONDS = float(os.getenv("PPTX_SLIDE_SECONDS", "3"))      # how long a slide WITHOUT a recording is shown in the video
+PPTX_VIDEO_WIDTH = int(os.getenv("PPTX_VIDEO_WIDTH", "1280"))         # video width in pixels (height follows the slide shape)
+PPTX_VIDEO_FPS = int(os.getenv("PPTX_VIDEO_FPS", "5"))                # still pictures need very few frames per second
+PPTX_RENDER_DPI = int(os.getenv("PPTX_RENDER_DPI", "100"))            # sharpness of the slide pictures
+PPTX_MAX_SLIDES = int(os.getenv("PPTX_MAX_SLIDES", "300"))
+PPTX_MAX_AUDIO_MB = int(os.getenv("PPTX_MAX_AUDIO_MB", "1500"))       # biggest total size of recordings we will unpack
+PPTX_STEP_TIMEOUT = int(os.getenv("PPTX_STEP_TIMEOUT", "900"))        # seconds allowed for one conversion step
+PPTX_MENU_TTL = 3600                                                  # an unanswered menu is forgotten after 1 hour
+PPTX_AUDIO_EXTENSIONS = (".wav", ".mp3", ".m4a", ".aac", ".wma", ".ogg", ".oga", ".flac", ".opus", ".aif", ".aiff")
+
+BTN_PPTX_PDF = "📄 PDF"
+BTN_PPTX_AUDIO = "🎧 Audio"
+BTN_PPTX_VIDEO = "🎬 Video"
+BTN_PPTX_ALL = "📦 All three"
+
+MSG_PPTX_MENU = (
+    "📊 {name} · {size}\n"
+    "\n"
+    "What do you want from this presentation?\n"
+    "\n"
+    "📄 PDF — every slide in one PDF\n"
+    "🎧 Audio — all the slide recordings joined in slide order\n"
+    "🎬 Video — each slide is shown while its own recording plays\n"
+    "📦 All three\n"
+    "\n"
+    "ℹ️ Slides without a recording are shown for {seconds:g} s in the video."
+)
+MSG_PPTX_OLD_FORMAT = (
+    "⚠️ That's an old .ppt file. Please open it in PowerPoint, choose Save As → PowerPoint Presentation (.pptx), "
+    "and send me that one."
+)
+MSG_PPTX_NEED_OFFICE = "Converting PowerPoint files isn't set up on this server yet (LibreOffice is missing)."
+MSG_PPTX_NEED_GS = "Making a video from slides isn't set up on this server yet (ghostscript is missing)."
+MSG_PPTX_EXPIRED = "That menu has expired — please send the file again."
+MSG_PPTX_BUSY = "⏳ I'm already working on this file."
+MSG_PPTX_CANCELLED = "❌ Cancelled — nothing was done."
+
+pptx_pending: dict[tuple[int, int], dict] = {}   # (chat id, the user's file message id) -> what was sent
+
+
+def is_pptx_document(document) -> bool:
+    mime = (document.mime_type or "").lower()
+    name = (document.file_name or "").lower()
+    return name.endswith((".pptx", ".ppsx")) or mime in (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+    )
+
+
+def is_old_ppt_document(document) -> bool:
+    name = (document.file_name or "").lower()
+    return name.endswith((".ppt", ".pps")) or (document.mime_type or "").lower() == "application/vnd.ms-powerpoint"
+
+
+def find_office_tool() -> str | None:
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def pptx_menu_keyboard(file_message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            ui_button(BTN_PPTX_PDF, callback_data=f"pptx:pdf:{file_message_id}"),
+            ui_button(BTN_PPTX_AUDIO, callback_data=f"pptx:audio:{file_message_id}"),
+        ],
+        [
+            ui_button(BTN_PPTX_VIDEO, callback_data=f"pptx:video:{file_message_id}"),
+            ui_button(BTN_PPTX_ALL, callback_data=f"pptx:all:{file_message_id}"),
+        ],
+        [ui_button(BTN_CANCEL, callback_data=f"pptx:cancel:{file_message_id}")],
+    ])
+
+
+def pptx_error_line(stderr: str) -> str:
+    lines = [line.strip() for line in (stderr or "").strip().splitlines() if line.strip()]
+    return lines[-1][:200] if lines else "unknown error"
+
+
+def pptx_extract_slide_audio(source: Path, media_dir: Path) -> list[list[Path]]:
+    """
+    Open the .pptx (a zip) and, for every slide in PRESENTATION order, pull out the audio
+    files that slide plays (in the order they appear on the slide). Returns one list of
+    extracted files per slide — an empty list for a slide with no recording.
+    """
+    rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    p_ns = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+    r_id = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+
+    try:
+        archive = zipfile.ZipFile(source)
+    except zipfile.BadZipFile as error:
+        raise RuntimeError("that isn't a valid .pptx file") from error
+
+    with archive:
+        names = set(archive.namelist())
+
+        def resolve(base_dir: str, target: str) -> str:
+            if target.startswith("/"):
+                return target.lstrip("/")
+            return posixpath.normpath(posixpath.join(base_dir, target))
+
+        def read_rels(part: str) -> dict[str, str]:
+            rels_name = f"{posixpath.dirname(part)}/_rels/{posixpath.basename(part)}.rels"
+            if rels_name not in names:
+                return {}
+
+            result = {}
+            for rel in _ET.fromstring(archive.read(rels_name)).iter(rel_ns + "Relationship"):
+                if rel.get("TargetMode") != "External" and rel.get("Id"):
+                    result[rel.get("Id")] = rel.get("Target") or ""
+            return result
+
+        if "ppt/presentation.xml" not in names:
+            raise RuntimeError("that isn't a PowerPoint presentation")
+
+        presentation_rels = read_rels("ppt/presentation.xml")
+        presentation = _ET.fromstring(archive.read("ppt/presentation.xml"))
+        slide_parts = []
+
+        for slide_id in presentation.iter(p_ns + "sldId"):
+            target = presentation_rels.get(slide_id.get(r_id) or "")
+            if target:
+                part = resolve("ppt", target)
+                if part in names:
+                    slide_parts.append(part)
+
+        if not slide_parts:
+            raise RuntimeError("it has no slides")
+        if len(slide_parts) > PPTX_MAX_SLIDES:
+            raise RuntimeError(f"it has more than {PPTX_MAX_SLIDES} slides")
+
+        media_dir.mkdir(parents=True, exist_ok=True)
+        total_bytes = 0
+        per_slide: list[list[Path]] = []
+
+        for number, part in enumerate(slide_parts, 1):
+            rels = read_rels(part)
+            xml_text = archive.read(part).decode("utf-8", errors="ignore")
+            clips: list[Path] = []
+            seen: set[str] = set()
+
+            # Every r:link / r:embed on the slide, in the order it appears: the recording is one of them.
+            for rel_id in re.findall(r'[A-Za-z0-9_]+:(?:link|embed)="([^"]+)"', xml_text):
+                target = rels.get(rel_id)
+                if not target:
+                    continue
+
+                member = resolve(posixpath.dirname(part), target)
+                if member in seen or member not in names or not member.lower().endswith(PPTX_AUDIO_EXTENSIONS):
+                    continue
+                seen.add(member)
+
+                total_bytes += archive.getinfo(member).file_size
+                if total_bytes > PPTX_MAX_AUDIO_MB * 1024 * 1024:
+                    raise RuntimeError(f"the recordings add up to more than {PPTX_MAX_AUDIO_MB} MB")
+
+                dest = media_dir / f"s{number:04d}_{len(clips) + 1}{Path(member).suffix.lower()}"
+                with archive.open(member) as source_file, open(dest, "wb") as out_file:
+                    shutil.copyfileobj(source_file, out_file)
+                clips.append(dest)
+
+            per_slide.append(clips)
+
+        return per_slide
+
+
+async def pptx_normalise_audio(clips: list[Path], output: Path) -> None:
+    """One slide's recording(s) -> one AAC file (44.1 kHz stereo), so all slides can be joined without re-encoding."""
+    command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    for clip in clips:
+        command += ["-i", str(clip)]
+
+    count = len(clips)
+    graph = "".join(
+        f"[{i}:a:0]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}];" for i in range(count)
+    )
+    graph += "".join(f"[a{i}]" for i in range(count)) + f"concat=n={count}:v=0:a=1[out]"
+    command += ["-filter_complex", graph, "-map", "[out]", "-c:a", "aac", "-b:a", "128k", str(output)]
+
+    code, stderr = await run_tool(command, PPTX_STEP_TIMEOUT)
+    if code != 0 or not output.exists():
+        raise RuntimeError(pptx_error_line(stderr))
+
+
+async def pptx_concat(files: list[Path], output: Path, extra: list[str] | None = None) -> None:
+    """Join files that share the same codec settings, without re-encoding (FFmpeg's concat list)."""
+    list_path = output.with_suffix(".txt")
+    list_path.write_text("".join(f"file '{path}'\n" for path in files), encoding="utf-8")
+
+    try:
+        code, stderr = await run_tool(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+             "-i", str(list_path), "-c", "copy", *(extra or []), str(output)],
+            PPTX_STEP_TIMEOUT,
+        )
+    finally:
+        list_path.unlink(missing_ok=True)
+
+    if code != 0 or not output.exists():
+        raise RuntimeError(pptx_error_line(stderr))
+
+
+async def pptx_convert_to_pdf(source: Path, out_dir: Path) -> Path:
+    """LibreOffice: slides.pptx -> slides.pdf (hidden slides included where this LibreOffice supports it)."""
+    tool = find_office_tool()
+    if tool is None:
+        raise RuntimeError(MSG_PPTX_NEED_OFFICE)
+
+    profile = (out_dir / "lo_profile").resolve().as_uri()
+    produced = out_dir / (source.stem + ".pdf")
+    last_error = ""
+
+    for target in ('pdf:impress_pdf_Export:{"ExportHiddenSlides":{"type":"boolean","value":"true"}}', "pdf"):
+        code, stderr = await run_tool(
+            [tool, f"-env:UserInstallation={profile}", "--headless", "--norestore", "--nolockcheck",
+             "--convert-to", target, "--outdir", str(out_dir), str(source)],
+            PPTX_STEP_TIMEOUT,
+        )
+        if produced.exists() and produced.stat().st_size > 0:
+            return produced
+        last_error = stderr
+
+    raise RuntimeError("LibreOffice couldn't convert it" + (f" ({pptx_error_line(last_error)})" if last_error.strip() else ""))
+
+
+async def pptx_render_pages(pdf: Path, out_dir: Path) -> list[Path]:
+    """PDF pages -> one picture per page (ghostscript)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    code, stderr = await run_tool(
+        ["gs", "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dSAFER", "-sDEVICE=png16m", f"-r{PPTX_RENDER_DPI}",
+         "-dTextAlphaBits=4", "-dGraphicsAlphaBits=4", f"-sOutputFile={out_dir}/slide-%04d.png", str(pdf)],
+        PPTX_STEP_TIMEOUT,
+    )
+    pages = sorted(out_dir.glob("slide-*.png"))
+
+    if not pages:
+        raise RuntimeError(f"couldn't draw the slides ({pptx_error_line(stderr)})")
+    return pages
+
+
+def png_dimensions(path: Path) -> tuple[int, int]:
+    with open(path, "rb") as handle:
+        header = handle.read(24)
+    return struct.unpack(">II", header[16:24])
+
+
+async def pptx_video_segment(
+    image: Path, audio: Path | None, output: Path, width: int, height: int,
+) -> None:
+    """One slide: the picture shown for as long as its recording (or a few silent seconds)."""
+    command = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-threads", str(FFMPEG_THREADS),
+        "-loop", "1", "-framerate", str(PPTX_VIDEO_FPS), "-i", str(image),
+    ]
+
+    if audio is not None:
+        command += ["-i", str(audio), "-c:a", "copy"]
+    else:
+        command += ["-f", "lavfi", "-t", f"{PPTX_SLIDE_SECONDS:g}", "-i", "anullsrc=r=44100:cl=stereo",
+                    "-c:a", "aac", "-b:a", "128k"]
+
+    command += [
+        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-crf", "28",
+        "-r", str(PPTX_VIDEO_FPS), "-shortest", "-movflags", "+faststart", str(output),
+    ]
+
+    code, stderr = await run_tool(command, PPTX_STEP_TIMEOUT)
+    if code != 0 or not output.exists():
+        raise RuntimeError(pptx_error_line(stderr))
+
+
+async def pptx_build_video(
+    pdf: Path, per_slide_audio: list[Path | None], work_dir: Path, post_status, notes: list[str],
+) -> tuple[Path, int, int]:
+    """Draw every slide, make one clip per slide, join the clips. Returns (video, width, height)."""
+    await post_status("🖼 Drawing the slides…")
+    pages = await pptx_render_pages(pdf, work_dir / "pages")
+
+    if per_slide_audio and len(pages) != len(per_slide_audio):
+        notes.append(
+            f"⚠️ The PDF has {len(pages)} pages but the file has {len(per_slide_audio)} slides, "
+            "so some recordings may not line up."
+        )
+
+    page_width, page_height = png_dimensions(pages[0])
+    width = max(2, PPTX_VIDEO_WIDTH // 2 * 2)
+    height = max(2, round(width * page_height / page_width) // 2 * 2)
+
+    segments_dir = work_dir / "segments"
+    segments_dir.mkdir(exist_ok=True)
+    segments: list[Path] = []
+    silent = 0
+    last_update = 0.0
+
+    for number, page in enumerate(pages, 1):
+        audio = per_slide_audio[number - 1] if number - 1 < len(per_slide_audio) else None
+        silent += audio is None
+
+        if time.monotonic() - last_update > 4:
+            last_update = time.monotonic()
+            await post_status(f"🎬 Building the video… slide {number}/{len(pages)}")
+
+        segment = segments_dir / f"seg_{number:04d}.mp4"
+        await pptx_video_segment(page, audio, segment, width, height)
+        segments.append(segment)
+        page.unlink(missing_ok=True)
+
+    if silent:
+        notes.append(f"ℹ️ {silent} slide(s) had no recording — shown for {PPTX_SLIDE_SECONDS:g} s each in the video.")
+
+    await post_status("🔗 Joining the slides into one video…")
+    video = work_dir / "video.mp4"
+    await pptx_concat(segments, video, extra=["-movflags", "+faststart"])
+
+    for segment in segments:
+        segment.unlink(missing_ok=True)
+
+    return video, width, height
+
+
+async def handle_pptx_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE, document) -> None:
+    """A .pptx arrived: ask what to make from it (nothing is downloaded until a button is tapped)."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if chat_id in merge_sessions:
+        await message.reply_text(merge_busy_text(chat_id))
+        return
+
+    if update_mode["on"] and not is_admin(user_id):
+        await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
+    size = int(document.file_size or 0)
+
+    if file_too_large(user_id, size):
+        await message.reply_text(file_too_large_text(user_id, size))
+        return
+
+    if not quota_allows(user_id, size):
+        await message.reply_text(quota_refusal_text(user_id, size))
+        return
+
+    now = time.time()
+    for key in [k for k, v in pptx_pending.items() if now - v["created"] > PPTX_MENU_TTL and not v.get("running")]:
+        pptx_pending.pop(key, None)
+
+    name = document.file_name or f"presentation_{message.message_id}.pptx"
+    pptx_pending[(chat_id, message.message_id)] = {
+        "file_id": document.file_id,
+        "name": name,
+        "size": size,
+        "user_id": user_id,
+        "created": now,
+        "running": False,
+    }
+
+    await with_style_fallback(lambda: message.reply_text(
+        MSG_PPTX_MENU.format(name=name[:120], size=format_size(size), seconds=PPTX_SLIDE_SECONDS),
+        reply_markup=pptx_menu_keyboard(message.message_id),
+    ))
+
+
+async def handle_pptx_callback(query, context: ContextTypes.DEFAULT_TYPE, user_id: int | None) -> None:
+    """A tap on the PDF / Audio / Video / All three / Cancel buttons."""
+    global other_jobs_running
+
+    try:
+        _prefix, kind, file_message_id = query.data.split(":", 2)
+        key = (query.message.chat_id, int(file_message_id))
+    except (ValueError, AttributeError):
+        await query.answer()
+        return
+
+    pending = pptx_pending.get(key)
+
+    if pending is None:
+        await query.answer(MSG_PPTX_EXPIRED, show_alert=True)
+        return
+
+    if user_id != pending["user_id"] and not is_admin(user_id):
+        await query.answer(MSG_NOT_YOUR_JOB, show_alert=True)
+        return
+
+    if pending.get("running"):
+        await query.answer(MSG_PPTX_BUSY)
+        return
+
+    if kind == "cancel":
+        pptx_pending.pop(key, None)
+        await query.answer()
+        with contextlib.suppress(Exception):
+            await query.edit_message_text(MSG_PPTX_CANCELLED)
+        return
+
+    if kind not in ("pdf", "audio", "video", "all"):
+        await query.answer()
+        return
+
+    if update_mode["on"] and not is_admin(user_id):
+        await query.answer(UPDATE_BUSY_TEXT, show_alert=True)
+        return
+
+    needs_office = kind in ("pdf", "video", "all")
+    needs_gs = kind in ("video", "all")
+
+    if needs_office and find_office_tool() is None:
+        await query.answer(MSG_PPTX_NEED_OFFICE, show_alert=True)
+        return
+
+    if needs_gs and not shutil.which("gs"):
+        await query.answer(MSG_PPTX_NEED_GS, show_alert=True)
+        return
+
+    size = pending["size"]
+
+    if not quota_allows(user_id, size):
+        await query.answer()
+        await query.message.reply_text(quota_refusal_text(user_id, size))
+        return
+
+    await query.answer()
+    quota_consume(user_id, size)
+    pending["running"] = True
+    other_jobs_running += 1
+    update_mode["notified"] = False
+
+    try:
+        await run_pptx_job(query, context, pending, kind)
+    finally:
+        pptx_pending.pop(key, None)
+        other_jobs_running -= 1
+        await maybe_notify_update_ready(context.bot)
+
+
+async def run_pptx_job(query, context: ContextTypes.DEFAULT_TYPE, pending: dict, kind: str) -> None:
+    message = query.message
+    chat_id = message.chat_id
+    user_id = pending["user_id"]
+    name = pending["name"]
+    size = pending["size"]
+    stem = Path(name).stem or "presentation"
+
+    send_pdf = kind in ("pdf", "all")
+    send_audio_file = kind in ("audio", "all")
+    send_video_file = kind in ("video", "all")
+    need_recordings = kind in ("audio", "video", "all")
+    need_pdf = send_pdf or send_video_file
+
+    work_dir: Path | None = None
+    slot_held = False
+    sent: list[str] = []
+    failed: list[str] = []
+    notes: list[str] = []
+
+    async def post_status(text: str) -> None:
+        with contextlib.suppress(Exception):
+            await message.edit_text(text)
+
+    try:
+        await acquire_work_slot(post_status, user_priority(user_id), user_plan_label(user_id))
+        slot_held = True
+
+        Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix=f"pptx_{message.message_id}_", dir=TEMP_DIR))
+        source = work_dir / "slides.pptx"
+
+        await post_status(f"⬇️ Downloading {name[:80]} ({format_size(size)})…")
+        telegram_file = await with_retries(context.bot.get_file, pending["file_id"])
+        await with_retries(telegram_file.download_to_drive, custom_path=str(source))
+        delete_server_copy(telegram_file)
+
+        # ---- 1) the recordings, one file per slide ----
+        per_slide_audio: list[Path | None] = []
+        slide_count = 0
+
+        if need_recordings:
+            await post_status("🔎 Looking for the recordings in your slides…")
+            slide_clips = await asyncio.to_thread(pptx_extract_slide_audio, source, work_dir / "media")
+            slide_count = len(slide_clips)
+            slides_with_audio = sum(1 for clips in slide_clips if clips)
+
+            if slides_with_audio == 0 and kind == "audio":
+                raise RuntimeError("I couldn't find any recordings in this file")
+
+            if slides_with_audio == 0:
+                notes.append("ℹ️ I couldn't find any recordings in this file, so the video has silent slides.")
+
+            audio_dir = work_dir / "audio"
+            audio_dir.mkdir(exist_ok=True)
+            last_update = 0.0
+
+            for number, clips in enumerate(slide_clips, 1):
+                if not clips:
+                    per_slide_audio.append(None)
+                    continue
+
+                if time.monotonic() - last_update > 4:
+                    last_update = time.monotonic()
+                    await post_status(f"🎧 Preparing the recordings… slide {number}/{slide_count}")
+
+                slide_audio = audio_dir / f"slide_{number:04d}.m4a"
+
+                try:
+                    await pptx_normalise_audio(clips, slide_audio)
+                    per_slide_audio.append(slide_audio)
+                except RuntimeError as error:
+                    logger.warning("PPTX slide %s recording failed: %s", number, error)
+                    notes.append(f"⚠️ Slide {number}: its recording couldn't be read.")
+                    per_slide_audio.append(None)
+
+                for clip in clips:
+                    clip.unlink(missing_ok=True)
+
+            if kind == "audio" and not any(per_slide_audio):
+                raise RuntimeError("none of the recordings could be read")
+
+        # ---- 2) audio: all recordings joined, in slide order ----
+        if send_audio_file and any(per_slide_audio):
+            try:
+                await post_status("🎧 Joining the recordings…")
+                combined = work_dir / "recordings.m4a"
+                parts = [path for path in per_slide_audio if path is not None]
+                await pptx_concat(parts, combined)
+                duration = await get_duration(str(combined))
+
+                await post_status("⬆️ Sending the audio…")
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+
+                with named_for_upload(combined, f"{stem}.m4a") as send_path:
+                    await with_retries(
+                        context.bot.send_audio,
+                        chat_id=chat_id,
+                        audio=str(send_path),
+                        duration=round(duration) if duration else None,
+                        title=stem[:64],
+                        caption=f"🎧 {len(parts)} recording(s) from {slide_count} slides · {format_size(combined.stat().st_size)}",
+                    )
+
+                sent.append("audio")
+                combined.unlink(missing_ok=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception("PPTX audio failed:")
+                failed.append(f"🎧 Audio: {error}")
+
+        # ---- 3) the PDF (also needed to make the video) ----
+        pdf_path: Path | None = None
+
+        if need_pdf:
+            try:
+                await post_status("📄 Converting the slides… (this can take a minute)")
+                pdf_path = await pptx_convert_to_pdf(source, work_dir)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception("PPTX -> PDF failed:")
+                failed.append(f"📄 PDF: {error}")
+
+            source.unlink(missing_ok=True)
+
+            if pdf_path is not None and send_pdf:
+                try:
+                    await post_status("⬆️ Sending the PDF…")
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+
+                    with named_for_upload(pdf_path, f"{stem}.pdf") as send_path:
+                        await with_retries(
+                            context.bot.send_document,
+                            chat_id=chat_id,
+                            document=str(send_path),
+                            caption=f"📄 {name[:200]} · {format_size(pdf_path.stat().st_size)}",
+                        )
+                    sent.append("PDF")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.exception("PPTX PDF send failed:")
+                    failed.append(f"📄 PDF: {error}")
+
+        # ---- 4) video: every slide with its own recording ----
+        if send_video_file:
+            if pdf_path is None:
+                failed.append("🎬 Video: it needs the slides converted first, and that didn't work")
+            else:
+                try:
+                    video, width, height = await pptx_build_video(pdf_path, per_slide_audio, work_dir, post_status, notes)
+                    duration = await get_duration(str(video))
+
+                    await post_status("⬆️ Sending the video…")
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+                    with named_for_upload(video, f"{stem}.mp4") as send_path:
+                        await with_retries(
+                            context.bot.send_video,
+                            chat_id=chat_id,
+                            video=str(send_path),
+                            duration=round(duration) if duration else None,
+                            width=width,
+                            height=height,
+                            supports_streaming=True,
+                            caption=f"🎬 {name[:200]} · {format_size(video.stat().st_size)}",
+                        )
+                    sent.append("video")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.exception("PPTX video failed:")
+                    failed.append(f"🎬 Video: {error}")
+
+        if not sent:
+            raise RuntimeError("; ".join(failed) or "nothing could be made")
+
+        await post_status("\n".join([f"✅ Done — sent: {', '.join(sent)}.", *notes, *failed]))
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.exception("Error converting PPTX:")
+
+        # Nothing came back to them: give the daily-limit bytes back.
+        if not sent and size > 0 and quota_applies(user_id):
+            quota_refund(user_id, size)
+
+        with contextlib.suppress(Exception):
+            await post_status(f"❌ Couldn't convert {name[:80]}: {error}")
+    finally:
+        if slot_held:
+            release_work_slot()
+        if work_dir is not None:
+            cleanup_work_dir(work_dir)
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
 
@@ -10834,6 +11989,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if is_rar_document(document):
         await handle_rar_incoming(update, context, document)
+        return
+
+    if is_pptx_document(document):
+        await handle_pptx_incoming(update, context, document)
+        return
+
+    if is_old_ppt_document(document):
+        await message.reply_text(MSG_PPTX_OLD_FORMAT)
         return
 
     is_video = (
@@ -11047,6 +12210,10 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_pdf_callback(query, context, user_id)
         return
 
+    if query.data.startswith("pptx:"):
+        await handle_pptx_callback(query, context, user_id)
+        return
+
     if query.data.startswith("toobig:"):
         # A level that would make the file bigger: the button does nothing but explain.
         await query.answer(MSG_LEVEL_WOULD_GROW_FILE, show_alert=True)
@@ -11076,13 +12243,23 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         page = level
 
         if page == "usage":
-            await show_page(query, usage_page_text(user_id), usage_keyboard(user_id))
+            await show_page(query, usage_page_text(user_id), lambda: usage_keyboard(user_id))
+        elif page == "plans":
+            await show_page(query, plans_text(user_id), lambda: plans_keyboard(user_id))
         elif page == "subscribe":
-            await show_page(query, subscribe_page_text(user_id), subscribe_keyboard())
+            await show_page(query, subscribe_page_text(user_id), subscribe_keyboard)
         elif page == "about":
-            await show_page(query, about_text(), about_keyboard())
+            await show_page(query, about_text(), about_keyboard)
+        elif page == "invite":
+            await show_page(
+                query,
+                invite_page(context.bot, user_id, with_back=True)[0],
+                lambda: invite_page(context.bot, user_id, with_back=True)[1],
+            )
+        elif page == "howto":
+            await send_how_to_use(query, context)
         else:
-            await show_page(query, home_text(query.from_user), home_keyboard())
+            await show_page(query, home_text(query.from_user), home_keyboard)
         return
 
     if action == "subpick" and not SUBSCRIPTIONS_ENABLED:
@@ -11098,16 +12275,18 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         awaiting_payment_proof[user_id] = {"tier": level, "since": time.time()}
-        await query.edit_message_text(
-            payment_steps_text(level),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_CANCEL, callback_data="subcancel:_:0")]]),
-        )
+        await with_style_fallback(lambda: query.edit_message_text(
+            payment_steps_text(level, user_id),
+            parse_mode="HTML",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            reply_markup=InlineKeyboardMarkup([[ui_button(BTN_CANCEL, callback_data="subcancel:_:0")]]),
+        ))
         return
 
     if action == "subcancel":
         if user_id is not None:
             awaiting_payment_proof.pop(user_id, None)
-        await show_page(query, home_text(query.from_user), home_keyboard())
+        await show_page(query, home_text(query.from_user), home_keyboard)
         return
 
     if action in ("payok", "payno"):
@@ -12416,6 +13595,7 @@ def main() -> None:
     application.add_handler(CommandHandler("grant", grant_command))
     application.add_handler(CommandHandler("revoke", revoke_command))
     application.add_handler(CommandHandler("event", event_command))
+    application.add_handler(CommandHandler("price", price_command))
     application.add_handler(CommandHandler("subs", subs_command))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
@@ -12424,6 +13604,13 @@ def main() -> None:
     # Admin forwards a text post from the backup channel -> bot replies with the channel ID.
     application.add_handler(
         MessageHandler(filters.FORWARDED & filters.TEXT & ~filters.COMMAND, report_forwarded_channel_id)
+    )
+    # The five menu buttons of the Telegram keyboard (must come BEFORE the plain-text handler below).
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex("^(?:" + "|".join(re.escape(label) for label in REPLY_MENU_LABELS) + ")$"),
+            reply_menu_button,
+        )
     )
     # Plain text = a new file name / album name, but only while a prompt is open.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
