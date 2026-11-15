@@ -2570,9 +2570,9 @@ async def notify_user_granted(bot, user_id: int, tier: str, until: float) -> boo
 # ------------------------------------------------------------
 INVITE_TARGET = 3
 INVITER_TIER, INVITER_DAYS = "pro", 3
-INVITEE_TIER, INVITEE_DAYS = "plus", 1
+INVITEE_TIER, INVITEE_DAYS = "plus", 2
 MAX_PENDING_INVITES = 5000
-INVITE_MAX_REWARDS = 2   # each person can earn the reward at most this many times
+INVITE_MAX_REWARDS = 3   # each person can earn the reward at most this many times
 
 MSG_INVITE_PAGE = (
     "🎁 Invite friends, get free Pro!\n\n"
