@@ -4204,15 +4204,29 @@ DEFAULT_LEVEL = "medium"
 # Audio quality + volume boost (chosen after the video level)
 # ============================================================
 
+# Five audio tiers (kbps). 32 kbps and below are saved as mono at a lower sample rate
+# (see audio_rate_args) — that is what makes such small files still sound clear.
 AUDIO_LEVELS: dict[str, dict] = {
-    "low": {"label": MSG_LOW_2, "detail": MSG_SMALLEST_AUDIO_NOTICEABLE_QUALITY_LO, "bitrate": "48k"},
-    "medium": {"label": MSG_MEDIUM_2, "detail": MSG_BALANCED, "bitrate": "96k"},
-    "high": {"label": MSG_HIGH_2, "detail": MSG_BEST_QUALITY_BIGGEST_AUDIO, "bitrate": "160k"},
+    "k16": {"label": "🔈 16 kbps", "detail": "Smallest — voice only, sounds muffled", "bitrate": "16k"},
+    "k32": {"label": "🔈 32 kbps", "detail": "Small — clear speech", "bitrate": "32k"},
+    "k64": {"label": "🔉 64 kbps", "detail": "Good for lectures and calls", "bitrate": "64k"},
+    "k96": {"label": "🔉 96 kbps", "detail": MSG_BALANCED, "bitrate": "96k"},
+    "k128": {"label": "🔊 128 kbps", "detail": "Best quality, biggest audio", "bitrate": "128k"},
 }
 
-AUDIO_LEVEL_ORDER = ["low", "medium", "high"]
+AUDIO_LEVEL_ORDER = ["k16", "k32", "k64", "k96", "k128"]
 
-DEFAULT_AUDIO_LEVEL = "medium"
+DEFAULT_AUDIO_LEVEL = "k96"
+
+
+def audio_rate_args(bitrate: str | None) -> list[str]:
+    """Extra FFmpeg audio options for very low bitrates: mono + 24 kHz (stereo 44.1 kHz at 16-32 kbps sounds bad)."""
+    try:
+        kbps = int(str(bitrate).rstrip("k"))
+    except ValueError:
+        return []
+
+    return ["-ac", "1", "-ar", "24000"] if kbps <= 32 else []
 
 # Extra choice in the video flow only: keep the original audio exactly as it is
 # (no re-encoding, so no quality loss; enhancements/volume boost don't apply).
@@ -4260,7 +4274,7 @@ AUDIO_COPY_LEVEL = "audio_copy"
 # Audio quality used for a replacement recording. The video is copied
 # (not re-encoded), so the extra bitrate over "medium" costs very
 # little size but keeps the user's recording sounding as good as sent.
-REPLACE_AUDIO_LEVEL = "high"
+REPLACE_AUDIO_LEVEL = "k128"
 
 
 def is_flow_level(level: str) -> bool:
@@ -5420,7 +5434,8 @@ def build_ffmpeg_command(
         # Keep the original audio exactly as is (filters can't apply to a copied stream).
         command += ["-c:a", "copy"]
     else:
-        command += ["-c:a", "aac", "-b:a", audio_bitrate or settings["audio_bitrate"]]
+        command += ["-c:a", "aac", "-b:a", audio_bitrate or settings["audio_bitrate"],
+                    *audio_rate_args(audio_bitrate or settings["audio_bitrate"])]
 
         audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
         if audio_filter_chain:
@@ -5729,7 +5744,7 @@ async def compress_audio_only(
         else:
             command += ["-vn"]
 
-        command += ["-c:a", "aac", "-b:a", audio_bitrate]
+        command += ["-c:a", "aac", "-b:a", audio_bitrate, *audio_rate_args(audio_bitrate)]
 
         audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
         if audio_filter_chain:
@@ -5920,6 +5935,7 @@ async def edit_video_audio(
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", audio_bitrate,
+        *audio_rate_args(audio_bitrate),
     ]
 
     audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
@@ -5968,6 +5984,7 @@ async def replace_video_audio(
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", audio_bitrate,
+        *audio_rate_args(audio_bitrate),
         "-af", "apad",
         "-shortest",
         "-movflags", "+faststart",
@@ -6695,7 +6712,8 @@ async def generate_volume_preview(
     if seek:
         command += ["-ss", f"{seek:.2f}"]
 
-    command += ["-i", input_path, "-t", f"{sample_duration:.2f}", "-vn", "-c:a", "aac", "-b:a", audio_bitrate]
+    command += ["-i", input_path, "-t", f"{sample_duration:.2f}", "-vn", "-c:a", "aac", "-b:a", audio_bitrate,
+                *audio_rate_args(audio_bitrate)]
 
     audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, boost_percent)
     if audio_filter_chain:
@@ -7085,10 +7103,14 @@ def smart_analyze(
     source_kbps = (info.get("audio_bps") or 0) / 1000
     if not info.get("has_audio") or not source_kbps:
         audio_level = DEFAULT_AUDIO_LEVEL
-    elif source_kbps <= 56:
-        audio_level = "low"
+    elif source_kbps <= 24:
+        audio_level = "k16"
+    elif source_kbps <= 48:
+        audio_level = "k32"
+    elif source_kbps <= 80:
+        audio_level = "k64"
     else:
-        audio_level = "medium"
+        audio_level = DEFAULT_AUDIO_LEVEL
 
     # --- frame rate ---
     max_fps = SMART_FPS_CAP if (fps and fps > SMART_FPS_THRESHOLD and level != "low") else None
@@ -7618,7 +7640,7 @@ async def run_compression(
             else:
                 # The audio format can't go into an MP4 as is (or the probe failed):
                 # re-encode at the best audio quality instead of failing.
-                audio_level = "high"
+                audio_level = "k128"
                 extra_caption = (
                     (extra_caption + "\n" if extra_caption else "")
                     + MSG_THAT_AUDIO_FORMAT_CAN_T
@@ -11313,6 +11335,10 @@ PPTX_MAX_SLIDES = int(os.getenv("PPTX_MAX_SLIDES", "300"))
 PPTX_MAX_AUDIO_MB = int(os.getenv("PPTX_MAX_AUDIO_MB", "1500"))       # biggest total size of recordings we will unpack
 PPTX_STEP_TIMEOUT = int(os.getenv("PPTX_STEP_TIMEOUT", "900"))        # seconds allowed for one conversion step
 PPTX_MENU_TTL = 3600                                                  # an unanswered menu is forgotten after 1 hour
+PPTX_AUDIO_KBPS = int(os.getenv("PPTX_AUDIO_KBPS", "128"))            # 16 / 32 / 64 / 96 / 128
+if PPTX_AUDIO_KBPS not in (16, 32, 64, 96, 128):
+    PPTX_AUDIO_KBPS = 128
+PPTX_AUDIO_RATE, PPTX_AUDIO_LAYOUT = (24000, "mono") if PPTX_AUDIO_KBPS <= 32 else (44100, "stereo")
 PPTX_AUDIO_EXTENSIONS = (".wav", ".mp3", ".m4a", ".aac", ".wma", ".ogg", ".oga", ".flac", ".opus", ".aif", ".aiff")
 
 BTN_PPTX_PDF = "📄 PDF"
@@ -11471,17 +11497,18 @@ def pptx_extract_slide_audio(source: Path, media_dir: Path) -> list[list[Path]]:
 
 
 async def pptx_normalise_audio(clips: list[Path], output: Path) -> None:
-    """One slide's recording(s) -> one AAC file (44.1 kHz stereo), so all slides can be joined without re-encoding."""
+    """One slide's recording(s) -> one AAC file with the same settings for every slide, so they can be joined without re-encoding."""
     command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     for clip in clips:
         command += ["-i", str(clip)]
 
     count = len(clips)
     graph = "".join(
-        f"[{i}:a:0]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}];" for i in range(count)
+        f"[{i}:a:0]aresample={PPTX_AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts={PPTX_AUDIO_LAYOUT}[a{i}];"
+        for i in range(count)
     )
     graph += "".join(f"[a{i}]" for i in range(count)) + f"concat=n={count}:v=0:a=1[out]"
-    command += ["-filter_complex", graph, "-map", "[out]", "-c:a", "aac", "-b:a", "128k", str(output)]
+    command += ["-filter_complex", graph, "-map", "[out]", "-c:a", "aac", "-b:a", f"{PPTX_AUDIO_KBPS}k", str(output)]
 
     code, stderr = await run_tool(command, PPTX_STEP_TIMEOUT)
     if code != 0 or not output.exists():
@@ -11562,8 +11589,9 @@ async def pptx_video_segment(
     if audio is not None:
         command += ["-i", str(audio), "-c:a", "copy"]
     else:
-        command += ["-f", "lavfi", "-t", f"{PPTX_SLIDE_SECONDS:g}", "-i", "anullsrc=r=44100:cl=stereo",
-                    "-c:a", "aac", "-b:a", "128k"]
+        command += ["-f", "lavfi", "-t", f"{PPTX_SLIDE_SECONDS:g}",
+                    "-i", f"anullsrc=r={PPTX_AUDIO_RATE}:cl={PPTX_AUDIO_LAYOUT}",
+                    "-c:a", "aac", "-b:a", f"{PPTX_AUDIO_KBPS}k"]
 
     command += [
         "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
