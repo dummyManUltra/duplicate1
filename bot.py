@@ -16,6 +16,7 @@ import itertools
 import hashlib
 import io
 import zipfile
+import secrets
 import subprocess
 import posixpath
 import struct
@@ -678,6 +679,7 @@ MSG_PROCESSING_THE_IMAGE = "🖼 Processing the image..."
 MSG_THAT_FILE_ISN_T_IN = "⚠️ That file isn't in my cache anymore — please resend it."
 MSG_I_COULDN_T_READ_THAT = "❌ I couldn't read that image. Send a different one (JPG / PNG / WebP)."
 MSG_ALBUM_COVER_SET = "✅ Album cover set."
+MSG_VIDEO_COVER_SET = "✅ Video cover set."
 MSG_VIDEO_COVER_SET_NOW_PICK = (
     "✅ Video cover set.\n"
     "\n"
@@ -2092,8 +2094,12 @@ referrals: dict = {
     "pending": {},    # new person (text id) -> who invited them; opened the bot via the link, not counted yet
     "progress": {},   # inviter (text id) -> [people counted since their last reward]
     "counted": {},    # everyone ever counted (text id) -> inviter, so nobody counts twice
-    "rewards": {},    # inviter (text id) -> how many times they earned the reward
+    "rewards": {},    # inviter (text id) -> how many groups of 3 they were rewarded for (OLD system)
+    "rewarded": {},   # friend (text id) -> inviter: people already rewarded one by one (NEW system)
     "bonus": {},      # user (text id) -> {"tier": ..., "until": ...} free days; runs next to a paid plan
+    "links": {},        # custom links (/newlink): code -> {"tier", "days", "max", "name", "created", "active"}
+    "link_claims": {},  # person (text id) -> code: who already got their free plan from a custom link
+    "link_pending": {}, # new person (text id) -> code: opened the bot through a custom link, not credited yet
 }
 
 
@@ -2232,10 +2238,20 @@ def file_too_large(user_id: int | None, size_bytes: int) -> bool:
 
 
 def user_priority(user_id: int | None) -> int:
+    """
+    Who goes first in the queue (bigger = sooner):
+      unlimited users, then people who BOUGHT a plan (Pro, then Plus),
+      then people on free days (invite rewards / custom links / events: Pro, then Plus), then Free.
+    """
     if user_id is not None and is_unlimited(user_id):
         return 99
 
-    return TIERS[get_tier(user_id)]["priority"]
+    paid = _paid_subscription(user_id)
+
+    if paid is not None:
+        return 10 + TIERS[paid["tier"]]["priority"]   # 11 = Plus, 12 = Pro — always ahead of free days
+
+    return TIERS[get_tier(user_id)]["priority"]       # 0 = Free, 1 = Plus days, 2 = Pro days
 
 
 def user_plan_label(user_id: int | None) -> str | None:
@@ -2563,37 +2579,35 @@ async def notify_user_granted(bot, user_id: int, tier: str, until: float) -> boo
 
 
 # ------------------------------------------------------------
-# /invite — every user gets a personal link. When INVITE_TARGET brand-new
-# people open the bot through it AND are in the channel, the inviter gets
-# INVITER_DAYS days of Pro and those people get INVITEE_DAYS day of Plus.
-# It repeats: every group of 3 earns the reward again.
+# /invite — every user gets a personal link. For EVERY brand-new person who
+# opens the bot through it AND is in the channel, the inviter gets INVITER_DAYS
+# of Pro straight away and that person gets INVITEE_DAYS of Plus.
+# Each inviter can earn this for at most INVITE_MAX_FRIENDS friends.
+# (Old system: groups of INVITE_TARGET friends — people counted under it still count.)
 # ------------------------------------------------------------
-INVITE_TARGET = 3
-INVITER_TIER, INVITER_DAYS = "pro", 3
+INVITE_TARGET = 3          # only used to convert old "groups of 3" rewards into a friends count
+INVITER_TIER, INVITER_DAYS = "pro", 1
 INVITEE_TIER, INVITEE_DAYS = "plus", 2
 MAX_PENDING_INVITES = 5000
-INVITE_MAX_REWARDS = 3   # each person can earn the reward at most this many times
+INVITE_MAX_FRIENDS = 6     # each person can be rewarded for at most this many friends
 
 MSG_INVITE_PAGE = (
     "🎁 Invite friends, get free Pro!\n\n"
     "Your personal link:\n{link}\n\n"
-    "When {target} new people open the bot through it and join our channel:\n"
+    "For every new person who opens the bot through it and joins our channel:\n"
     "• you get {inviter_days} of {inviter_tier}\n"
-    "• each of them gets {invitee_days} of {invitee_tier}\n\n"
-    "📊 Progress: {progress}/{target}\n"
-    "🏆 Rewards earned: {rewards}/{max_rewards}"
+    "• they get {invitee_days} of {invitee_tier}\n\n"
+    "👥 Friends joined: {friends}/{max_friends}"
 )
 MSG_INVITE_LIMIT_REACHED = (
-    "🏆 You've earned the invite reward {max_rewards}/{max_rewards} times — that's the maximum.\n"
+    "🏆 {max_friends} friends joined through your link — that's the maximum.\n"
     "Thanks for spreading the word! 💙"
 )
-MSG_INVITE_JOINED = "🎉 {name} joined through your link! Progress: {progress}/{target}"
-MSG_INVITE_DONE_INVITER = (
-    "🎁 {target}/{target} reached! You got {inviter_days} of {inviter_tier}.\n"
-    "Your {target} friends got {invitee_days} of {invitee_tier}.\n\n"
-    "You can earn this reward up to {max_rewards} times in total — rewards used: {rewards}/{max_rewards}."
+MSG_INVITE_JOINED = (
+    "🎉 {name} joined through your link — you got {inviter_days} of {inviter_tier}!\n"
+    "👥 Friends joined: {friends}/{max_friends}"
 )
-MSG_INVITE_DONE_INVITEE = "🎁 {name}'s invite just reached {target}/{target} — you got {invitee_days} of {invitee_tier}!"
+MSG_INVITE_DONE_INVITEE = "🎁 You joined through {name}'s invite — you got {invitee_days} of {invitee_tier}!"
 BTN_SHARE_INVITE = "📤 Share my link"
 BTN_INVITE_TO_WIN = "🎁 Invite to win!"
 MSG_SHARE_INVITE_TEXT = "Free video & audio compressor on Telegram (مش هكر والله 😁❤️)"
@@ -2629,6 +2643,16 @@ def merge_referrals_bytes(raw: bytes) -> None:
         for person in people if isinstance(people, list) else []:
             if person not in mine:
                 mine.append(person)
+
+    for key, inviter in (data.get("rewarded") or {}).items():
+        referrals["rewarded"].setdefault(str(key), inviter)
+
+    for code, link in (data.get("links") or {}).items():
+        if isinstance(link, dict) and link.get("tier") in ("plus", "pro"):
+            referrals["links"].setdefault(str(code), link)
+
+    for key, code in (data.get("link_claims") or {}).items():
+        referrals["link_claims"].setdefault(str(key), code)
 
     for inviter, amount in (data.get("rewards") or {}).items():
         try:
@@ -2674,8 +2698,14 @@ def grant_bonus(user_id: int, tier: str, days: int) -> float:
     return until
 
 
+def invite_friends(user_id: int) -> int:
+    """How many friends this person has been rewarded for (old groups of 3 count as 3 each)."""
+    new_system = sum(1 for inviter in referrals["rewarded"].values() if str(inviter) == str(user_id))
+    return new_system + int(referrals["rewards"].get(str(user_id), 0)) * INVITE_TARGET
+
+
 def invite_limit_reached(user_id: int) -> bool:
-    return int(referrals["rewards"].get(str(user_id), 0)) >= INVITE_MAX_REWARDS
+    return invite_friends(user_id) >= INVITE_MAX_FRIENDS
 
 
 def invite_link(bot, user_id: int) -> str:
@@ -2699,6 +2729,12 @@ async def capture_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         user = update.effective_user
 
         if message is None or user is None or user.is_bot:
+            return
+
+        link_code = _parse_link_start(message.text)
+
+        if link_code is not None:
+            await capture_custom_link(message, context, user, link_code)
             return
 
         inviter_id = _parse_ref_start(message.text)
@@ -2726,48 +2762,256 @@ async def capture_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         logger.exception("Couldn't record an invite")
 
 
+async def reward_friend(bot, inviter_id: int, person_id: int, person_name: str) -> bool:
+    """One friend counted: the inviter gets Pro days, the friend gets Plus days. False if the inviter is at the maximum."""
+    if invite_limit_reached(inviter_id) or str(person_id) in referrals["rewarded"]:
+        return False
+
+    referrals["rewarded"][str(person_id)] = inviter_id
+    grant_bonus(inviter_id, INVITER_TIER, INVITER_DAYS)
+    grant_bonus(person_id, INVITEE_TIER, INVITEE_DAYS)
+
+    fmt = dict(
+        inviter_days=_days_text(INVITER_DAYS), inviter_tier=tier_label(INVITER_TIER),
+        invitee_days=_days_text(INVITEE_DAYS), invitee_tier=tier_label(INVITEE_TIER),
+        friends=invite_friends(inviter_id), max_friends=INVITE_MAX_FRIENDS,
+    )
+
+    with contextlib.suppress(Exception):
+        await bot.send_message(chat_id=inviter_id, text=MSG_INVITE_JOINED.format(name=person_name, **fmt))
+
+    with contextlib.suppress(Exception):
+        await bot.send_message(
+            chat_id=person_id,
+            text=MSG_INVITE_DONE_INVITEE.format(name=display_name_for(inviter_id), **fmt),
+        )
+
+    return True
+
+
 async def credit_referral(bot, user) -> None:
-    """The invited person is now in the channel: count them, and reward when the group is complete."""
+    """The invited person is now in the channel: count them and reward both of you straight away."""
     uid = str(user.id)
+
+    link_code = referrals["link_pending"].pop(uid, None)
+    if link_code is not None:
+        await credit_custom_link(bot, user, link_code)
+        return
+
     inviter_id = referrals["pending"].pop(uid, None)
 
     if inviter_id is None or uid in referrals["counted"] or invite_limit_reached(inviter_id):
         return
 
     referrals["counted"][uid] = inviter_id
-    group = referrals["progress"].setdefault(str(inviter_id), [])
-    group.append(user.id)
 
-    if len(group) < INVITE_TARGET:
-        with contextlib.suppress(Exception):
-            await bot.send_message(
-                chat_id=inviter_id,
-                text=MSG_INVITE_JOINED.format(name=user_display_name(user), progress=len(group), target=INVITE_TARGET),
-            )
+    # People counted under the OLD system but not rewarded yet (a group of 3 that never completed): reward them now.
+    for person_id in referrals["progress"].pop(str(inviter_id), []):
+        if person_id != user.id:
+            await reward_friend(bot, inviter_id, person_id, display_name_for(person_id))
+
+    await reward_friend(bot, inviter_id, user.id, user_display_name(user))
+
+
+# ------------------------------------------------------------
+# Custom links (admin): /newlink <plus|pro> <days> <max people> [name]
+# Anyone brand-new who opens the bot through the link (and joins the channel) gets that plan
+# for that many days — until the link has been used by its maximum number of people.
+#   /links              every link, how many people used it, and its address
+#   /stoplink <code>    stop a link        /resumelink <code>   turn it back on
+# ------------------------------------------------------------
+LINK_MAX_PEOPLE = 100_000
+LINK_MAX_DAYS = 3650
+MAX_PENDING_LINK_USERS = 5000
+
+MSG_NEWLINK_USAGE = (
+    "Usage: /newlink <plus|pro> <days> <max people> [name]\n"
+    "Example: /newlink pro 7 50 Telegram group\n"
+    "→ the first 50 new people who join through it get 7 days of Pro."
+)
+MSG_NEWLINK_CREATED = (
+    "✅ Link created\n\n"
+    "🔗 {link}\n\n"
+    "🎁 {days} of {tier} for each new person · up to {max_people} people\n"
+    "{name_line}"
+    "Code: {code}\n\n"
+    "/links — all links · /stoplink {code} — stop it"
+)
+MSG_LINK_WELCOME = "🎁 Welcome! This link gave you {days} of {tier} — enjoy! 🚀"
+MSG_LINK_FULL = "⚠️ This link has already been used by everyone it was made for, so there's no free plan this time. You can still use the bot normally!"
+MSG_LINK_FULL_ADMIN = "🔗 Your link “{name}” is full: {used}/{max_people} people joined."
+MSG_LINKS_NONE = "You haven't made any links yet.\n\n" + MSG_NEWLINK_USAGE
+MSG_LINK_UNKNOWN = "I don't have a link with that code. /links shows them all."
+
+
+def _parse_link_start(text: str | None) -> str | None:
+    parts = (text or "").split()
+
+    if len(parts) < 2 or not parts[0].lower().startswith("/start"):
+        return None
+
+    payload = parts[1]
+    return payload[4:] if payload.startswith("lnk_") and len(payload) > 4 else None
+
+
+def link_used(code: str) -> int:
+    return sum(1 for claimed in referrals["link_claims"].values() if claimed == code)
+
+
+def link_address(bot, code: str) -> str:
+    return f"https://t.me/{bot.username}?start=lnk_{code}"
+
+
+async def capture_custom_link(message, context: ContextTypes.DEFAULT_TYPE, user, code: str) -> None:
+    """A brand-new person opened the bot through a custom link: remember it until they're in the channel."""
+    uid = str(user.id)
+
+    if (
+        uid in stats["users"] or uid in referrals["counted"] or uid in referrals["pending"]
+        or uid in referrals["link_claims"] or uid in referrals["link_pending"] or is_unlimited(user.id)
+    ):
         return
 
-    batch = group[:INVITE_TARGET]
-    referrals["progress"][str(inviter_id)] = group[INVITE_TARGET:]
-    referrals["rewards"][str(inviter_id)] = int(referrals["rewards"].get(str(inviter_id), 0)) + 1
+    link = referrals["links"].get(code)
 
-    grant_bonus(inviter_id, INVITER_TIER, INVITER_DAYS)
-    fmt = dict(
-        target=INVITE_TARGET,
-        inviter_days=_days_text(INVITER_DAYS), inviter_tier=tier_label(INVITER_TIER),
-        invitee_days=_days_text(INVITEE_DAYS), invitee_tier=tier_label(INVITEE_TIER),
-        max_rewards=INVITE_MAX_REWARDS, rewards=referrals["rewards"][str(inviter_id)],
-    )
+    if link is None or not link.get("active", True):
+        return
+
+    if link_used(code) >= int(link.get("max", 0)):
+        await message.reply_text(MSG_LINK_FULL)
+        return
+
+    referrals["link_pending"][uid] = code
+
+    while len(referrals["link_pending"]) > MAX_PENDING_LINK_USERS:
+        referrals["link_pending"].pop(next(iter(referrals["link_pending"])))
+
+    if REQUIRED_CHANNEL_ID == 0:   # no channel to join: give the plan straight away
+        await credit_custom_link(context.bot, user, code)
+
+
+async def credit_custom_link(bot, user, code: str) -> None:
+    """The person is in (and in the channel): give them the link's plan, if there is still room."""
+    uid = str(user.id)
+    link = referrals["links"].get(code)
+
+    if link is None or not link.get("active", True) or uid in referrals["link_claims"]:
+        return
+
+    max_people = int(link.get("max", 0))
+
+    if link_used(code) >= max_people:
+        with contextlib.suppress(Exception):
+            await bot.send_message(chat_id=user.id, text=MSG_LINK_FULL)
+        return
+
+    referrals["link_claims"][uid] = code
+    grant_bonus(user.id, link["tier"], int(link["days"]))
 
     with contextlib.suppress(Exception):
-        await bot.send_message(chat_id=inviter_id, text=MSG_INVITE_DONE_INVITER.format(**fmt))
+        await bot.send_message(
+            chat_id=user.id,
+            text=MSG_LINK_WELCOME.format(days=_days_text(int(link["days"])), tier=tier_label(link["tier"])),
+        )
 
-    for person_id in batch:
-        grant_bonus(person_id, INVITEE_TIER, INVITEE_DAYS)
+    if link_used(code) >= max_people:
         with contextlib.suppress(Exception):
             await bot.send_message(
-                chat_id=person_id,
-                text=MSG_INVITE_DONE_INVITEE.format(name=display_name_for(inviter_id), **fmt),
+                chat_id=ADMIN_USER_ID,
+                text=MSG_LINK_FULL_ADMIN.format(name=link.get("name") or code, used=max_people, max_people=max_people),
             )
+
+
+async def newlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    args = context.args or []
+
+    try:
+        tier = args[0].lower()
+        days = int(args[1])
+        max_people = int(args[2])
+    except (IndexError, ValueError):
+        await message.reply_text(MSG_NEWLINK_USAGE)
+        return
+
+    if tier not in ("plus", "pro") or not 1 <= days <= LINK_MAX_DAYS or not 1 <= max_people <= LINK_MAX_PEOPLE:
+        await message.reply_text(MSG_NEWLINK_USAGE)
+        return
+
+    name = " ".join(args[3:])[:40].strip()
+    code = secrets.token_urlsafe(6)
+
+    while code in referrals["links"]:
+        code = secrets.token_urlsafe(6)
+
+    referrals["links"][code] = {
+        "tier": tier, "days": days, "max": max_people, "name": name, "created": time.time(), "active": True,
+    }
+
+    await message.reply_text(MSG_NEWLINK_CREATED.format(
+        link=link_address(context.bot, code), days=_days_text(days), tier=tier_label(tier),
+        max_people=max_people, name_line=f"🏷 {name}\n" if name else "", code=code,
+    ))
+
+
+async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    if not referrals["links"]:
+        await message.reply_text(MSG_LINKS_NONE)
+        return
+
+    newest_first = sorted(referrals["links"].items(), key=lambda item: item[1].get("created", 0), reverse=True)
+    blocks = []
+
+    for code, link in newest_first[:20]:
+        used, max_people = link_used(code), int(link.get("max", 0))
+        state = "🟢" if link.get("active", True) and used < max_people else ("🔴" if used >= max_people else "⏸")
+        title = link.get("name") or code
+        blocks.append(
+            f"{state} {title} — {_days_text(int(link['days']))} of {tier_label(link['tier'])} · {used}/{max_people} people\n"
+            f"{link_address(context.bot, code)}"
+        )
+
+    extra = f"\n\n(+{len(newest_first) - 20} older links not shown)" if len(newest_first) > 20 else ""
+    await message.reply_text("🔗 Your links\n\n" + "\n\n".join(blocks) + extra, disable_web_page_preview=True)
+
+
+async def _set_link_active(update: Update, context: ContextTypes.DEFAULT_TYPE, active: bool) -> None:
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    raw = (context.args[0] if context.args else "").strip()
+    code = raw.split("lnk_")[-1] if "lnk_" in raw else raw
+    link = referrals["links"].get(code)
+
+    if link is None:
+        await message.reply_text(MSG_LINK_UNKNOWN)
+        return
+
+    link["active"] = active
+    title = link.get("name") or code
+    await message.reply_text(f"▶️ Link “{title}” is on again." if active else f"⏸ Link “{title}” is stopped. /resumelink {code} turns it back on.")
+
+
+async def stoplink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_link_active(update, context, False)
+
+
+async def resumelink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_link_active(update, context, True)
 
 
 def invite_page(bot, user_id: int, with_back: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
@@ -2775,18 +3019,16 @@ def invite_page(bot, user_id: int, with_back: bool = False) -> tuple[str, Inline
     back_row = [[ui_button(BTN_BACK, callback_data="home:back:0")]] if with_back else []
 
     if invite_limit_reached(user_id):
-        text = MSG_INVITE_LIMIT_REACHED.format(max_rewards=INVITE_MAX_REWARDS)
+        text = MSG_INVITE_LIMIT_REACHED.format(max_friends=INVITE_MAX_FRIENDS)
         return text, (InlineKeyboardMarkup(back_row) if back_row else None)
 
     link = invite_link(bot, user_id)
     text = MSG_INVITE_PAGE.format(
         link=link,
-        target=INVITE_TARGET,
         inviter_days=_days_text(INVITER_DAYS), inviter_tier=tier_label(INVITER_TIER),
         invitee_days=_days_text(INVITEE_DAYS), invitee_tier=tier_label(INVITEE_TIER),
-        progress=len(referrals["progress"].get(str(user_id), [])),
-        rewards=int(referrals["rewards"].get(str(user_id), 0)),
-        max_rewards=INVITE_MAX_REWARDS,
+        friends=invite_friends(user_id),
+        max_friends=INVITE_MAX_FRIENDS,
     )
     share_row = [ui_button(
         BTN_SHARE_INVITE,
@@ -2936,7 +3178,7 @@ def home_reply_keyboard() -> ReplyKeyboardMarkup:
             [ui_reply_button(BTN_USAGE), ui_reply_button(BTN_HOW_TO_USE)],
         ],
         resize_keyboard=True,
-        is_persistent=True,
+        is_persistent=False,   # so people can collapse it with the keyboard icon next to the text box (and open it again)
     )
 
 
@@ -2990,7 +3232,7 @@ def how_to_use_text_en() -> str:
         "📊 LIMITS & PLANS\n"
         "• Everyone has a daily data limit and a biggest file size — see 📊 Usage. It resets every day at 12:00 AM.\n"
         "• 📦 Plans and 💎 Subscribe give bigger limits and a place ahead in the queue (Pro, then Plus, then Free).\n"
-        f"• 🎁 Invite to win: invite {INVITE_TARGET} friends and get {_days_text(INVITER_DAYS)} of Pro free (/invite).\n"
+        f"• 🎁 Invite to win: for every friend you invite, get {_days_text(INVITER_DAYS)} of Pro free (/invite).\n"
         "\n"
         f"🔒 Your files are deleted as soon as they're processed, or after {idle} without any action.\n"
         "\n"
@@ -3040,7 +3282,7 @@ def how_to_use_text_ar() -> str:
         "📊 الحدود والباقات\n"
         "• كل مستخدم له حد يومي للبيانات وأقصى حجم للملف الواحد — شوفهم في 📊 Usage. بيتجدد كل يوم الساعة 12:00 صباحًا.\n"
         "• 📦 Plans و 💎 Subscribe بيدّوك حدود أكبر وأولوية في الطابور (Pro ثم Plus ثم Free).\n"
-        f"• 🎁 Invite to win: ادعو {INVITE_TARGET} من أصحابك واكسب {_ar_days(INVITER_DAYS)} Pro مجانًا (/invite).\n"
+        f"• 🎁 Invite to win: لكل صاحب بتدعوه بتكسب {_ar_days(INVITER_DAYS)} Pro مجانًا (/invite).\n"
         "\n"
         f"🔒 ملفاتك بتتمسح أول ما تخلص معالجتها، أو بعد {idle} من غير أي حركة.\n"
         "\n"
@@ -3586,7 +3828,7 @@ async def require_channel_membership(update: Update, context: ContextTypes.DEFAU
     is_recheck = query is not None and query.data == "joincheck"
 
     if joined:
-        if str(user.id) in referrals["pending"]:
+        if str(user.id) in referrals["pending"] or str(user.id) in referrals["link_pending"]:
             await credit_referral(context.bot, user)
 
         if is_recheck:
@@ -8282,6 +8524,24 @@ async def process_audio_replacement(
         )
         return
 
+    # The recording counts toward the daily data limit like every other file they send.
+    sender_id = update.effective_user.id if update.effective_user else None
+    replacement_size = audio_path.stat().st_size if audio_path.exists() else 0
+
+    if file_too_large(sender_id, replacement_size):
+        audio_path.unlink(missing_ok=True)
+        await status_message.edit_text(file_too_large_text(sender_id, replacement_size))
+        return
+
+    if not quota_allows(sender_id, replacement_size):
+        audio_path.unlink(missing_ok=True)
+        await status_message.edit_text(quota_refusal_text(sender_id, replacement_size))
+        return
+
+    quota_consume(sender_id, replacement_size)
+    # If this job fails or is cancelled, the bytes of BOTH files go back.
+    pending["charged_bytes"] = int(pending.get("charged_bytes") or pending.get("original_size") or 0) + replacement_size
+
     # Got a usable recording — no longer waiting.
     awaiting_audio_replacement.pop(chat_id, None)
 
@@ -9850,8 +10110,12 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def show_audio_meta_panel(context, chat_id: int, message_id: int) -> None:
-    """Show (or refresh) the rename / album / cover panel for an audio file."""
+async def show_audio_meta_panel(context, chat_id: int, message_id: int, resend: bool = False) -> None:
+    """
+    Show (or refresh) the rename / album / cover panel for an audio file.
+    resend=True sends it as a NEW message at the bottom of the chat (and removes the old panel),
+    so after setting something the buttons are right under the confirmation.
+    """
     pending = pending_compressions.get(message_id)
 
     if pending is None:
@@ -9861,7 +10125,7 @@ async def show_audio_meta_panel(context, chat_id: int, message_id: int) -> None:
     markup = audio_meta_keyboard(message_id)
     panel_id = pending.get("meta_panel_id")
 
-    if panel_id:
+    if panel_id and not resend:
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=panel_id, text=text, reply_markup=markup
@@ -9875,6 +10139,44 @@ async def show_audio_meta_panel(context, chat_id: int, message_id: int) -> None:
 
     sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
     pending["meta_panel_id"] = sent.message_id
+
+    if resend and panel_id:
+        with contextlib.suppress(Exception):
+            await context.bot.delete_message(chat_id=chat_id, message_id=panel_id)
+
+
+async def resend_level_menu(
+    context, chat_id: int, message_id: int, header: str = "", extra_row: list | None = None
+) -> bool:
+    """Send the video's level menu again as a new message at the bottom. False if it isn't available any more."""
+    pending = pending_compressions.get(message_id)
+    menu_text = pending.get("menu_text") if pending else None
+
+    if not menu_text:
+        return False
+
+    args = (
+        message_id,
+        pending.get("estimates", {}),
+        pending.get("default_level"),
+        pending.get("smart"),
+        pending.get("original_size"),
+    )
+
+    for styled in (True, False):
+        markup = estimate_keyboard(*args, styled=styled)
+
+        if extra_row:
+            markup = InlineKeyboardMarkup([*markup.inline_keyboard, extra_row])
+
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=header + menu_text, reply_markup=markup)
+            return True
+        except BadRequest:
+            if not styled:
+                raise
+
+    return False
 
 
 async def apply_cover_image(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
@@ -9927,17 +10229,29 @@ async def apply_cover_image(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     if waiting["field"] == "cover":
         await status_message.edit_text(MSG_ALBUM_COVER_SET)
-        await show_audio_meta_panel(context, chat_id, target_message_id)
+        await show_audio_meta_panel(context, chat_id, target_message_id, resend=True)
     else:
-        await status_message.edit_text(
-            MSG_VIDEO_COVER_SET_NOW_PICK,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    BTN_UPLOAD_VIDEO_UNCHANGED,
-                    callback_data=f"coveronly:_:{target_message_id}",
-                )
-            ]]),
+        # Video cover: confirm, then bring the level menu back as a new message, so the buttons are right here.
+        menu_shown = await resend_level_menu(
+            context, chat_id, target_message_id,
+            header="✅ Video cover set — it will be used on the result.\n\n",
+            extra_row=[InlineKeyboardButton(
+                BTN_UPLOAD_VIDEO_UNCHANGED, callback_data=f"coveronly:_:{target_message_id}"
+            )],
         )
+
+        if menu_shown:
+            await status_message.edit_text(MSG_VIDEO_COVER_SET)
+        else:
+            await status_message.edit_text(
+                MSG_VIDEO_COVER_SET_NOW_PICK,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        BTN_UPLOAD_VIDEO_UNCHANGED,
+                        callback_data=f"coveronly:_:{target_message_id}",
+                    )
+                ]]),
+            )
 
 
 SLIDE_NUMBERS_RE = re.compile(r"^[\d\s,;\-\u2013]+$")
@@ -10094,7 +10408,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     awaiting_input.pop(chat_id, None)
-    await show_audio_meta_panel(context, chat_id, waiting["mid"])
+    await show_audio_meta_panel(context, chat_id, waiting["mid"], resend=True)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10342,12 +10656,15 @@ def pdf_screen(session: dict) -> tuple[str, InlineKeyboardMarkup]:
     return text, keyboard
 
 
-async def pdf_edit(bot, chat_id: int, session: dict, text: str, keyboard=None) -> None:
-    """Show text on this list's one menu message (edit it, or send it the first time)."""
+async def pdf_edit(bot, chat_id: int, session: dict, text: str, keyboard=None, fresh: bool = False) -> None:
+    """
+    Show text on this list's one menu message (edit it, or send it the first time).
+    fresh=True sends it as a NEW message at the bottom instead (and removes the old one).
+    """
     async with session["lock"]:
         menu_mid = session.get("menu_mid")
 
-        if menu_mid is not None:
+        if menu_mid is not None and not fresh:
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id, message_id=menu_mid, text=text, reply_markup=keyboard
@@ -10361,13 +10678,17 @@ async def pdf_edit(bot, chat_id: int, session: dict, text: str, keyboard=None) -
         sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
         session["menu_mid"] = sent.message_id
 
+        if fresh and menu_mid is not None:
+            with contextlib.suppress(Exception):
+                await bot.delete_message(chat_id=chat_id, message_id=menu_mid)
 
-async def pdf_render(bot, chat_id: int, session: dict, mode: str | None = None) -> None:
+
+async def pdf_render(bot, chat_id: int, session: dict, mode: str | None = None, fresh: bool = False) -> None:
     if mode:
         session["mode"] = mode
 
     text, keyboard = pdf_screen(session)
-    await pdf_edit(bot, chat_id, session, text, keyboard)
+    await pdf_edit(bot, chat_id, session, text, keyboard, fresh=fresh)
 
 
 async def handle_pdf_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE, document) -> None:
@@ -10912,7 +11233,7 @@ async def handle_pdf_text(update: Update, context: ContextTypes.DEFAULT_TYPE, wa
 
     awaiting_input.pop(chat_id, None)
     session["last_active"] = time.time()
-    await pdf_render(context.bot, chat_id, session, "name")
+    await pdf_render(context.bot, chat_id, session, "name", fresh=True)
 
 
 async def apply_pdf_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
@@ -10962,7 +11283,7 @@ async def apply_pdf_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE
     with contextlib.suppress(Exception):
         await status_message.delete()
 
-    await pdf_render(context.bot, chat_id, session, "name")
+    await pdf_render(context.bot, chat_id, session, "name", fresh=True)
 
 
 async def expire_idle_pdf_sessions(bot) -> int:
@@ -13792,6 +14113,10 @@ def main() -> None:
     application.add_handler(CommandHandler("event", event_command))
     application.add_handler(CommandHandler("price", price_command))
     application.add_handler(CommandHandler("subs", subs_command))
+    application.add_handler(CommandHandler("newlink", newlink_command))
+    application.add_handler(CommandHandler("links", links_command))
+    application.add_handler(CommandHandler("stoplink", stoplink_command))
+    application.add_handler(CommandHandler("resumelink", resumelink_command))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
