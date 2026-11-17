@@ -2815,8 +2815,9 @@ async def credit_referral(bot, user) -> None:
 
 # ------------------------------------------------------------
 # Custom links (admin): /newlink <plus|pro> <days> <max people> [name]
-# Anyone brand-new who opens the bot through the link (and joins the channel) gets that plan
-# for that many days — until the link has been used by its maximum number of people.
+# Anyone who opens the bot through the link (new OR old user) and is in the channel gets that plan
+# for that many days — added on top of any days they already have — until the link has been
+# used by its maximum number of people. Each person can use each link once.
 #   /links              every link, how many people used it, and its address
 #   /stoplink <code>    stop a link        /resumelink <code>   turn it back on
 # ------------------------------------------------------------
@@ -2837,7 +2838,7 @@ MSG_NEWLINK_CREATED = (
     "Code: {code}\n\n"
     "/links — all links · /stoplink {code} — stop it"
 )
-MSG_LINK_WELCOME = "🎁 Welcome! This link gave you {days} of {tier} — enjoy! 🚀"
+MSG_LINK_WELCOME = "🎁 This link gave you {days} of {tier} — active until {until}. Enjoy! 🚀"
 MSG_LINK_FULL = "⚠️ This link has already been used by everyone it was made for, so there's no free plan this time. You can still use the bot normally!"
 MSG_LINK_FULL_ADMIN = "🔗 Your link “{name}” is full: {used}/{max_people} people joined."
 MSG_LINKS_NONE = "You haven't made any links yet.\n\n" + MSG_NEWLINK_USAGE
@@ -2855,7 +2856,13 @@ def _parse_link_start(text: str | None) -> str | None:
 
 
 def link_used(code: str) -> int:
-    return sum(1 for claimed in referrals["link_claims"].values() if claimed == code)
+    """How many people have used this link (new claims are stored as "code:user"; older ones as user -> code)."""
+    prefix = f"{code}:"
+    return sum(1 for key, value in referrals["link_claims"].items() if key.startswith(prefix) or value == code)
+
+
+def link_already_claimed(code: str, user_id) -> bool:
+    return f"{code}:{user_id}" in referrals["link_claims"] or referrals["link_claims"].get(str(user_id)) == code
 
 
 def link_address(bot, code: str) -> str:
@@ -2863,13 +2870,10 @@ def link_address(bot, code: str) -> str:
 
 
 async def capture_custom_link(message, context: ContextTypes.DEFAULT_TYPE, user, code: str) -> None:
-    """A brand-new person opened the bot through a custom link: remember it until they're in the channel."""
+    """Someone opened the bot through a custom link: remember it until they're in the channel."""
     uid = str(user.id)
 
-    if (
-        uid in stats["users"] or uid in referrals["counted"] or uid in referrals["pending"]
-        or uid in referrals["link_claims"] or uid in referrals["link_pending"] or is_unlimited(user.id)
-    ):
+    if is_unlimited(user.id) or link_already_claimed(code, uid):
         return
 
     link = referrals["links"].get(code)
@@ -2895,7 +2899,7 @@ async def credit_custom_link(bot, user, code: str) -> None:
     uid = str(user.id)
     link = referrals["links"].get(code)
 
-    if link is None or not link.get("active", True) or uid in referrals["link_claims"]:
+    if link is None or not link.get("active", True) or link_already_claimed(code, uid):
         return
 
     max_people = int(link.get("max", 0))
@@ -2905,13 +2909,16 @@ async def credit_custom_link(bot, user, code: str) -> None:
             await bot.send_message(chat_id=user.id, text=MSG_LINK_FULL)
         return
 
-    referrals["link_claims"][uid] = code
-    grant_bonus(user.id, link["tier"], int(link["days"]))
+    referrals["link_claims"][f"{code}:{uid}"] = time.time()
+    # Adds the days on top if they already have some of this plan (or a better one); otherwise starts now.
+    until = grant_bonus(user.id, link["tier"], int(link["days"]))
 
     with contextlib.suppress(Exception):
         await bot.send_message(
             chat_id=user.id,
-            text=MSG_LINK_WELCOME.format(days=_days_text(int(link["days"])), tier=tier_label(link["tier"])),
+            text=MSG_LINK_WELCOME.format(
+                days=_days_text(int(link["days"])), tier=tier_label(link["tier"]), until=format_until(until)
+            ),
         )
 
     if link_used(code) >= max_people:
