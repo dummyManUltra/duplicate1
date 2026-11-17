@@ -1,1591 +1,14165 @@
-"""ترتيل | Tarteel — بوت تليجرام لتنظيم الورد اليومي من المصحف.
-
-كل مستخدم بيحدد عدد الصفحات في اليوم (أو هدف ختمة) وميعاد التذكير، والبوت
-بيبعتله صفحات ورد النهاردة بس من ملف المصحف PDF بتاعك، وبينبّهه قبل الصلوات.
-
-التخزين: كل البيانات في ملف JSON مضغوط (zip) واحد. أي ما بيتغير، البوت بيرفع
-الملف في جروب خاص على تليجرام وبيثبّته. وأول ما البوت يشتغل تاني بيقرا الملف
-المثبّت، فمفيش حاجة بتضيع لو السيرفر اتغيّر أو البوت اتعمله ريستارت.
-"""
-import asyncio
-import copy
-import html
-import io
-import json
-import logging
-import math
 import os
+import sys
+import signal
+import json
+import asyncio
+import logging
+import shutil
+import tempfile
+import time
+import contextlib
+import contextvars
+import difflib
+import inspect
 import re
-import threading
+import itertools
+import hashlib
+import io
 import zipfile
-from contextlib import suppress
-from datetime import datetime, time, timedelta, timezone
+import secrets
+import subprocess
+import posixpath
+import struct
+from xml.etree import ElementTree as _ET
+from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
-import fitz  # PyMuPDF
-from dotenv import load_dotenv
+import img2pdf
 from telegram import (
+    Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
     KeyboardButton,
+    LinkPreviewOptions,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
 )
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.constants import ChatAction
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
-    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     TypeHandler,
+    ApplicationHandlerStop,
     filters,
 )
 
-from prayer import PRAYERS, next_prayer
-
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("tarteel")
-
-# حط توكن البوت (من @BotFather) مكان الكلام اللي بين العلامتين، أو سيبه وحطه
-# في متغير البيئة BOT_TOKEN. متشاركش الملف ده مع حد ومترفعوش على مكان عام.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
-QURAN_PDF = os.getenv("QURAN_PDF", "quran.pdf")
-# لو الـ PDF فيه صفحات غلاف/مقدمة قبل صفحة ١ من المصحف، حط عددها هنا.
-PDF_OFFSET = int(os.getenv("PDF_OFFSET", "0"))
-TOTAL_PAGES = int(os.getenv("TOTAL_PAGES", "604"))
-DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Africa/Cairo")
-CACHE_DIR = Path(os.getenv("CACHE_DIR", "page_cache"))
-CACHE_DIR.mkdir(exist_ok=True)
-ZOOM = float(os.getenv("RENDER_ZOOM", "2.0"))
-
-# الجروب اللي بيتثبّت فيه ملف النسخة الاحتياطية (البوت لازم يكون أدمن فيه
-# بصلاحية تثبيت الرسايل ومسحها).
-BACKUP_CHAT_ID = int(os.getenv("BACKUP_CHAT_ID", "-1004383995976"))
-BACKUP_NAME = "tarteel_data.zip"      # الملف المضغوط اللي بيتثبّت في الجروب
-LEGACY_NAME = "tarteel_data.json"     # النسخ القديمة (JSON عادي) لسه بتتقرا
-JSON_ENTRY = "tarteel_data.json"      # اسم الملف جوه الـ zip
-MAX_JSON_BYTES = 50 * 1024 * 1024     # حماية من zip ضخم بشكل مريب
-LOCAL_COPY = Path(os.getenv("LOCAL_COPY", "tarteel_data.zip"))
-SAVE_INTERVAL = int(os.getenv("SAVE_INTERVAL", "30"))  # ثواني بين كل فحص للنسخة الاحتياطية
-# أرقام تليجرام (ID) للأدمنز اللي يقدروا يستخدموا /health و /backup من أي مكان.
-# أي حد جوه جروب النسخ الاحتياطي أدمن تلقائياً.
-ADMIN_IDS = {940770584} | {
-    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
-}
-STATS_KEEP_DAYS = 60
-
-# طابور الإرسال: كل التذكيرات والتنبيهات بتعدّي منه بفاصل بسيط عشان حدود تليجرام.
-SEND_GAP = float(os.getenv("SEND_GAP", "0.35"))  # ثواني بين كل مستخدم
-SEND_RETRIES = 3
-RETRY_PAD = 1.0  # ثواني زيادة فوق مدة الانتظار اللي تليجرام بيطلبها
-
-MIN_GOAL_DAYS = -(-TOTAL_PAGES // 100)  # أقصى ورد ١٠٠ صفحة في اليوم
-MAX_GOAL_DAYS = 365
-
-PRAYER_AR = {
-    "fajr": "الفجر",
-    "dhuhr": "الظهر",
-    "asr": "العصر",
-    "maghrib": "المغرب",
-    "isha": "العشاء",
-}
-WARN_STAGES = (60, 30)  # دقايق قبل الصلاة
-WARN_WINDOW = 5         # لو التيك اتأخر (ريستارت مثلاً) لسه نبعت لحد ٥ دقايق بعد الميعاد
-
-# (الاسم، خط العرض، خط الطول، المنطقة الزمنية)
-CITIES = [
-    ("القاهرة", 30.0444, 31.2357, "Africa/Cairo"),
-    ("الجيزة", 30.0131, 31.2089, "Africa/Cairo"),
-    ("الإسكندرية", 31.2001, 29.9187, "Africa/Cairo"),
-    ("طنطا", 30.7865, 31.0004, "Africa/Cairo"),
-    ("المنصورة", 31.0409, 31.3785, "Africa/Cairo"),
-    ("بورسعيد", 31.2653, 32.3019, "Africa/Cairo"),
-    ("السويس", 29.9668, 32.5498, "Africa/Cairo"),
-    ("الإسماعيلية", 30.5965, 32.2715, "Africa/Cairo"),
-    ("أسيوط", 27.1809, 31.1837, "Africa/Cairo"),
-    ("الأقصر", 25.6872, 32.6396, "Africa/Cairo"),
-    ("أسوان", 24.0889, 32.8998, "Africa/Cairo"),
-    ("الرياض", 24.7136, 46.6753, "Asia/Riyadh"),
-    ("جدة", 21.4858, 39.1925, "Asia/Riyadh"),
-    ("مكة", 21.3891, 39.8579, "Asia/Riyadh"),
-    ("المدينة", 24.5247, 39.5692, "Asia/Riyadh"),
-    ("دبي", 25.2048, 55.2708, "Asia/Dubai"),
-    ("الكويت", 29.3759, 47.9774, "Asia/Kuwait"),
-    ("الدوحة", 25.2854, 51.5310, "Asia/Qatar"),
-    ("عمّان", 31.9454, 35.9284, "Asia/Amman"),
-]
-# مناطق زمنية بس (من غير مدينة) — تنبيهات الصلاة محتاجة مدينة أو موقع.
-ZONES = [
-    ("لندن", "Europe/London"),
-    ("نيويورك", "America/New_York"),
-    ("إسطنبول", "Europe/Istanbul"),
-]
-NEAREST_CITY_KM = 400
-TZ_LABELS = {
-    "Africa/Cairo": "توقيت القاهرة",
-    "Asia/Riyadh": "توقيت الرياض",
-    "Asia/Dubai": "توقيت دبي",
-    "Asia/Kuwait": "توقيت الكويت",
-    "Asia/Qatar": "توقيت الدوحة",
-    "Asia/Amman": "توقيت عمّان",
-    "Europe/London": "توقيت لندن",
-    "America/New_York": "توقيت نيويورك",
-    "Europe/Istanbul": "توقيت إسطنبول",
-}
-
-# ───────────────────────── أرقام عربي ─────────────────────────
-_TO_AR = str.maketrans("0123456789.", "٠١٢٣٤٥٦٧٨٩٫")
-_TO_EN = str.maketrans("٠١٢٣٤٥٦٧٨٩٫", "0123456789.")
-
-
-def ar(x) -> str:
-    """رقم/نص بأرقام عربي."""
-    return str(x).translate(_TO_AR)
-
-
-def num(x: float) -> str:
-    s = f"{x:.1f}"
-    if s.endswith(".0"):
-        s = s[:-2]
-    return ar(s)
-
-
-def en_digits(text: str) -> str:
-    return text.translate(_TO_EN)
-
-
-def tz_label(tz: str) -> str:
-    """اسم المنطقة بالعربي للمناطق الجاهزة، والاسم الأصلي لو كتبها المستخدم بنفسه."""
-    return TZ_LABELS.get(tz, tz)
-
-
-def fmt12(h: int, m: int) -> str:
-    """الساعة بنظام ١٢ ساعة بالعربي: ١١:٣٨ ص."""
-    return f"{ar(h % 12 or 12)}:{ar(f'{m:02d}')} {'ص' if h < 12 else 'م'}"
-
-
-# ───────────────────────── الداتا (JSON) ─────────────────────────
-DEFAULTS = {
-    "pages_per_day": 5,
-    "current_page": 1,
-    "remind_time": "08:00",
-    "tz": DEFAULT_TZ,
-    "reminders_on": True,
-    "streak": 0,
-    "last_done": None,
-    "last_sent": None,  # آخر يوم (بتوقيته) ورد النهاردة اتبعتله فيه
-    "khatmas": 0,
-    # هدف الختمة
-    "goal_days": None,
-    "goal_start": None,
-    "goal_read": 0,
-    # المكان وتنبيهات الصلاة (الإحداثيات متقرّبة لخانتين عشان الخصوصية)
-    "city": None,
-    "lat": None,
-    "lon": None,
-    "prayer_on": False,
-    "prayers": {p: True for p in PRAYERS},
-    # المستخدم عامل بلوك للبوت
-    "blocked": False,
-}
-
-state: dict = {"version": 3, "updated_at": None, "users": {}, "stats": {}}
-# كل تغيير بيزوّد revision بواحد. النسخة الاحتياطية "متسخة" (dirty) طول ما
-# revision مختلف عن saved_revision، فأي تغيير بيحصل أثناء الرفع مبيضيعش أبداً.
-revision = 0
-saved_revision = 0
-restored = False  # مفيش رفع قبل قراءة النسخة المثبّتة (عشان منكتبش داتا فاضية فوقها)
-backup_retry_at = 0.0  # لو التثبيت فشل، منحاولش تاني قبل الوقت ده (loop time)
-PIN_FAIL_BACKOFF = 600  # ثواني
-backup_msg_id: int | None = None
-save_lock: asyncio.Lock | None = None
-APP: Application | None = None
-outbox: "Outbox | None" = None
-outbox_task: asyncio.Task | None = None
-
-
-def utc_stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def mark_dirty():
-    global revision
-    revision += 1
-    state["updated_at"] = utc_stamp()
-
-
-def is_dirty() -> bool:
-    return revision != saved_revision
-
-
-def new_user(chat_id: int) -> dict:
-    return {"chat_id": chat_id, **copy.deepcopy(DEFAULTS)}
-
-
-def get_user(chat_id: int) -> dict:
-    key = str(chat_id)
-    u = state["users"].get(key)
-    if u is None:
-        u = new_user(chat_id)
-        state["users"][key] = u
-        sync_catchup_marker(u)  # مستخدم جديد مفوّتش حاجة
-        mark_dirty()
-    return u
-
-
-def update_user(chat_id: int, **fields):
-    get_user(chat_id).update(fields)
-    mark_dirty()
-
-
-# ───────────────────────── إحصائيات ─────────────────────────
-def stats_day() -> str:
-    """تاريخ اليوم بتوقيت الإحصائيات (توقيت DEFAULT_TZ)."""
-    return datetime.now(ZoneInfo(DEFAULT_TZ)).strftime("%Y-%m-%d")
-
-
-def day_stats(day: str) -> dict:
-    stats = state.setdefault("stats", {})
-    d = stats.get(day)
-    if d is None:
-        d = stats[day] = {"active": [], "done": 0, "pages": 0}
-        while len(stats) > STATS_KEEP_DAYS:
-            del stats[min(stats)]
-    return d
-
-
-def record_active(chat_id: int):
-    d = day_stats(stats_day())
-    if chat_id not in d["active"]:
-        d["active"].append(chat_id)
-        mark_dirty()
-
-
-def record_done(chat_id: int, pages: int):
-    d = day_stats(stats_day())
-    if chat_id not in d["active"]:
-        d["active"].append(chat_id)
-    d["done"] += 1
-    d["pages"] += pages
-    mark_dirty()
-
-
-def window_days(n: int, today: str) -> list[str]:
-    """آخر n يوم (من أول يوم فيه داتا، عشان الأيام الفاضية قبل البداية متأثرش المتوسط)."""
-    stats = state.get("stats", {})
-    first = min(stats) if stats else today
-    base = datetime.strptime(today, "%Y-%m-%d")
-    days = [(base - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n)]
-    return [d for d in days if d >= first] or [today]
-
-
-def health_report(today: str | None = None) -> dict:
-    today = today or stats_day()
-    stats = state.get("stats", {})
-
-    def agg(n: int) -> dict:
-        days = window_days(n, today)
-        k = len(days)
-        active = sum(len(stats.get(d, {}).get("active", [])) for d in days)
-        done = sum(stats.get(d, {}).get("done", 0) for d in days)
-        pages = sum(stats.get(d, {}).get("pages", 0) for d in days)
-        return {
-            "requested": n,
-            "days": k,
-            "active": active / k,
-            "done": done / k,
-            "pages": pages / k,
-            "pages_per_finisher": pages / done if done else 0.0,
-        }
-
-    t = stats.get(today, {})
-    users = list(state["users"].values())
-    live = [u for u in users if not u.get("blocked")]
-    return {
-        "total_users": len(users),
-        "blocked": len(users) - len(live),
-        "reminders_on": sum(1 for u in live if u["reminders_on"]),
-        "prayer_on": sum(1 for u in live if u.get("prayer_on")),
-        "goal": sum(1 for u in live if u.get("goal_days")),
-        "today": {
-            "active": len(t.get("active", [])),
-            "done": t.get("done", 0),
-            "pages": t.get("pages", 0),
-        },
-        "d7": agg(7),
-        "d30": agg(30),
-    }
-
-
-def format_health(r: dict) -> str:
-    def block(title: str, a: dict) -> str:
-        note = ""
-        if a["days"] < a["requested"]:
-            note = f"\n(الداتا من {ar(a['days'])} يوم بس لحد دلوقتي)"
-        return (
-            f"<b>{title}</b>{note}\n"
-            f"• مستخدمين نشطين: {num(a['active'])}\n"
-            f"• أوراد اتخلّصت: {num(a['done'])}\n"
-            f"• صفحات اتقرت: {num(a['pages'])}\n"
-            f"• متوسط الصفحات للي خلّص وردُه: {num(a['pages_per_finisher'])}"
-        )
-
-    t = r["today"]
-    return (
-        "📊 <b>حالة ترتيل</b>\n\n"
-        f"👥 إجمالي المستخدمين: {ar(r['total_users'])}\n"
-        f"🚫 حاظرين البوت: {ar(r['blocked'])}\n"
-        f"🔔 التذكير شغّال عند: {ar(r['reminders_on'])}\n"
-        f"🕌 تنبيهات الصلاة شغّالة عند: {ar(r['prayer_on'])}\n"
-        f"🎯 عندهم هدف ختمة: {ar(r['goal'])}\n\n"
-        "<b>النهاردة</b>\n"
-        f"• مستخدمين نشطين: {ar(t['active'])}\n"
-        f"• أوراد اتخلّصت: {ar(t['done'])}\n"
-        f"• صفحات اتقرت: {ar(t['pages'])}\n\n"
-        + block("متوسط آخر ٧ أيام (في اليوم)", r["d7"])
-        + "\n\n"
-        + block("متوسط آخر ٣٠ يوم (في اليوم)", r["d30"])
-    )
-
-
-# ───────────────────────── النسخ الاحتياطي ─────────────────────────
-def pack_state(data: bytes) -> bytes:
-    """JSON -> zip (مضغوط)."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        zf.writestr(JSON_ENTRY, data)
-    return buf.getvalue()
-
-
-def unpack_state(blob: bytes) -> bytes:
-    """zip -> JSON. ولو الملف JSON عادي (نسخة قديمة) بيرجعه زي ما هو."""
-    if zipfile.is_zipfile(io.BytesIO(blob)):
-        with zipfile.ZipFile(io.BytesIO(blob)) as zf, zf.open(JSON_ENTRY) as f:
-            raw = f.read(MAX_JSON_BYTES + 1)
-        if len(raw) > MAX_JSON_BYTES:
-            raise ValueError("backup too large")
-        return raw
-    return blob
-
-
-def local_today(tz: str) -> str:
-    try:
-        return datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d")
-    except Exception:
-        return datetime.now(ZoneInfo(DEFAULT_TZ)).strftime("%Y-%m-%d")
-
-
-def parse_state(blob: bytes) -> dict:
-    s = json.loads(unpack_state(blob).decode("utf-8"))
-    if not isinstance(s, dict) or not isinstance(s.get("users"), dict):
-        raise ValueError("not a Tarteel backup file")
-    s.setdefault("stats", {})
-    for key, u in s["users"].items():
-        u["chat_id"] = int(key)
-        if "last_sent" not in u:
-            # نسخة قديمة قبل التعويض: منبعتش "تعويض" لحد في أول تشغيل بعد الترقية.
-            u["last_sent"] = local_today(u.get("tz", DEFAULT_TZ))
-        for k, v in DEFAULTS.items():
-            u.setdefault(k, copy.deepcopy(v))
-        for p in PRAYERS:
-            u["prayers"].setdefault(p, True)
-    return s
-
-
-def newest(a: dict | None, b: dict | None) -> dict | None:
-    if a is None:
-        return b
-    if b is None:
-        return a
-    return a if (a.get("updated_at") or "") >= (b.get("updated_at") or "") else b
-
-
-async def restore_state(bot):
-    """بيحمّل النسخة المثبّتة من الجروب (ولو النسخة المحلية أحدث بياخدها)."""
-    global state, backup_msg_id, saved_revision, restored
-    remote = None
-    try:
-        chat = await bot.get_chat(BACKUP_CHAT_ID)
-    except TelegramError as e:
-        raise RuntimeError(
-            f"Cannot reach backup group {BACKUP_CHAT_ID}: {e}. "
-            "Add the bot to the group first."
-        ) from e
-
-    pm = chat.pinned_message
-    if pm is not None and pm.document and pm.document.file_name in (BACKUP_NAME, LEGACY_NAME):
-        try:
-            f = await pm.document.get_file()
-            remote = parse_state(bytes(await f.download_as_bytearray()))
-            backup_msg_id = pm.message_id
-            log.info("Restored %d users from pinned backup.", len(remote["users"]))
-        except Exception as e:
-            # مفيش بدء بداتا فاضية فوق نسخة معرفناش نقراها.
-            raise RuntimeError(f"Pinned backup exists but could not be read: {e}") from e
-    elif pm is not None:
-        log.warning("Latest pinned message in the group is not a Tarteel backup; ignoring it.")
-    else:
-        log.info("No pinned backup found; starting fresh.")
-
-    local = None
-    if LOCAL_COPY.exists():
-        try:
-            local = parse_state(LOCAL_COPY.read_bytes())
-        except Exception as e:
-            log.warning("Local copy unreadable: %s", e)
-
-    chosen = newest(remote, local)
-    if chosen is not None:
-        state = chosen
-    saved_revision = revision
-    restored = True
-    if remote is None or chosen is not remote:
-        mark_dirty()  # مفيش نسخة مثبّتة، أو النسخة المحلية أحدث -> ارفعها
-
-
-async def flush(bot, force: bool = False):
-    """بيرفع الـ zip للجروب ويثبّته ويمسح النسخة القديمة.
-
-    - بيشتغل واحد واحد (save_lock)، فمفيش رفعتين في نفس الوقت.
-    - اللقطة (snapshot) واتسجّل رقم revision بتاعها في نفس اللحظة من غير await،
-      فالملف دايماً متسق. ولو حصل تغيير أثناء الرفع، revision بيبقى أكبر من
-      saved_revision والدورة الجاية بترفعه.
-    """
-    global saved_revision, backup_msg_id, backup_retry_at
-    if not restored:
-        log.warning("flush skipped: backup not restored yet.")
-        return
-    async with save_lock:
-        if not force and revision == saved_revision:
-            return  # حد تاني رفع قبلنا ومفيش جديد
-        if not force and asyncio.get_running_loop().time() < backup_retry_at:
-            return  # التثبيت فشل قريب، نستنى شوية
-        snap_rev = revision
-        data = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
-        blob = pack_state(data)
-        stamp = state["updated_at"] or utc_stamp()
-        users = len(state["users"])
-
-        tmp = LOCAL_COPY.with_suffix(".tmp")
-        tmp.write_bytes(blob)
-        tmp.replace(LOCAL_COPY)
-
-        try:
-            msg = await bot.send_document(
-                BACKUP_CHAT_ID,
-                document=blob,
-                filename=BACKUP_NAME,
-                caption=f"🗂 نسخة احتياطية • {ar(users)} مستخدم • {stamp}",
-                disable_notification=True,
-            )
-        except TelegramError as e:
-            # saved_revision متغيّرش، فالنسخة لسه متسخة وهيحاول تاني.
-            log.error("Backup upload failed: %s", e)
-            return
-
-        try:
-            await bot.pin_chat_message(
-                BACKUP_CHAT_ID, msg.message_id, disable_notification=True
-            )
-        except TelegramError as e:
-            # الرفع نجح بس التثبيت فشل: بنمسح الرسالة الجديدة عشان الجروب
-            # ميتملاش بنسخ كل ٣٠ ثانية، والنسخة المثبّتة القديمة تفضل زي ما هي.
-            log.error(
-                "Backup pin failed: %s — make sure the bot is an admin in the "
-                "group with the 'Pin messages' permission.",
-                e,
-            )
-            with suppress(TelegramError):
-                await bot.delete_message(BACKUP_CHAT_ID, msg.message_id)
-            backup_retry_at = asyncio.get_running_loop().time() + PIN_FAIL_BACKOFF
-            return
-
-        saved_revision = snap_rev
-        backup_retry_at = 0.0
-        old = backup_msg_id
-        backup_msg_id = msg.message_id
-        if old and old != msg.message_id:
-            try:
-                await bot.delete_message(BACKUP_CHAT_ID, old)
-            except TelegramError as e:
-                log.warning("Could not delete old backup %s: %s", old, e)
-        log.info(
-            "Backup pinned (message %s): %d KB json -> %d KB zip.",
-            msg.message_id, len(data) // 1024, len(blob) // 1024,
-        )
-
-
-async def autosave_job(context: ContextTypes.DEFAULT_TYPE):
-    await flush(context.bot)
-
-
-# ───────────────────────── صفحات المصحف ─────────────────────────
-_pdf = fitz.open(QURAN_PDF)
-
-
-def today_pages(user: dict) -> list[int]:
-    """أرقام صفحات ورد النهاردة (١..TOTAL_PAGES) وبترجع للأول لما الختمة تخلص."""
-    start, n = user["current_page"], user["pages_per_day"]
-    return [((start - 1 + i) % TOTAL_PAGES) + 1 for i in range(n)]
-
-
-_render_lock = threading.Lock()  # PyMuPDF مش thread-safe
-
-
-def render_page(page_no: int) -> Path:
-    out = CACHE_DIR / f"{page_no}.jpg"
-    if out.exists():
-        return out
-    with _render_lock:
-        if not out.exists():
-            # بنكتب في ملف مؤقت وبعدين نبدّله، عشان محدش يقرا صورة نصها مكتوب.
-            tmp = out.with_name(f"{page_no}.tmp.jpg")
-            pix = _pdf[page_no - 1 + PDF_OFFSET].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM))
-            pix.save(str(tmp), jpg_quality=88)
-            tmp.replace(out)
-    return out
-
-
-async def send_pages(bot, chat_id: int, pages: list[int]):
-    paths = await asyncio.to_thread(lambda: [render_page(p) for p in pages])
-    # الألبوم في تليجرام بيشيل ١٠ صور بالكتير.
-    for i in range(0, len(paths), 10):
-        chunk = list(zip(pages[i : i + 10], paths[i : i + 10]))
-        if len(chunk) == 1:
-            p, path = chunk[0]
-            with open(path, "rb") as f:
-                await bot.send_photo(chat_id, f, caption=f"📖 صفحة {ar(p)}")
-        else:
-            media = [
-                InputMediaPhoto(path.read_bytes(), caption=f"📖 صفحة {ar(p)}")
-                for p, path in chunk
-            ]
-            await bot.send_media_group(chat_id, media)
-
-
-# ───────────────────────── أدوات مساعدة ─────────────────────────
-def user_now(user) -> datetime:
-    return datetime.now(ZoneInfo(user["tz"]))
-
-
-def is_admin(update: Update) -> bool:
-    chat = update.effective_chat
-    user = update.effective_user
-    return bool(
-        (chat and chat.id == BACKUP_CHAT_ID) or (user and user.id in ADMIN_IDS)
-    )
-
-
-def back_row(target: str) -> list:
-    return [InlineKeyboardButton("⬅️ رجوع", callback_data=target)]
-
-
-def done_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ خلّصت وردي", callback_data="done")]]
-    )
-
-
-def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📖 ورد النهاردة", callback_data="today")],
-            [
-                InlineKeyboardButton("📊 تقدّمي", callback_data="progress"),
-                InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings"),
-            ],
-            [InlineKeyboardButton("📚 طريقة الاستخدام", callback_data="howto")],
-        ]
-    )
-
-
-def settings_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("📄 عدد الصفحات", callback_data="set_pages"),
-                InlineKeyboardButton("🎯 هدف الختمة", callback_data="set_goal"),
-            ],
-            [
-                InlineKeyboardButton("⏰ ميعاد التذكير", callback_data="set_time"),
-                InlineKeyboardButton("🌍 المدينة والمنطقة", callback_data="set_tz"),
-            ],
-            [InlineKeyboardButton("🕌 تنبيهات الصلاة", callback_data="set_prayer")],
-            back_row("menu"),
-        ]
-    )
-
-
-def settings_text(u: dict) -> str:
-    goal = f"ختمة في {ar(u['goal_days'])} يوم" if u["goal_days"] else "مفيش هدف"
-    remind = ar(u["remind_time"]) if u["reminders_on"] else "واقف"
-    place = html.escape(u["city"] or tz_label(u["tz"]))
-    prayer = "شغّالة ✅" if u["prayer_on"] else "واقفة ⏸"
-    return (
-        "⚙️ <b>الإعدادات</b>\n\n"
-        f"📄 الورد: {ar(u['pages_per_day'])} صفحة في اليوم\n"
-        f"🎯 الهدف: {goal}\n"
-        f"⏰ التذكير: {remind}\n"
-        f"🌍 المكان: {place}\n"
-        f"🕌 تنبيهات الصلاة: {prayer}"
-    )
-
-
-# ───────────────────────── المدينة والمنطقة ─────────────────────────
-TZ_TEXT = (
-    "🌍 <b>المدينة والمنطقة</b>\n"
-    "اختار مدينتك عشان أظبط ميعاد التذكير ومواعيد الصلاة 👇"
+# ============================================================
+# TEXTS — every message and button the bot shows, in one place.
+# Edit the wording / emojis here. Keep the {placeholders} exactly as they
+# are (they're filled in by the bot): you may move them around or delete
+# the words around them, but don't rename them.
+#   MSG_...  = a message          BTN_...  = a button label
+# Sections are named after the part of the bot that uses them.
+# ============================================================
+# ---- cancel button (while compressing) ----
+MSG_COMPRESSION_CANCELLED = "🛑 Cancelled — nothing was sent."
+MSG_CANCELLING_JOB = "Cancelling…"
+MSG_TOO_LATE_TO_CANCEL = "Too late to cancel — it has already finished encoding."
+MSG_NOT_YOUR_JOB = "This isn't your video."
+MSG_STATS_CANCELLED = "🛑 Cancelled by users: {cancelled}"
+MSG_COMPRESSION_CANCELLED_REFUNDED = "🛑 Cancelled — nothing was sent, and {size} was given back to your daily limit."
+MSG_CANCELLED_FILES_REMOVED_REFUNDED = "❌ Cancelled — temporary files removed, and {size} was given back to your daily limit."
+
+# ---- live job updates sent to the admin (one message per job, edited as it runs) ----
+MSG_ADMIN_JOB_HEADER = "👤 User: {name} ({username}) · id {user_id}"
+MSG_ADMIN_JOB_PROGRESS = "⚙️ Compressing {kind} — {percent:.0f}% complete"
+MSG_ADMIN_JOB_DONE = "✅ Finished compressing {kind}"
+MSG_ADMIN_JOB_CANCELLED = "🛑 Cancelled compressing {kind}{refund_note}"
+MSG_ADMIN_JOB_FAILED = "❌ Failed compressing {kind}{refund_note}"
+MSG_ADMIN_JOB_STOPPED = "⚠️ Stopped before finishing ({kind})"
+MSG_ADMIN_JOB_REFUND_NOTE = " — {size} refunded"
+
+# ---- quota status text ----
+MSG_TODAY_YOU_VE_SENT_OF = (
+    "{plan}\n"
+    "📊 Today you've sent {size_used} of your {size_limit} daily limit — {size_left} left.\n"
+    "It resets at 12:00 AM, in {reset_in}."
+)
+MSG_YOU_HAVE_NO_DAILY_LIMIT = "♾️ You have no daily limit."
+MSG_NO_DAILY_LIMIT_RIGHT_NOW = (
+    "{plan}\n"
+    "♾️ No daily limit right now."
 )
 
+# ---- file too large text ----
+MSG_THIS_FILE_IS_BUT_YOUR = "⛔ This file is {size_bytes}, but your {plan_get_tier} plan takes files up to {size_max_file_bytes}.{upgrade_hint}"
 
-def tz_keyboard() -> InlineKeyboardMarkup:
-    rows, row = [], []
-    for i, city in enumerate(CITIES):
-        row.append(InlineKeyboardButton(city[0], callback_data=f"city_{i}"))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append(
-        [InlineKeyboardButton(n, callback_data=f"zone_{i}") for i, (n, _) in enumerate(ZONES)]
-    )
-    rows.append(
-        [
-            InlineKeyboardButton("📍 ابعت موقعك", callback_data="loc_share"),
-            InlineKeyboardButton("✏️ اكتب المنطقة", callback_data="tz_typed"),
-        ]
-    )
-    rows.append(back_row("settings"))
-    return InlineKeyboardMarkup(rows)
+# ---- quota refusal text ----
+MSG_THE_LIMIT_RESETS_EVERY_DAY = (
+    "{first_line}\n"
+    "\n"
+    "The limit resets every day at 12:00 AM — in {reset_in}. See you then! 👋{upgrade_hint}"
+)
+MSG_YOU_VE_USED_ALL_OF = "⛔ You've used all of your {size_limit} daily limit."
+MSG_THIS_FILE_IS_BUT_YOU = "⛔ This file is {size_bytes}, but you only have {size_left} left of your {size_limit} daily limit."
 
-
-def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp, dl = p2 - p1, math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * 6371 * math.asin(math.sqrt(a))
-
-
-def nearest_city(lat: float, lon: float) -> tuple[int, float]:
-    dists = [haversine_km(lat, lon, c[1], c[2]) for c in CITIES]
-    i = min(range(len(dists)), key=dists.__getitem__)
-    return i, dists[i]
-
-
-# ───────────────────────── هدف الختمة ─────────────────────────
-GOAL_TEXT = (
-    "🎯 <b>هدف الختمة</b>\n"
-    "اختار تخلّص المصحف في كام يوم، وأنا هظبطلك عدد الصفحات اللي تقراها كل يوم 👇"
+# ---- upgrade hint ----
+MSG_WANT_MORE_SEE_PLANS_THEN = (
+    "\n"
+    "\n"
+    "💎 Want more? See /plans, then use /subscribe.\n"
+    "{dm_text}"
 )
 
+# ---- home text ----
+MSG_HI_SEND_ME_A_VIDEO = (
+    "👋 Hi {name}!\n"
+    "\n"
+    "🎬 I compress videos and audio — and show you a preview before anything is compressed.\n"
+    "\n"
+    "📖 How to use\n"
+    "1️⃣ Send me a video or an audio file.\n"
+    "2️⃣ I'll send a {SAMPLE_SECONDS:.0f}s sample and the estimated size at each level.\n"
+    "3️⃣ Pick a level and an audio quality.\n"
+    "4️⃣ Get your compressed file ✅\n"
+    "\n"
+    "💎 Subscriptions\n"
+    "{plans}\n"
+    "⚡ Each plan is served before the smaller ones: Pro → Plus → Free.\n"
+    "\n"
+    "{your_plan}\n"
+    "\n"
+    "👇 Pick an option:"
+)
+MSG_HOME_PLAN_LINE = "{emoji} {label} — {size_daily_mb}/day · up to {size_max_file_mb} per file"
+MSG_RAM_CLEAN_CONFIRM = (
+    "🧹 Clean everything and restart the bot?\n"
+    "\n"
+    "• {running} running job(s) will be cancelled (their daily limit is given back)\n"
+    "• {menus} open menu(s) will be removed (their daily limit is given back)\n"
+    "• All temporary files ({temp_size}) will be deleted\n"
+    "• The bot restarts and is back in a few seconds\n"
+    "\n"
+    "Plans, daily limits, approved users and statistics are kept (a backup is saved first)."
+)
+BTN_YES_CLEAN_RESTART = "✅ Yes, clean & restart"
+MSG_RAM_CLEAN_CANCELLED = "👍 Cancelled — nothing was changed."
+MSG_RAM_CLEAN_WORKING = "🧹 Stopping jobs and deleting temporary files..."
+MSG_RAM_CLEAN_DONE = (
+    "✅ Cleaned: {jobs} job(s) cancelled, {menus} menu(s) removed, {files} item(s) deleted ({freed} freed).\n"
+    "♻️ Restarting now — back in a few seconds."
+)
+MSG_RAM_CLEAN_TOO_SOON = "⏳ The bot has only just restarted. Try again in a minute."
+MSG_RAM_CLEAN_BACK = "✅ The bot restarted and is running again."
+MSG_RAM_TITLE = "🧠 RAM usage"
+MSG_RAM_CONTAINER = "📦 Container: {used} of {limit}\n{bar}"
+MSG_RAM_CONTAINER_NO_LIMIT = "📦 Container: {used} (no limit set)"
+MSG_RAM_BOT = "🤖 Bot process: {size}"
+MSG_RAM_FFMPEG = "🎞 FFmpeg ({count} running): {size}"
+MSG_RAM_FFMPEG_IDLE = "🎞 FFmpeg: not running"
+MSG_RAM_HOST = "🖥 Host machine: {available} free of {total}"
+MSG_RAM_UNAVAILABLE = "⚠️ Couldn't read the memory usage on this system."
+MSG_SUBSCRIPTIONS_COMING_SOON = "💎 Subscriptions aren't available yet — coming soon!"
+MSG_HOME_LEFT_TODAY = "📊 Left today: {size_left} of {size_limit}"
 
-def goal_keyboard(u: dict) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(f"{ar(d)} يوم", callback_data=f"goal_{d}") for d in (15, 30, 60, 90)],
-        [InlineKeyboardButton("✏️ عدد أيام تاني", callback_data="goal_custom")],
-    ]
-    if u["goal_days"]:
-        rows.append([InlineKeyboardButton("🚫 إلغاء الهدف", callback_data="goal_off")])
-    rows.append(back_row("settings"))
-    return InlineKeyboardMarkup(rows)
+# ---- usage page text ----
+MSG_YOUR_USAGE = (
+    "📊 Your usage\n"
+    "\n"
+    "{usage}"
+)
+MSG_BIGGEST_FILE_YOU_CAN_SEND = (
+    "\n"
+    "\n"
+    "📁 Biggest file you can send: {size_max_file_bytes}"
+)
+
+# ---- about text ----
+MSG_ABOUT_THIS_BOT_COMPRESSES_VIDEOS = (
+    "ℹ️ About this bot\n"
+    "\n"
+    "🎬 Compresses videos at 5 levels — you get a short sample and the estimated size of each level before anything is compressed.\n"
+    "🧠 Looks at your video's resolution, frame rate, codec and bitrate and recommends the best settings.\n"
+    "🔊 Edits audio: volume boost, noise reduction, voice enhancement, or replace a video's audio.\n"
+    "🎧 Compresses audio files too.\n"
+    "🏷 Renames audio and sets artist / album / cover — with or without compression.\n"
+    "📄 Turns a video into a PDF of its frames.\n"
+    "\n"
+    "🔒 Your files are deleted as soon as they're processed{idle}.\n"
+    "💎 Free to use with daily limits — see Subscribe for more."
+)
+
+# ---- payment steps text ----
+MSG_30_DAYS_PER_DAY_FILES = (
+    "{plan_tier} — 30 days\n"
+    "• {size_daily_mb} per day - files up to {size_max_file_mb} - {perk}\n"
+    "\n"
+    "💳 How to pay:\n"
+    "{how_to_pay}\n"
+    "\n"
+    "📸 Then send a screenshot of the payment here\n"
+    "OR\n"
+    "💬 in the Direct messages of the {channel_link} + your ID\n"
+    "You'll get a message here as soon as your plan is active. 🫶\n"
+    "\n"
+    "🆔 YOUR ID: {user_id}"
+)
+MSG_PAYMENT_MAIN_CHANNEL = "main channel"
+
+# The same instructions in Arabic — shown under the English ones in the same message.
+MSG_PAYMENT_ARABIC = (
+    "💳 طريقة الدفع:\n"
+    "{how_to_pay}\n"
+    "\n"
+    "📸 بعد كده ابعت سكرين شوت للدفع هنا\n"
+    "أو\n"
+    "💬 ابعته في رسائل الـ Direct بتاعة {channel_link} + الـ ID بتاعك\n"
+    "هتوصلك رسالة هنا أول ما باقتك تتفعّل. 🫶\n"
+    "\n"
+    "🆔 الـ ID بتاعك: {user_id}"
+)
+MSG_PAYMENT_MAIN_CHANNEL_AR = "القناة الرئيسية"
+MSG_PAYMENT_NO_DETAILS_AR = "اسأل المالك عن تفاصيل الدفع."
+MSG_PAYMENT_DIVIDER = "━━━━━━━━━━━━"
+
+# ---- maybe handle payment proof ----
+MSG_PAYMENT_PROOF_FROM_ID_WANTS = (
+    "💳 Payment proof\n"
+    "From: {name} ({username}) · id {id}\n"
+    "Wants: {plan_tier} for 30 days\n"
+    "Current plan: {plan_id}"
+)
+MSG_GOT_IT_I_VE_SENT = "✅ Got it! I've sent your screenshot to the owner. You'll get a message here as soon as your plan is active."
+BTN_APPROVE = "✅ Approve {plan_plus}{mark_plus}"
+BTN_APPROVE_2 = "✅ Approve {plan_pro}{mark_pro}"
+BTN_REJECT = "❌ Reject"
+MSG_I_COULDN_T_PASS_THAT = "❌ I couldn't pass that on. Please send it through the channel's Direct Messages: {REQUIRED_CHANNEL_URL}"
+
+# ---- settings & menus ----
+MSG_ORIGINAL = "🎵 Original"
+MSG_KEEP_THE_AUDIO_UNTOUCHED_NO = "Keep the audio untouched (no compression)"
+MSG_LOTS_OF_ROOM_TO_SHRINK = "🟢 lots of room to shrink"
+MSG_SOME_ROOM_TO_SHRINK = "🟡 some room to shrink"
+MSG_ALREADY_FAIRLY_COMPACT_MODEST_SAVING = "🟠 already fairly compact — modest savings only"
+MSG_ALREADY_VERY_COMPACT_RECOMPRESSING_M = "🔴 already very compact — recompressing may barely help"
+MSG_FREE = "Free"
+MSG_PLUS = "Plus"
+MSG_PRO = "Pro"
+MSG_LOW = "🟢 Low"
+MSG_BEST_QUALITY_BIGGEST_FILE = "Best quality, biggest file"
+MSG_MEDIUM = "🟡 Medium"
+MSG_BALANCED_DEFAULT = "Balanced (default)"
+MSG_HIGH = "🟠 High"
+MSG_SMALLER_FILE_VISIBLE_QUALITY_LOSS = "Smaller file, visible quality loss"
+MSG_VERY_HIGH = "🔴 Very High"
+MSG_MUCH_SMALLER_NOTICEABLY_SOFTER = "Much smaller, noticeably softer"
+MSG_EXTREME = "⚫ Extreme"
+MSG_SMALLEST_POSSIBLE_ROUGH_QUALITY = "Smallest possible, rough quality"
+MSG_LOW_2 = "🔈 Low"
+MSG_SMALLEST_AUDIO_NOTICEABLE_QUALITY_LO = "Smallest audio, noticeable quality loss"
+MSG_MEDIUM_2 = "🔉 Medium"
+MSG_BALANCED = "Balanced"
+MSG_HIGH_2 = "🔊 High"
+MSG_BEST_QUALITY_BIGGEST_AUDIO = "Best quality, biggest audio"
+JOIN_TEXT = (
+    "📢 To use this bot, please join our channel first.\n\n"
+    "1️⃣ Tap the green button and join\n"
+    "2️⃣ Come back here and tap “✅ I've joined”"
+)
+UPDATE_BUSY_TEXT = (
+    "🔧 The bot is being updated right now, so I can't take new files at the moment.\n"
+    "Please send yours again in a few minutes — sorry!"
+)
+
+# ---- flow header ----
+MSG_AUDIO = "🎚️ {level_label} · audio: {audio_label}"
+MSG_AUDIO_QUALITY = "🎧 Audio quality: {audio_label}"
+MSG_JUST_EDITING_AUDIO_VIDEO_UNTOUCHED = "🎧 Just editing audio (video untouched) · quality: {audio_label}"
+
+# ---- enhancement keyboard ----
+MSG_NOISE_REDUCTION = "🔇 Noise reduction: {noise_reduction_choice}"
+MSG_VOICE_ENHANCEMENT = "🎙 Voice enhancement: {voice_enhancement_choice}"
+BTN_PREVIEW_NOISE_VOICE_BOTH = "🎧 Preview: noise / voice / both"
+BTN_CONTINUE = "▶️ Continue"
+
+# ---- audio meta text ----
+MSG_AUDIO_DETAILS_ALL_OPTIONAL_NAME = (
+    "✏️ Audio details (all optional)\n"
+    "\n"
+    "📝 Name: {out_name}\n"
+    "🎤 Artist: {artist}\n"
+    "💿 Album: {album}\n"
+    "🖼 Cover: {cover_path_choice}\n"
+    "\n"
+    "Tap a button, then send the new value. When you're done, pick the quality in the menu above — or tap \"Send as is\" to keep the sound untouched."
+)
+
+# ---- access request text ----
+MSG_NAME = "👤 Name: {name}"
+MSG_USERNAME = "🔗 Username: {username}"
+MSG_ID = "🆔 ID: {user_id}"
+MSG_ACCESS_REQUEST = "🔔 Access request"
+MSG_ACCESS_REQUEST_DECIDED = "🔔 Access request — decided"
+
+# ---- plans text ----
+MSG_PLANS = "📦 Plans"
+MSG_YOUR_PLAN = "Your plan: {plan}"
+MSG_TO_SUBSCRIBE_SEND_SUBSCRIBE_PAY = "To subscribe: send /subscribe, pay, and send me a screenshot of the payment."
+MSG_DAY_FILES_UP_TO = "{emoji} {label} — {size_daily_mb}/day · files up to {size_max_file_mb} · {perk}"
+
+# ---- subscribe page text ----
+MSG_WHICH_PLAN_DO_YOU_WANT = (
+    "\n"
+    "\n"
+    "👇 Which plan do you want? (30 days)"
+)
+
+# ---- subs command ----
+MSG_ACTIVE_SUBSCRIBERS = "💎 Active subscribers: {subscribers}"
+MSG_UNTIL_D_LEFT = "{plan_tier} · {name} ({user_id}) · until {date_until} · {days_left}d left"
+MSG_NO_ACTIVE_SUBSCRIBERS = "No active subscribers."
+
+# ---- join keyboard ----
+BTN_JOIN_THE_CHANNEL = "📢 Join the channel"
+BTN_I_VE_JOINED = "✅ I've joined"
+
+# ---- stats overview text ----
+MSG_BOT_STATISTICS_TIMES_IN_UTC = "📊 Bot statistics (times in UTC)"
+MSG_SINCE_USER_S = "Since {since} · 👥 {count_users} user(s)"
+MSG_FINISHED_JOBS = "✅ Finished jobs: {jobs}"
+MSG_VIDEO_COMPRESSIONS = "   🎬 Video compressions: {video}"
+MSG_AUDIO_COMPRESSIONS = "   🎧 Audio compressions: {audio}"
+MSG_AUDIO_EDITS_AUDIO_REPLACED = "   🔊 Audio edits: {audio_edit} · 🔁 Audio replaced: {audio_replace}"
+MSG_FAILED = "❌ Failed: {failed}"
+MSG_FILES_RECEIVED_VIDEO_AUDIO = "📥 Files received: {received_video} video · {received_audio} audio"
+MSG_JOBS_TODAY_LAST_7_DAYS = "📅 Jobs today: {jobs} · last 7 days: {jobs_2}"
+MSG_TODAY_PERSON_S_SENT_FILES = "🎟 Today: {quota_today_summary} person(s) sent files · {size} in total"
+MSG_MORE_STATS_USERS_STATS_CSV = "More: /stats users · /stats csv"
+MSG_COMPRESSION = "💾 Compression"
+MSG_ORIGINAL_TOTAL = "   Original total: {size_orig}"
+MSG_COMPRESSED_TOTAL = "   Compressed total: {size_comp}"
+MSG_SPACE_SAVED_OVERALL = "   Space saved: {size_orig_comp} ({pct_text_overall_pct} overall)"
+MSG_AVERAGE_SAVING_PER_FILE = "   Average saving per file: {pct_text_avg_pct}"
+MSG_BEST_WORST = "   Best: {pct_text_best_saved_pct} · Worst: {pct_text_worst_saved_pct}"
+MSG_BIGGEST_FILE_RECEIVED = "   Biggest file received: {size_max_original_bytes}"
+MSG_TIME = "⏱ Time"
+MSG_MEDIA_PROCESSED_LONG = "   Media processed: {time_media_seconds} long"
+MSG_TOTAL_ENCODING_TIME = "   Total encoding time: {time_encode_seconds}"
+MSG_AVERAGE_PER_JOB_REAL_TIME = "   Average per job: {time_encode_seconds_jobs} (~{speed:.1f}× real time)"
+MSG_AVERAGE_QUEUE_WAIT = "   Average queue wait: {time_wait_seconds_jobs}"
+MSG_BY_LEVEL = "🎚 By level"
+MSG_BUSIEST_HOUR_00_59_UTC = "🕒 Busiest hour: {peak:02d}:00–{peak:02d}:59 UTC ({hours_peak} job(s))"
+MSG_LAST_JOBS_NEWEST_FIRST = "🧾 Last jobs (newest first)"
+MSG_JOB_S_SAVED_AVG_ENCODE = "   {label}: {jobs} job(s) · saved {pct_text_level_pct} · avg encode {time_encode_seconds_jobs}"
+MSG_STATS_OVERVIEW_TEXT = "{size_original_bytes} → {size_compressed_bytes} (−{saved_pct:.1f}%)"
+MSG_STATS_OVERVIEW_TEXT_2 = "• {when} · {value} · {level} · {size_part}{enc_part}"
+
+# ---- stats users text ----
+MSG_USER_S_HAVE_FINISHED_AT = "👥 {count_users} user(s) · {active} have finished at least one job"
+MSG_AND_MORE = "…and {len_users} more"
+
+# ---- smart analysis text ----
+MSG_SMART_ANALYSIS = "🧠 Smart analysis"
+MSG_RECOMMENDED_AUDIO = "✅ Recommended: {level_info_label} + audio {audio_info_label}"
+MSG_SMART_ANALYSIS_TEXT = "📹 {width}×{height} · {fps_text} · {codec} · {bitrate_text_video_bps}"
+MSG_COULDN_T_READ_THIS_VIDEO = "📹 Couldn't read this video's properties — using balanced defaults"
+MSG_BITS_PER_PIXEL_AS_H = "📊 {eq_bpp:.3f} bits per pixel (as H.264) → {smart_verdict_text_verdict}"
+MSG_SMART_ANALYSIS_TEXT_2 = "   ≈ {size_est_size}{saved}"
+MSG_SMART_ANALYSIS_TEXT_3 = "• {note}"
+MSG_SMART_ANALYSIS_TEXT_4 = "⚠️ {warning}"
+MSG_SMART_ANALYSIS_TEXT_5 = "🔊 {audio_codec} · {audio_bps_choice} · {channels}"
+MSG_NO_AUDIO_TRACK = "🔇 No audio track"
+
+# ---- analyze and show level menu ----
+MSG_ORIGINAL_SIZE = "Original size: {size_original_size}"
+MSG_ESTIMATES_ARE_BASED_ON_THE = "Estimates are based on the {sample_label} samples and may vary ±15%."
+MSG_PICK_A_LEVEL_TO_COMPRESS = "Pick a level to compress:"
+MSG_ENCODING_A_SAMPLE_AT_EACH = (
+    "🔎 Encoding a {sample_label} sample at each compression level (0/{count_level_order} done)...\n"
+    "This can take a minute or two 🦦"
+)
+MSG_ANALYZE_AND_SHOW_LEVEL_MENU = "{label} — ~{size_estimates_level} · {detail}"
+
+# ---- update status text ----
+MSG_UPDATE_MODE_IS_ON_NEW = "🔧 Update mode is ON — new files are turned away."
+MSG_UPDATE_OFF_CANCEL_AND_ACCEPT = "/update off — cancel and accept files again"
+MSG_NOBODY_IS_IN_THE_MIDDLE = "✅ Nobody is in the middle of anything."
+MSG_STILL_TO_FINISH = "👥 {people_left} still to finish:"
+MSG_BEING_DOWNLOADED_ANALYZED_COMPRESSED = "   ⚙️ {work_active} being downloaded / analyzed / compressed / sent"
+MSG_WAITING_IN_LINE = "   🕓 {waiting} waiting in line"
+MSG_I_LL_MESSAGE_YOU_THE = "I'll message you the moment they're all done."
+MSG_PERSON_PEOPLE_HAVE_AN_ANALYZED = "📋 {menus} person/people have an analyzed video open but haven't picked yet. They can still finish, but anything unfinished is lost when the bot restarts."
+MSG_PDF_JOB_S_RUNNING = "   🧾 {other_jobs_running} PDF job(s) running"
+
+# ---- maybe notify update ready ----
+MSG_EVERYONE_HAS_FINISHED_IT_S = "✅ Everyone has finished — it's safe to deploy now."
+MSG_UPDATE_OFF_CANCELS_UPDATE_MODE = "/update off cancels update mode."
+MSG_THE_LATEST_DATABASE_ZIP_IS = "💾 The latest Database.zip is saved in the backup channel."
+MSG_I_COULDN_T_CONFIRM_THE = "⚠️ I couldn't confirm the Database.zip backup — check the backup channel before deploying."
+MSG_OPEN_MENU_S_WILL_BE = "⚠️ {menus} open menu(s) will be lost on restart — those people will need to resend."
+
+# ---- handle callback inner ----
+MSG_SCANNING_THE_VIDEO_FOR_CHANGES = "📸 Scanning the video for changes (sampling every {interval:.1f}s)..."
+MSG_SESSION_FINISHED_THE_STORED_VIDEO = "✅ Session finished — the stored video and temporary files were deleted."
+MSG_REJECTED_THE_PAYMENT_FROM = "❌ Rejected the payment from {name} ({target_id})."
+MSG_FRAME_S_ONE_EVERY_S = "📄 {frame_count} frame(s), one every {interval}s."
+MSG_SAMPLED_FRAME_S_COMPARING_FOR = "🔍 Sampled {count_candidate_paths} frame(s) — comparing for real changes..."
+MSG_FRAME_S_KEPT_OUT_OF = (
+    "📄 {count_kept_paths} frame(s) kept out of {count_candidate_paths} sampled (every {interval:.1f}s).\n"
+    "(auto threshold: {threshold_used:.0f})"
+)
+MSG_NOT_AUTHORIZED_YOUR_TELEGRAM_USER = "⛔ Not authorized. Your Telegram user ID is {user_id}."
+MSG_APPROVED_FOR_UNTIL = "✅ Approved: {plan_level} {verb} for {name} ({target_id}) until {date_until}."
+MSG_STATISTICS_RESET_COUNTING_FROM_ZERO = "✅ Statistics reset — counting from zero now."
+MSG_DEFAULT_STAR_SET_TO_NEW = (
+    "Default star set to {level_label}.\n"
+    "New estimate menus will highlight this level."
+)
+MSG_CANCELLED_TEMPORARY_FILES_REMOVED = "❌ Cancelled — temporary files removed."
+MSG_PICK_A_SCREENSHOT_INTERVAL_ONE = "Pick a screenshot interval — one frame will be captured every N seconds and combined into a PDF:"
+MSG_EXTRACTING_A_FRAME_EVERY_S = "📄 Extracting a frame every {interval}s and building a PDF..."
+MSG_COMPARING_FRAMES_FOR_NEAR_DUPLICATES = "🔍 Comparing frames for near-duplicates..."
+MSG_JUST_EDITING_THE_AUDIO_THE = (
+    "🎧 Just editing the audio — the video stays exactly as it is (no re-encode).\n"
+    "Pick audio quality:"
+)
+MSG_SEND_THE_NEW_FILE_NAME = "📝 Send the new file name now (just the name, no extension)."
+MSG_SEND_THE_ALBUM_NAME_NOW = "💿 Send the album name now. (Send - to remove it.)"
+MSG_SEND_THE_ARTIST_NAME_NOW = "🎤 Send the artist name now. (Send - to remove it.)"
+MSG_UPLOADING_AUDIO_AS_IS = "📤 Uploading your audio..."
+MSG_SENDING_AUDIO_AS_IS = "📤 Applying your changes — the sound itself is not re-encoded..."
+MSG_AUDIO_SENT_AS_IS = "✅ Sent without compression — the sound is exactly as it was."
+MSG_ARTIST = (
+    "🎤 Artist: {custom_artist}\n"
+)
+MSG_COVER_NOT_EMBEDDED = "ℹ️ This format can't hold an embedded cover, so it's only shown as the preview image."
+MSG_SENT_AS_FILE_NOT_MP3_M4A = "ℹ️ Telegram only plays MP3 / M4A as music, so this one was sent as a file (still untouched)."
+MSG_SEND_THE_ALBUM_COVER_NOW = "🖼 Send the album cover now — a photo or an image file."
+MSG_OPTIONAL_AUDIO_ENHANCEMENTS_TOGGLE_T = (
+    "{header}\n"
+    "🎛 Optional audio enhancements — toggle, then continue:"
+)
+MSG_GENERATING_S_ENHANCEMENT_PREVIEWS_ON = "🎧 Generating {ENHANCEMENT_PREVIEW_SECONDS}s enhancement previews — one moment..."
+MSG_NOISE_REDUCTION_2 = "🔇 Noise reduction"
+MSG_VOICE_ENHANCEMENT_2 = "🎙 Voice enhancement"
+MSG_BOTH_TOGETHER = "🔇 + 🎙 Both together"
+MSG_NOISE_REDUCTION_3 = "🔇 noise reduction"
+MSG_VOICE_ENHANCEMENT_3 = "🎙 voice enhancement"
+MSG_GENERATING_S_PREVIEWS_AT_EACH = "🎧 Generating {VOLUME_PREVIEW_SECONDS}s previews at each volume level{enhancement_note} — one moment..."
+MSG_SELECTED_NOW_PICK_AUDIO_QUALITY = "🎚️ {level_settings_label} selected. Now pick audio quality:"
+MSG_CANCELLED_THE_STATISTICS_WERE_NOT = "Cancelled — the statistics were not changed."
+MSG_THAT_VIDEO_ISN_T_IN_2 = "⚠️ That video isn't in my cache anymore — please resend it."
+MSG_NO_EXTRACTED_FRAMES_TO_COMPARE = "⚠️ No extracted frames to compare yet — extract a PDF first."
+MSG_NOTHING_TO_COMPARE_NOT_ENOUGH = "Nothing to compare — not enough frames."
+MSG_GETTING_SAMPLES_READY = "🔎 Getting samples ready..."
+MSG_THIS_VIDEO_HAS_NO_AUDIO = "⚠️ This video has no audio track, so there's nothing to edit. Pick a compression level above instead."
+MSG_SEND_ME_THE_NEW_AUDIO = (
+    "🔁 Send me the new audio now — a voice message, an audio file, or an audio document.\n"
+    "\n"
+    "It replaces the video's current audio; the picture stays exactly as it is. The video decides the final length: a longer recording is cut at the end of the video, a shorter one leaves the rest silent."
+)
+MSG_AUDIO_REPLACEMENT_CANCELLED_PICK_ANO = "❌ Audio replacement cancelled — pick another option from the menu above."
+MSG_S_PREVIEW_OF_THE_SAME = "🎧 {sample_duration:.0f}s preview of the same moment, from the middle:"
+MSG_S_PREVIEW_AT_EACH_VOLUME = "🎧 {sample_duration:.0f}s preview at each volume level{enhancement_note}, from the middle:"
+MSG_PICK_A_VOLUME_LEVEL = "Pick a volume level:"
+MSG_A_COPY_OF_THE_STATISTICS = "🗂 A copy of the statistics from before the reset."
+MSG_WHAT_WOULD_YOU_LIKE_TO = (
+    "What would you like to do next?\n\n"
+    "✂️ To delete slides, just send their page numbers, e.g. 2 5 11 16 (ranges like 3-6 work too)."
+)
+MSG_DELETE_SLIDES_OUT_OF_RANGE = "⚠️ The PDF has {total} page(s) — these numbers don't exist: {bad}. Nothing was deleted."
+MSG_DELETE_SLIDES_WOULD_EMPTY = "⚠️ That would delete every page. Send fewer numbers."
+MSG_DELETE_SLIDES_WORKING = "✂️ Deleting {count} slide(s) and rebuilding the PDF..."
+MSG_DELETE_SLIDES_DONE = (
+    "✂️ Deleted slide(s) {deleted} — {remaining} page(s) left.\n"
+    "Page numbers in this new PDF start again from 1."
+)
+MSG_DELETE_SLIDES_FAILED = "❌ Something went wrong deleting those slides.\n\nError: {error}"
+MSG_REMOVED_NEAR_DUPLICATE_FRAME_S = (
+    "🧹 Removed {count_removed_paths} near-duplicate frame(s) — {count_kept_paths} remain.\n"
+    "(auto threshold: {threshold_used:.0f})"
+)
+MSG_AUDIO_REPLACEMENT_CANCELLED = "❌ Audio replacement cancelled."
+MSG_SEND_ME_THE_IMAGE_TO = (
+    "🖼 Send me the image to use as this video's cover — a photo, or an image file if you want to keep full quality.\n"
+    "\n"
+    "Then pick what to do with the video from the menu above."
+)
+MSG_CANCELLED = "❌ Cancelled."
+MSG_I_COULDN_T_CONFIRM_YOUR = (
+    "❌ I couldn't confirm your payment, so your plan wasn't activated.\n"
+    "Please contact the owner. {dm_text}"
+)
+MSG_COULDN_T_EXTRACT_ANY_FRAMES = "❌ Couldn't extract any frames from that video."
+MSG_SOMETHING_WENT_WRONG_EXTRACTING_FRAM = (
+    "❌ Something went wrong extracting frames.\n"
+    "\n"
+    "Error: {error}"
+)
+MSG_SOMETHING_WENT_WRONG_SCANNING_THE = (
+    "❌ Something went wrong scanning the video.\n"
+    "\n"
+    "Error: {error}"
+)
+MSG_NO_EXTREMELY_SIMILAR_FRAMES_FOUND = (
+    "✅ No extremely-similar frames found — nothing removed.\n"
+    "(auto threshold: {threshold_used:.0f})"
+)
+MSG_SOMETHING_WENT_WRONG_REMOVING_SIMILA = (
+    "❌ Something went wrong removing similar frames.\n"
+    "\n"
+    "Error: {error}"
+)
+MSG_SAVED_NOW_PICK_THE_QUALITY = (
+    "\n"
+    "\n"
+    "✅ Saved — now pick the quality in the menu above, or tap Send as is."
+)
+MSG_COULDN_T_GENERATE_THE_PREVIEW = "⚠️ Couldn't generate the preview for {label}."
+MSG_COULDN_T_GENERATE_A_PREVIEW = "⚠️ Couldn't generate a preview for {label}."
+MSG_HANDLE_CALLBACK_INNER = "🔊 {label}"
+MSG_VOLUME_SAMPLE_TITLE = "Audio sample {number}"
+MSG_LEVEL_WOULD_GROW_FILE = "⛔ This level would make the file bigger than the original, so it's disabled. Pick a different level."
+VOLUME_SAMPLE_PERFORMER = "صلي علي النبي"
+
+# ---- reject unauthorized ----
+MSG_YOU_RE_NOT_APPROVED_TO = (
+    "⛔ You're not approved to use this bot yet.\n"
+    "\n"
+    "I've sent your request to the admin — you'll get a message here when they decide."
+)
+MSG_YOUR_ACCESS_REQUEST_WAS_DECLINED = "🔴 Your access request was declined."
+MSG_YOUR_REQUEST_IS_STILL_WAITING = "⏳ Your request is still waiting for the admin's approval. You'll get a message here as soon as they decide."
+MSG_I_COULDN_T_REACH_THE = "⚠️ I couldn't reach the admin to ask for you right now — please try again later."
+
+# ---- report forwarded channel id ----
+MSG_THAT_CHANNEL_S_ID_IS = (
+    "📢 That channel's ID is:\n"
+    "{origin_chat_id}\n"
+    "\n"
+    "Set it as BACKUP_CHANNEL_ID (Railway variable, or in bot.py) and make sure the bot is an admin of the channel with the \"Post messages\" and \"Pin messages\" rights."
+)
+
+# ---- handle access decision ----
+MSG_ACCESS_REVOKED = "Access revoked 🚫"
+MSG_ACCESS_REVOKED_2 = "🚫 Access revoked"
+MSG_YOUR_ACCESS_TO_THIS_BOT = "🔴 Your access to this bot was removed by the admin."
+MSG_ONLY_THE_ADMIN_CAN_DO = "Only the admin can do this."
+MSG_ACCEPTED = "Accepted ✅"
+MSG_ACCEPTED_2 = "✅ Accepted"
+MSG_GREEN_CARD_GRANTED_THE_ADMIN = (
+    "🟢 Green card granted! The admin approved you — you can use the bot now.\n"
+    "\n"
+    "Send me a video or an audio recording to get started."
+)
+MSG_DENIED = "Denied ❌"
+MSG_DENIED_2 = "❌ Denied"
+MSG_YOUR_REQUEST_TO_USE_THIS = "🔴 Your request to use this bot was declined."
+MSG_THAT_USER_IS_HARD_CODED = "That user is hard-coded in bot.py, so it can't be revoked here."
+
+# ---- grant command ----
+MSG_FOR_ACTIVE_UNTIL = (
+    "✅ {plan_tier} {verb} for {name} ({user_id}).\n"
+    "Active until {date_until} ({QUOTA_TZ})."
+)
+MSG_I_COULDN_T_MESSAGE_THEM = "(I couldn't message them — they may need to send me /start first.)"
+
+# ---- revoke command ----
+MSG_PLAN_ENDED_FOR_BACK_TO = "✅ Plan ended for {name} ({user_id}) — back to Free."
+MSG_USAGE_REVOKE_USER_NUMERIC_ID = "Usage: /revoke <user>  (numeric ID or @username)"
+MSG_HAS_NO_ACTIVE_PLAN = "{name} ({user_id}) has no active plan."
+
+# ---- reset stats command ----
+MSG_RESET_ALL_STATISTICS_THIS_ERASES = (
+    "⚠️ Reset ALL statistics?\n"
+    "\n"
+    "This erases {totals_jobs} finished job(s), each user's job counts, the per-level numbers and the job history. I'll send you a copy of the data first.\n"
+    "\n"
+    "Not touched: the list of {count_users} user(s) (names, usernames, first/last seen), approved users, plans and today's daily data limits."
+)
+BTN_YES_RESET = "✅ Yes, reset"
+
+# ---- estimate keyboard ----
+MSG_ESTIMATE_KEYBOARD = "✅ {text}"
+BTN_JUST_EDIT_AUDIO_KEEP_VIDEO = "🎧 Just edit audio (keep video as is)"
+BTN_REPLACE_AUDIO_SEND_A_RECORDING = "🔁 Replace audio (send a recording)"
+BTN_SET_VIDEO_COVER_SEND_AN = "🖼 Set video cover (send an image)"
+BTN_EXTRACT_TO_PDF = "📄 Extract to PDF"
+BTN_EXTRACT_AUDIO = "🎵 Extract audio"
+BTN_SPLIT_VIDEO = "✂️ Split video"
+MSG_SPLIT_ASK = (
+    "✂️ Where should I split the video?\n\n"
+    "Send the time of the cut as hours:minutes:seconds, like 0:05:30. "
+    "Hour 2 is 2:00:00. (Minutes and seconds alone work too, like 5:30.)\n\n"
+    "This video is {length} long ({clock}). It becomes two videos: from the start to the cut, and from the cut to the end."
+)
+MSG_SPLIT_BAD_TIME = "⚠️ I couldn't read that time. Send it like 0:05:30 (hours:minutes:seconds), or tap Cancel."
+MSG_SPLIT_OUT_OF_RANGE = "⚠️ The cut must be inside the video (between 0:00:01 and {clock}). Send another time, or tap Cancel."
+MSG_SPLIT_NO_LENGTH = "⚠️ I couldn't read this video's length, so I can't split it."
+MSG_SPLIT_BUSY = "⏳ This video is already being worked on — please wait for it to finish."
+MSG_SPLIT_CUTTING = "✂️ Cutting part {part}/2 ({start} → {end})"
+MSG_SPLIT_SENDING = "📤 Sending part {part}/2…"
+MSG_SPLIT_CAPTION = "✂️ Part {part}/2 — {start} → {end}\nLength: {length}\nSize: {size}"
+MSG_SPLIT_TOO_BIG = "Part {part} would be bigger than Telegram's 2 GB upload limit, so I couldn't send it."
+MSG_SPLIT_FAILED = "😕 Something went wrong while splitting: {error}"
+MSG_SPLIT_CANCELLED = "❌ Split cancelled."
+MSG_SPLIT_DONE = "✅ Split at {clock}. The original is still here — you can compress it or choose anything else from its menu."
+MSG_EXTRACT_AUDIO_PICK_QUALITY = (
+    "🎵 Extracting the audio from your video into an audio file.\n\n"
+    "Pick the audio quality (estimated size of the audio file):"
+)
+MSG_EXTRACT_AUDIO_CANT_COPY = (
+    "⚠️ This video's audio is in a format that can't be saved as a playable audio file without "
+    "converting it. Pick an audio quality above instead."
+)
+# Audio formats that can be copied out of a video untouched, and the file they become.
+EXTRACT_COPY_EXTENSIONS = {"aac": ".m4a", "mp3": ".mp3"}
+MSG_EXTRACT_AUDIO_NO_AUDIO = "⚠️ This video has no audio track, so there's nothing to extract."
+BTN_CANCEL = "❌ Cancel"
+
+# ---- pdf interval keyboard ----
+BTN_S = "{seconds}s"
+BTN_AUTO_DETECT_CHANGES = "🧠 Auto-detect changes"
+BTN_PDF_IN_THREE_PARTS = "🧩 Do it in 3 parts (saves space)"
+MSG_PDF3_SCANNING_PART = "🧩 Part {part}/3 — scanning (sampling every {interval:.1f}s)..."
+MSG_PDF3_COMPARING_PART = "🧩 Part {part}/3 — sampled {count} frame(s), comparing for real changes..."
+MSG_PDF3_BUILDING_PART = "🧩 Part {part}/3 — building the PDF..."
+MSG_PDF3_PART_CAPTION = (
+    "📄 Part {part}/3 ({start} → {end}): {kept} frame(s) kept out of {sampled} sampled "
+    "(every {interval:.1f}s).\n(auto threshold: {threshold:.0f})"
+)
+MSG_PDF3_PART_FAILED = "⚠️ Part {part}/3 ({start} → {end}) couldn't be extracted — moving on to the next part."
+MSG_PDF3_NEEDS_DURATION = "⚠️ I couldn't read this video's length, so I can't split it into 3 parts. Try one of the other options."
+MSG_PDF3_DONE = "✅ All parts done. Part PDFs were removed from the server after each one was sent."
+
+# ---- smart analyze ----
+MSG_RESOLUTION = "Resolution {width}×{height} → {out_w}×{out_h}"
+MSG_FPS_CAPPED_AT_FPS_SMALLER = "{fps:.0f} fps → capped at {SMART_FPS_CAP} fps (smaller file, slightly less smooth motion)"
+
+# ---- setlevel ----
+MSG_PICK_THE_LEVEL_THAT_SHOULD = "Pick the level that should be starred by default in the menu:"
+
+# ---- run compression ----
+MSG_AUDIO_EDITED_VIDEO_UNTOUCHED_AUDIO = "✅ Audio edited — video untouched! (audio: {audio_info_label}{boost_suffix}{enhancement_suffix})"
+MSG_AUDIO_REPLACED_VIDEO_UNTOUCHED_AUDIO = "✅ Audio replaced — video untouched! (audio: {audio_info_label})"
+MSG_COMPLETE_AUDIO = "✅ {smart_choice} complete! ({level_info_label}{fps_note}, audio: {audio_info_label}{boost_suffix}{enhancement_suffix})"
+MSG_THAT_AUDIO_FORMAT_CAN_T = "ℹ️ That audio format can't be kept inside an MP4, so it was re-encoded at High quality."
+MSG_RUN_COMPRESSION = " · 🔊+{volume_boost_percent}%"
+MSG_COMPRESSING_AUDIO = "⚙️ Compressing audio ({audio_info_label}{boost_suffix}{enhancement_suffix})..."
+MSG_SENDING_COMPRESSED_AUDIO = "📤 Sending compressed audio..."
+MSG_SENDING_EDITED_VIDEO = "📤 Sending edited video..."
+MSG_SENDING_COMPRESSED_VIDEO = "📤 Sending compressed video..."
+MSG_EDITING_AUDIO_VIDEO_UNTOUCHED = "⚙️ Editing audio, video untouched ({audio_info_label}{boost_suffix}{enhancement_suffix})..."
+MSG_SOMETHING_WENT_WRONG_WHILE_COMPRESSI = (
+    "❌ Something went wrong while compressing.\n"
+    "\n"
+    "Error: {error}"
+)
+MSG_REPLACING_THE_AUDIO_VIDEO_UNTOUCHED = "⚙️ Replacing the audio, video untouched ({audio_info_label})..."
+MSG_AT_AUDIO = "⚙️ {smart_choice} at {level_info_label}{fps_note} (audio: {audio_info_label}{boost_suffix}{enhancement_suffix})..."
+MSG_COMPRESSION_COMPLETE_AUDIO = (
+    "✅ Compression complete! (audio: {audio_info_label}{boost_suffix}{enhancement_suffix})\n"
+    "\n"
+)
+MSG_ALBUM = (
+    "💿 Album: {custom_album}\n"
+    "\n"
+)
+
+# ---- process audio replacement ----
+MSG_DOWNLOADING_THE_NEW_AUDIO = "📥 Downloading the new audio..."
+MSG_YOUR_RECORDING_IS_LONGER_THAN = "ℹ️ Your recording ({time_replacement_duration}) is longer than the video ({time_video_duration}), so its last {time_difference} was cut."
+MSG_THAT_VIDEO_ISN_T_IN = "⚠️ That video isn't in my cache anymore — please resend it, then tap Replace audio again."
+MSG_YOUR_RECORDING_IS_SHORTER_THAN = "ℹ️ Your recording ({time_replacement_duration}) is shorter than the video ({time_video_duration}), so the last {time_difference} is silent."
+MSG_I_COULDN_T_FIND_ANY = "❌ I couldn't find any audio in that file. Send a different recording (or tap Cancel above)."
+MSG_COULDN_T_DOWNLOAD_THAT_AUDIO = (
+    "❌ Couldn't download that audio — send it again.\n"
+    "\n"
+    "Error: {error}"
+)
+
+# ---- apply cover image ----
+MSG_PROCESSING_THE_IMAGE = "🖼 Processing the image..."
+MSG_THAT_FILE_ISN_T_IN = "⚠️ That file isn't in my cache anymore — please resend it."
+MSG_I_COULDN_T_READ_THAT = "❌ I couldn't read that image. Send a different one (JPG / PNG / WebP)."
+MSG_ALBUM_COVER_SET = "✅ Album cover set."
+MSG_VIDEO_COVER_SET = "✅ Video cover set."
+MSG_VIDEO_COVER_SET_NOW_PICK = (
+    "✅ Video cover set.\n"
+    "\n"
+    "Pick what to do with the video from the menu above — the cover is used on the result — "
+    "or upload the video exactly as it is with just the new cover:"
+)
+BTN_UPLOAD_VIDEO_UNCHANGED = "📤 Upload video unchanged (cover only)"
+MSG_COVER_ONLY_UPLOADING = "📤 Uploading your video with the new cover (video unchanged)..."
+MSG_COVER_CHANGED_VIDEO_UNCHANGED = "✅ Cover changed — video unchanged!"
+MSG_COULDN_T_DOWNLOAD_THAT_IMAGE = (
+    "❌ Couldn't download that image — send it again.\n"
+    "\n"
+    "Error: {error}"
+)
+
+# ---- users command ----
+MSG_APPROVED_USER_S_RIGHT_NOW = "📋 {count_approved_users} approved user(s) right now. (To load a save manually, just send a Database.zip back to me.)"
+
+# ---- usage keyboard ----
+BTN_BACK = "⬅️ Back"
+BTN_GO_BACK = "⬅️ Go back"
+BTN_GET_MORE_SUBSCRIBE = "💎 Get more — Subscribe"
+
+# ---- require channel membership ----
+MSG_YOU_HAVEN_T_JOINED_YET = "You haven't joined yet — tap the green button first."
+MSG_PLEASE_JOIN_OUR_CHANNEL_FIRST = "Please join our channel first."
+MSG_THANKS_FOR_JOINING = "✅ Thanks for joining!"
+MSG_YOU_RE_IN_SEND_ME = "✅ You're in! Send me a video (or an audio file) to get started."
+MSG_I_CAN_T_CHECK_WHO = (
+    "⚠️ I can't check who joined the required channel, so everyone is being let in.\n"
+    "Add me as an ADMINISTRATOR of that channel (no special rights needed) and it will start working."
+)
+
+# ---- wait text ----
+MSG_JOB_S_AHEAD_OF_YOU = "🕓 {ahead} job(s) ahead of you — I'll start yours automatically as soon as the server is free."
+MSG_YOU_RE_SUBSCRIBED_SO_YOU = "{plan_label} — you're subscribed, so you're served before free users."
+MSG_THE_COMPRESSION_RUNNING_NOW_HAS = "⏱ The compression running now has ~{time_remaining} left."
+MSG_PLUS_AND_PRO_MEMBERS_ARE = "💡 Plus and Pro members are served first (see /plans)."
+
+# ---- volume keyboard ----
+MSG_NO_BOOST = "🔈 No boost"
+MSG_VOLUME_KEYBOARD = "🔊 +{boost}%"
+
+# ---- post pdf keyboard ----
+BTN_COMPRESS_VIDEO = "🗜 Compress video"
+BTN_FINISH_SESSION_DELETES_VIDEO = "✅ Finish session (deletes video)"
+BTN_AUTO_DELETE_SIMILAR_FRAMES = "🧹 Auto-delete similar frames"
+
+# ---- send level samples ----
+MSG_SAMPLE_AT_EACH_COMPRESSION_LEVEL = "🎬 {sample_length_duration} sample at each compression level (taken from the middle of the video, with that level's default audio):"
+MSG_SAMPLE_FULL_VIDEO = (
+    "{label} — {detail}\n"
+    "Sample: {size_sample_size} · full video ≈ {size_estimates_level}"
+)
+
+# ---- on progress ----
+MSG_ENCODING_A_SAMPLE_AT_EACH_2 = (
+    "🔎 Encoding a {sample_label} sample at each compression level ({done}/{total} done)...\n"
+    "This can take a minute or two on a small CPU."
+)
+
+# ---- handle incoming ----
+MSG_DOWNLOADING = "📥 Downloading {kind_label} ({size_text})..."
+MSG_ORIGINAL_SIZE_PICK_AUDIO_QUALITY = (
+    "🎧 Original size: {size_downloaded_size}\n"
+    "Pick audio quality:"
+)
+MSG_SOMETHING_WENT_WRONG_WHILE_ANALYZING = (
+    "❌ Something went wrong while analyzing the {kind_label}.\n"
+    "\n"
+    "Error: {error}"
+)
+
+# ---- handle photo ----
+MSG_I_M_WAITING_FOR_TEXT = "✏️ I'm waiting for text here, not an image."
+
+# ---- handle document ----
+MSG_THAT_DOESN_T_LOOK_LIKE = "❌ That doesn't look like a video, audio, PDF or RAR file."
+
+# ---- update command ----
+MSG_UPDATE_MODE_IS_OFF_NEW = "✅ Update mode is OFF — new files are accepted again."
+MSG_UPDATE_MODE_WASN_T_ON = "Update mode wasn't on."
+
+# ---- access request keyboard ----
+BTN_REVOKE_ACCESS = "🚫 Revoke access"
+BTN_ACCEPT_INSTEAD = "✅ Accept instead"
+BTN_ACCEPT_AGAIN = "✅ Accept again"
+BTN_ACCEPT = "✅ Accept"
+BTN_DENY = "❌ Deny"
+
+# ---- pin backup file ----
+MSG_I_POSTED_DATABASE_ZIP_IN = "⚠️ I posted Database.zip in the channel but couldn't pin it. Give the bot the \"Pin messages\" admin right there — the pinned file is what I restore from after a restart."
+
+# ---- notify user granted ----
+MSG_YOU_RE_NOW_ON_THE = (
+    "🎉 You're now on the {plan_tier} plan until {date_until}!\n"
+    "• {size_daily_mb} per day\n"
+    "• files up to {size_max_file_mb}\n"
+    "• you're served before free users in the queue"
+)
+
+# ---- home keyboard ----
+BTN_USAGE = "📊 Usage"
+BTN_SUBSCRIBE = "💎 Subscribe!"
+BTN_PLANS = "📦 Plans"
+BTN_HOW_TO_USE = "❓ How to use"
+BTN_ABOUT_THE_BOT = "ℹ️ About the bot"
+
+# ---- about keyboard ----
+BTN_OUR_CHANNEL = "📢 Our channel"
+
+# ---- stats command ----
+MSG_NO_FINISHED_JOBS_YET = "No finished jobs yet."
+MSG_THE_LAST_JOB_S = "🧾 The last {count_recent} job(s)."
+
+# ---- audio keyboard ----
+BTN_AUDIO_KEYBOARD = "{original_info_label} — ~{size_estimates_original_audio} · {original_info_detail}"
+BTN_RENAME_ALBUM_NAME_COVER = "✏️ Rename / album name / cover"
+
+# ---- audio meta keyboard ----
+BTN_RENAME_FILE = "📝 Rename file"
+BTN_ALBUM_NAME = "💿 Album name"
+BTN_ARTIST_NAME = "🎤 Artist name"
+BTN_SEND_AS_IS = "📤 Send as is (no compression)"
+BTN_ALBUM_COVER = "🖼 Album cover"
+BTN_CLEAR_ALL = "🗑 Clear all"
+BTN_DONE = "✅ Done"
+
+# ---- handle text input ----
+MSG_THAT_NAME_HAS_NO_USABLE = "❌ That name has no usable characters — try another one."
+MSG_I_M_WAITING_FOR_AN = "🖼 I'm waiting for an image here — send a photo or an image file."
+
+# ---- restore approved users from document ----
+MSG_LOADED_THAT_FILE_NEW_USER = "✅ Loaded that file — {added} new user(s) added, {count_approved_users} approved in total."
+MSG_I_COULDN_T_USE_THAT = "❌ I couldn't use that file: {error}"
+MSG_SOMETHING_WENT_WRONG_READING_THAT = (
+    "❌ Something went wrong reading that file.\n"
+    "\n"
+    "Error: {error}"
+)
+MSG_COULDN_T_SAVE_TO_DISK = (
+    "\n"
+    "⚠️ Couldn't save to disk on the server."
+)
+
+# ---- backup database if changed ----
+MSG_DATABASE_BACKUP_APPROVED_USER_S = "💾 Database backup — {count} approved user(s), {totals_jobs} job(s) logged — {stamp}"
+MSG_I_COULDN_T_POST_DATABASE = (
+    "⚠️ I couldn't post Database.zip to the backup channel ({BACKUP_CHANNEL_ID}): {error}\n"
+    "Make sure the bot is an admin there with the \"Post messages\" and \"Pin messages\" rights. I'll keep retrying every few minutes."
+)
+
+# ---- restore from pinned backup ----
+MSG_BOT_RESTARTED_RESTORED_APPROVED_USER = "♻️ Bot restarted — restored {added} approved user(s) from the pinned Database.zip ({count_approved_users} approved in total)."
+
+# ---- expire idle files ----
+MSG_I_DELETED_YOUR_VIDEO_BECAUSE = "⌛ I deleted your video because you didn't choose anything for {IDLE_FILE_TTL_MINUTES} minutes. Send it again whenever you're ready."
+MSG_I_DELETED_YOUR_AUDIO_BECAUSE = "⌛ I deleted your audio because you didn't choose anything for {minutes} minutes. Send it again whenever you're ready."
+MSG_I_DELETED_YOUR_AUDIO_REFUNDED = "⌛ I deleted your audio because you didn't choose anything for {minutes} minutes, and {size} was given back to your daily limit. Send it again whenever you're ready."
+MSG_I_DELETED_YOUR_VIDEO_REFUNDED = "⌛ I deleted your video because you didn't choose anything for {IDLE_FILE_TTL_MINUTES} minutes, and {size} was given back to your daily limit. Send it again whenever you're ready."
+MSG_EVICTED_MAKE_ROOM = "⌛ I had to delete your video to make room for other people's files. Send it again whenever you're ready."
+MSG_EVICTED_MAKE_ROOM_REFUNDED = "⌛ I had to delete your video to make room for other people's files, and {size} was given back to your daily limit. Send it again whenever you're ready."
 
 
-def goal_ppd(u: dict) -> int:
-    return -(-TOTAL_PAGES // u["goal_days"])
+# ============================================================
+# Configuration
+# ============================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+TELEGRAM_API_URL = os.getenv(
+    "TELEGRAM_API_URL",
+    "http://localhost:8081",
+)
+
+TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video-compressor")
+
+# ------------------------------------------------------------
+# Access control
+#
+# Three ways a user gets in:
+#   1. ADMIN_USER_ID below — always allowed, and the only person who
+#      can approve/deny others.
+#   2. ALLOWED_USER_IDS — hard-coded in the repo (the original list).
+#   3. Approved users — anyone the admin taps "Accept" for. Someone
+#      who isn't allowed just messages the bot; the admin gets a
+#      request (name, username, ID) with Accept / Deny buttons. Accepted
+#      IDs are saved in Database.zip, and every few minutes (if anything
+#      changed) the bot posts a fresh Database.zip in the private BACKUP
+#      CHANNEL and PINS it.
+#
+# Railway wipes local files on every redeploy (no Volume needed here):
+# when the bot starts it downloads the Database.zip pinned in the backup
+# channel and restores from it, so the pinned file IS the backup.
+# ------------------------------------------------------------
+# The one and only admin. Deliberately NOT read from an environment variable.
+ADMIN_USER_ID = 940770584
+
+# True = everyone can use the bot (no approval needed). Set the OPEN_ACCESS
+# variable to 0 in Railway to bring the approval system back.
+OPEN_ACCESS = os.getenv("OPEN_ACCESS", "1").strip().lower() not in ("0", "false", "no")
+
+# The private channel where Database.zip is posted + pinned. The bot must
+# be an ADMIN there with the "Post messages" and "Pin messages" rights.
+# Override with the BACKUP_CHANNEL_ID variable in Railway if needed.
+# While it's 0 nothing is backed up (the local file is still written).
+BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "-1002891277206") or 0)
+
+# How often (seconds) the bot checks for changes and re-uploads Database.zip.
+BACKUP_INTERVAL_SECONDS = int(os.getenv("BACKUP_INTERVAL_SECONDS", "300"))
+
+# Local copy of the save file (wiped by Railway on redeploy — the pinned
+# copy in the channel is the real backup).
+DATABASE_FILE = Path(
+    os.getenv("DATABASE_FILE", str(Path(__file__).resolve().parent / "Database.zip"))
+)
+
+ALLOWED_USER_IDS: set[int] = {
+    940770584,
+   5879238618,
+   6608494574,
+    6651204891,
+    1194780815,
+    5879238618,
+    2112316128,
+    7504848343,
+    5131223597,
+}
+
+# user_id -> {"name": str, "username": str | None, "approved_at": iso str}
+approved_users: dict[int, dict] = {}
+
+# Requests waiting on the admin's decision (user_id -> info). Kept in
+# memory only: after a restart the user just tries again.
+pending_access_requests: dict[int, dict] = {}
+
+# Users the admin denied this session — remembered so they can't spam
+# the admin with new requests (the admin can still flip it to Accept
+# from the original request message).
+denied_users: set[int] = set()
+
+# user_id -> last time we told them "still waiting"/"denied", so a
+# burst of messages (e.g. an album of videos) gets one reply, not ten.
+_last_access_notice: dict[int, float] = {}
+ACCESS_NOTICE_COOLDOWN_SECONDS = 60
 
 
-def apply_goal(chat_id: int, days: int) -> str:
-    u = get_user(chat_id)
-    ppd = -(-TOTAL_PAGES // days)
-    now = user_now(u)
-    today = now.strftime("%Y-%m-%d")
-    start = today
-    if u["last_done"] == today:  # خلّص ورد النهاردة قبل ما يحدد الهدف
-        start = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-    update_user(chat_id, goal_days=days, goal_start=start, goal_read=0, pages_per_day=ppd)
-    finish = -(-TOTAL_PAGES // ppd)
-    text = (
-        f"🎯 تمام! هتختم القرآن في {ar(days)} يوم بإذن الله\n"
-        f"📄 وردك: {ar(ppd)} صفحة في اليوم\n"
-        f"(هتخلّص فعلياً في حوالي {ar(finish)} يوم)"
-    )
-    if start != today:
-        text += "\nالهدف هيبدأ من بكرة لأنك خلّصت ورد النهاردة."
-    return text
-
-
-def goal_status(u: dict) -> dict | None:
-    """مقارنة تقدّمك بجدول الهدف (بالصفحات والأيام)."""
-    if not u["goal_days"] or not u["goal_start"]:
-        return None
-    now = user_now(u)
-    today = now.strftime("%Y-%m-%d")
-    t = datetime.strptime(today, "%Y-%m-%d").date()
-    s = datetime.strptime(u["goal_start"], "%Y-%m-%d").date()
-    started = t >= s
-    elapsed = max(0, (t - s).days)
-    bonus = 1 if (started and u["last_done"] == today) else 0
-    gp = goal_ppd(u)
-    expected = min(TOTAL_PAGES, gp * (elapsed + bonus)) if started else 0
-    diff_pages = u["goal_read"] - expected
-    remaining = max(0, TOTAL_PAGES - u["goal_read"])
-    remaining_days = u["goal_days"] - elapsed - bonus if started else u["goal_days"]
-    needed = -(-remaining // remaining_days) if remaining_days > 0 else None
-    return {
-        "started": started,
-        "goal_ppd": gp,
-        "expected": expected,
-        "diff_pages": diff_pages,
-        "diff_days": diff_pages / gp,
-        "remaining": remaining,
-        "remaining_days": remaining_days,
-        "needed": needed,
-    }
-
-
-def goal_lines(u: dict) -> list[str]:
-    g = goal_status(u)
-    if g is None:
-        return []
-    lines = [
-        f"🎯 هدف الختمة: {ar(u['goal_days'])} يوم ({ar(g['goal_ppd'])} صفحة في اليوم)",
-        f"أنجزت {ar(u['goal_read'])} من {ar(TOTAL_PAGES)} صفحة",
-    ]
-    if not g["started"]:
-        lines.append("🕐 الهدف هيبدأ من بكرة")
-    elif g["remaining_days"] <= 0 and g["remaining"] > 0:
-        lines.append("⏰ ميعاد الهدف عدّى. تقدر تحدد هدف جديد من الإعدادات")
-    elif abs(g["diff_days"]) < 0.5:
-        lines.append("✅ ماشي على الجدول")
-    elif g["diff_days"] > 0:
-        lines.append(f"🚀 قدّام الجدول بحوالي {ar(max(1, round(g['diff_days'])))} يوم")
-    else:
-        lines.append(f"⚠️ ورا الجدول بحوالي {ar(max(1, round(-g['diff_days'])))} يوم")
-        if g["needed"] and g["needed"] > u["pages_per_day"]:
-            lines.append(f"عشان تلحق محتاج تقرا {ar(g['needed'])} صفحة في اليوم")
-    return lines
-
-
-# ───────────────────────── تذكيرات الورد ─────────────────────────
-def reminder_passed_today(u: dict) -> bool:
-    now = user_now(u)
-    h, m = map(int, u["remind_time"].split(":"))
-    return (now.hour, now.minute) >= (h, m)
-
-
-def sync_catchup_marker(u: dict):
-    """بعد تغيير الميعاد/المنطقة: لو ميعاد النهاردة عدّى بنعتبره "فات" عشان
-    متجيش رسالة تعويض غلط بعد الريستارت، ولو لسه مجاش بنفضّي العلامة."""
-    u["last_sent"] = user_now(u).strftime("%Y-%m-%d") if reminder_passed_today(u) else None
-    mark_dirty()
-
-
-def needs_catchup(u: dict) -> bool:
-    """ميعاد وردك فات النهاردة ومبعتناش ولا خلّصت؟"""
-    if not u["reminders_on"] or u["blocked"]:
+def is_allowed(user_id: int | None) -> bool:
+    if user_id is None:
         return False
-    today = user_now(u).strftime("%Y-%m-%d")
-    if u["last_done"] == today or u.get("last_sent") == today:
-        return False
-    return reminder_passed_today(u)
 
-
-def schedule_reminder(app: Application, user: dict):
-    name = f"remind_{user['chat_id']}"
-    for job in app.job_queue.get_jobs_by_name(name):
-        job.schedule_removal()
-    if not user["reminders_on"] or user["blocked"]:
-        return
-    h, m = map(int, user["remind_time"].split(":"))
-    app.job_queue.run_daily(
-        reminder_job,
-        time=time(h, m, tzinfo=ZoneInfo(user["tz"])),
-        chat_id=user["chat_id"],
-        name=name,
-    )
-
-
-async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-    if get_user(chat_id)["blocked"]:
-        return
-    outbox.put("wird", chat_id, mode="reminder")
-
-
-async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
-    """بعد أي ريستارت: بيحط في الطابور ورد النهاردة لكل واحد معاده فات والبوت كان واقف."""
-    due = [u["chat_id"] for u in list(state["users"].values()) if needs_catchup(u)]
-    for chat_id in due:
-        outbox.put("wird", chat_id, mode="late")
-    if due:
-        log.info("Catch-up: %d users missed today's reminder.", len(due))
-
-
-async def deliver_today(
-    bot, chat_id: int, user, reminder: bool = False, late: bool = False
-):
-    pages = today_pages(user)
-    today = user_now(user).strftime("%Y-%m-%d")
-    if user["last_done"] == today:
-        await bot.send_message(
-            chat_id, "✅ إنت خلّصت ورد النهاردة قبل كده، تقبّل الله منك 🤍"
-        )
-        return
-    if late:
-        head = "🔔 معاد وردك عدّى والبوت كان واقف شوية، ورد النهاردة أهو"
-    elif reminder:
-        head = "🔔 جه معاد وردك"
-    else:
-        head = "📖 ورد النهاردة"
-    await bot.send_message(
-        chat_id,
-        f"{head}\nالصفحات من {ar(pages[0])} لـ {ar(pages[-1])} ({ar(len(pages))} صفحة)",
-    )
-    await send_pages(bot, chat_id, pages)
-    update_user(chat_id, last_sent=today)
-    await bot.send_message(
-        chat_id, "لما تخلّص دوس على الزرار 👇", reply_markup=done_keyboard()
-    )
-
-
-# ───────────────────────── طابور الإرسال + المستخدمين الحاظرين ─────────────────────────
-def is_gone(e: Exception) -> bool:
-    """المستخدم عامل بلوك للبوت أو حسابه اتمسح."""
-    return isinstance(e, Forbidden) or (
-        isinstance(e, BadRequest) and "chat not found" in str(e).lower()
-    )
-
-
-def mark_blocked(chat_id: int):
-    u = get_user(chat_id)
-    if u["blocked"]:
-        return
-    update_user(chat_id, blocked=True)
-    if APP is not None:
-        schedule_reminder(APP, u)  # بيشيل التذكير المجدول
-    log.info("User %s blocked the bot; reminders paused.", chat_id)
-
-
-def unblock(app: Application, chat_id: int):
-    u = state["users"].get(str(chat_id))
-    if u and u["blocked"]:
-        update_user(chat_id, blocked=False)
-        schedule_reminder(app, u)
-        log.info("User %s is back.", chat_id)
-
-
-def on_send_failed(kind: str, chat_id: int, data: dict):
-    """لو تعويض فشل، نعلّم إننا حاولنا النهاردة عشان منحاولش في كل ريستارت."""
-    if kind == "wird" and data.get("mode") == "late":
-        u = get_user(chat_id)
-        update_user(chat_id, last_sent=user_now(u).strftime("%Y-%m-%d"))
-
-
-async def dispatch(bot, kind: str, chat_id: int, data: dict):
-    u = get_user(chat_id)
-    if u["blocked"]:
-        return
-    if kind == "wird":
-        mode = data.get("mode", "reminder")
-        if mode == "late" and not needs_catchup(u):
-            return  # اتغيّر حاجة وهو في الطابور
-        await deliver_today(
-            bot, chat_id, u, reminder=(mode == "reminder"), late=(mode == "late")
-        )
-    elif kind == "prayer":
-        await send_prayer_warning(bot, chat_id, **data)
-
-
-class Outbox:
-    """طابور بيبعت للمستخدمين واحد واحد بفاصل SEND_GAP، بيحترم الـ flood-wait
-    بتاع تليجرام، ومبيحطّش نفس المهمة مرتين."""
-
-    def __init__(self):
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.pending: set = set()
-
-    def put(self, kind: str, chat_id: int, **data) -> bool:
-        key = (kind, chat_id, tuple(sorted(data.items())))
-        if key in self.pending:
-            return False
-        self.pending.add(key)
-        self.queue.put_nowait((key, kind, chat_id, data, 0))
+    if OPEN_ACCESS:
         return True
 
-    async def process(self, bot, item):
-        key, kind, chat_id, data, attempt = item
-        requeue = False
+    return (
+        user_id == ADMIN_USER_ID
+        or user_id in ALLOWED_USER_IDS
+        or user_id in approved_users
+    )
+
+
+def is_admin(user_id: int | None) -> bool:
+    return user_id is not None and user_id == ADMIN_USER_ID
+
+
+def user_display_name(user) -> str:
+    """'First Last' from a Telegram user object (falls back to 'Unknown')."""
+    parts = [getattr(user, "first_name", None), getattr(user, "last_name", None)]
+    name = " ".join(part for part in parts if part)
+    return name or "Unknown"
+
+
+def format_username(username: str | None) -> str:
+    return f"@{username}" if username else "none"
+
+
+def approved_users_payload() -> dict:
+    return {
+        "approved_users": [
+            {"id": user_id, **info}
+            for user_id, info in sorted(approved_users.items())
+        ]
+    }
+
+
+def approved_users_json_bytes() -> bytes:
+    return json.dumps(approved_users_payload(), indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def save_approved_users() -> bool:
+    """Write Database.zip to disk (atomically). Returns False if it couldn't."""
+    try:
+        DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = DATABASE_FILE.with_suffix(".zip.tmp")
+        temp_path.write_bytes(build_database_zip())
+        os.replace(temp_path, DATABASE_FILE)
+        return True
+    except OSError:
+        logger.exception("Could not save %s", DATABASE_FILE)
+        return False
+
+
+def merge_approved_users(raw: bytes) -> int:
+    """
+    Merge users from JSON bytes into approved_users. Accepts the file
+    this bot sends ({"approved_users": [{"id": ..., ...}]}) or a bare
+    list of IDs / user objects. Returns how many NEW users were added.
+    Raises ValueError if the content isn't usable.
+    """
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"not valid JSON ({error})") from error
+
+    entries = data.get("approved_users") if isinstance(data, dict) else data
+
+    if not isinstance(entries, list):
+        raise ValueError('expected {"approved_users": [...]} or a list of IDs')
+
+    added = 0
+
+    for entry in entries:
+        if isinstance(entry, dict):
+            raw_id, info = entry.get("id"), {k: v for k, v in entry.items() if k != "id"}
+        else:
+            raw_id, info = entry, {}
+
         try:
-            await dispatch(bot, kind, chat_id, data)
-        except RetryAfter as e:
-            ra = e.retry_after
-            wait = ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)
-            await asyncio.sleep(wait + RETRY_PAD)
-            if attempt + 1 < SEND_RETRIES:
-                self.queue.put_nowait((key, kind, chat_id, data, attempt + 1))
-                requeue = True
-            else:
-                log.warning("Giving up on %s for %s after flood waits.", kind, chat_id)
-                on_send_failed(kind, chat_id, data)
-        except TelegramError as e:
-            if is_gone(e):
-                mark_blocked(chat_id)
-            else:
-                log.warning("Send %s to %s failed: %s", kind, chat_id, e)
-                on_send_failed(kind, chat_id, data)
-        except Exception:
-            log.exception("Outbox job %s for %s crashed", kind, chat_id)
-        finally:
-            if not requeue:
-                self.pending.discard(key)
+            user_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
 
-    async def run(self, bot):
-        while True:
-            item = await self.queue.get()
-            await self.process(bot, item)
-            await asyncio.sleep(SEND_GAP)
+        if user_id not in approved_users:
+            added += 1
 
-    async def drain(self, bot):
-        """بيفضّي الطابور فوراً (للاختبارات)."""
-        while not self.queue.empty():
-            await self.process(bot, self.queue.get_nowait())
+        approved_users[user_id] = {
+            "name": info.get("name") or approved_users.get(user_id, {}).get("name") or "Unknown",
+            "username": info.get("username") or approved_users.get(user_id, {}).get("username"),
+            "approved_at": info.get("approved_at")
+            or approved_users.get(user_id, {}).get("approved_at")
+            or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+
+    return added
 
 
-# ───────────────────────── تنبيهات الصلاة ─────────────────────────
-prayer_sent: set = set()    # (chat_id, يوم, صلاة, مرحلة) اتبعتت
-prayer_prayed: set = set()  # (chat_id, يوم, صلاة) المستخدم داس "لقد صليت"
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+def load_approved_users() -> None:
+    """Load the saved Database.zip at startup (missing file = empty list)."""
+    if not DATABASE_FILE.exists():
+        logger.info("No %s yet — starting with no approved users.", DATABASE_FILE)
+        return
+
+    try:
+        read_database_bytes(DATABASE_FILE.read_bytes())
+        logger.info("Loaded %d approved user(s) from %s", len(approved_users), DATABASE_FILE)
+    except (OSError, ValueError):
+        logger.exception("Couldn't read %s — starting with no approved users.", DATABASE_FILE)
 
 
-def prayer_due(u: dict, now: datetime) -> list:
-    """التنبيهات المستحقة دلوقتي للمستخدم: [(صلاة, مرحلة, وقت الصلاة, تاريخها)]."""
-    if not u["prayer_on"] or u["lat"] is None or u["blocked"]:
-        return []
-    n = next_prayer(u["lat"], u["lon"], u["tz"], now)
-    if n is None:
-        return []
-    name, at, day = n
-    cid = u["chat_id"]
-    if not u["prayers"].get(name, True) or (cid, day, name) in prayer_prayed:
-        return []
-    mins = (at - now).total_seconds() / 60
-    return [
-        (name, stage, at, day)
-        for stage in WARN_STAGES
-        if stage - WARN_WINDOW < mins <= stage and (cid, day, name, stage) not in prayer_sent
+def access_request_text(user_id: int, info: dict, status: str | None = None) -> str:
+    lines = [
+        MSG_ACCESS_REQUEST if status is None else MSG_ACCESS_REQUEST_DECIDED,
+        "",
+        MSG_NAME.format(name=info.get('name') or 'Unknown'),
+        MSG_USERNAME.format(username=format_username(info.get('username'))),
+        MSG_ID.format(user_id=user_id),
     ]
 
+    if status:
+        lines += ["", status]
 
-async def prayer_tick(context: ContextTypes.DEFAULT_TYPE):
-    now = now_utc()
-    for u in list(state["users"].values()):
-        for name, stage, at, day in prayer_due(u, now):
-            prayer_sent.add((u["chat_id"], day, name, stage))
-            outbox.put(
-                "prayer", u["chat_id"],
-                name=name, stage=stage, day=day, at=at.strftime("%H:%M"),
-            )
-    old = (now.date() - timedelta(days=2)).isoformat()  # نمسح الذاكرة القديمة
-    for s in (prayer_sent, prayer_prayed):
-        for k in [k for k in s if k[1] < old]:
-            s.discard(k)
+    return "\n".join(lines)
 
 
-async def send_prayer_warning(bot, chat_id: int, name: str, stage: int, day: str, at: str):
-    if (chat_id, day, name) in prayer_prayed:
+def access_request_keyboard(user_id: int, state: str = "pending") -> InlineKeyboardMarkup:
+    """state: 'pending' (Accept/Deny), 'accepted' (Revoke), 'denied' (Accept instead)."""
+    if state == "accepted":
+        rows = [[InlineKeyboardButton(BTN_REVOKE_ACCESS, callback_data=f"access:revoke:{user_id}")]]
+    elif state == "denied":
+        rows = [[InlineKeyboardButton(BTN_ACCEPT_INSTEAD, callback_data=f"access:accept:{user_id}")]]
+    elif state == "revoked":
+        rows = [[InlineKeyboardButton(BTN_ACCEPT_AGAIN, callback_data=f"access:accept:{user_id}")]]
+    else:
+        rows = [[
+            InlineKeyboardButton(BTN_ACCEPT, callback_data=f"access:accept:{user_id}"),
+            InlineKeyboardButton(BTN_DENY, callback_data=f"access:deny:{user_id}"),
+        ]]
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def reject_unauthorized(message, user_id: int | None) -> None:
+    """
+    Someone who isn't allowed tried to use the bot. Instead of a dead
+    end, forward a request (name, username, ID + Accept/Deny buttons)
+    to the admin — once; repeat attempts while it's pending just get a
+    short "still waiting" reply.
+    """
+    if user_id is None:
         return
-    h, m = map(int, at.split(":"))
-    when = "ساعة" if stage == 60 else "نص ساعة"
-    tail = "جهّز نفسك 🤍" if stage == 60 else "لو صلّيت دوس على الزرار 👇"
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ لقد صليت", callback_data=f"prayed_{name}_{day}")]]
-    )
-    await bot.send_message(
-        chat_id,
-        f"🕌 فاضل {when} على صلاة {PRAYER_AR[name]} ({fmt12(h, m)})\n{tail}",
-        reply_markup=kb,
+
+    now = time.monotonic()
+
+    def should_notify_user() -> bool:
+        last = _last_access_notice.get(user_id, 0.0)
+        if now - last < ACCESS_NOTICE_COOLDOWN_SECONDS:
+            return False
+        _last_access_notice[user_id] = now
+        return True
+
+    if user_id in denied_users:
+        if should_notify_user():
+            await message.reply_text(MSG_YOUR_ACCESS_REQUEST_WAS_DECLINED)
+        return
+
+    if user_id in pending_access_requests:
+        if should_notify_user():
+            await message.reply_text(
+                MSG_YOUR_REQUEST_IS_STILL_WAITING
+            )
+        return
+
+    user = message.from_user
+    info = {
+        "name": user_display_name(user),
+        "username": getattr(user, "username", None),
+    }
+
+    try:
+        await message.get_bot().send_message(
+            chat_id=ADMIN_USER_ID,
+            text=access_request_text(user_id, info),
+            reply_markup=access_request_keyboard(user_id),
+        )
+    except Exception:
+        logger.exception("Couldn't send the access request for %s to the admin", user_id)
+        if should_notify_user():
+            await message.reply_text(
+                MSG_I_COULDN_T_REACH_THE
+            )
+        return
+
+    pending_access_requests[user_id] = {**info, "requested_at": now}
+    _last_access_notice[user_id] = now
+
+    await message.reply_text(
+        MSG_YOU_RE_NOT_APPROVED_TO
     )
 
 
-def prayer_text(u: dict) -> str:
-    city = html.escape(u["city"]) if u["city"] else "مش محددة ⚠️"
-    status = "شغّالة ✅" if u["prayer_on"] else "واقفة ⏸"
-    text = (
-        "🕌 <b>تنبيهات الصلاة</b>\n"
-        "بنبّهك قبل كل صلاة بساعة وبنص ساعة. ولو دوست «لقد صليت» مش هنبّهك تاني "
-        "لنفس الصلاة.\n\n"
-        f"الحالة: {status}\n"
-        f"المدينة: {city}"
+# ------------------------------------------------------------
+# Database.zip — the save file pinned in the backup channel
+#
+# Every BACKUP_INTERVAL_SECONDS the bot checks whether the data changed
+# since the last upload. If it did, it posts a fresh Database.zip in the
+# backup channel, pins it and unpins the old one. On startup the pinned
+# Database.zip is downloaded and restored. To save more data in future,
+# add another file inside build_database_zip() and read it back in
+# read_database_bytes().
+# ------------------------------------------------------------
+DATABASE_ZIP_FILENAME = "Database.zip"
+USERS_ENTRY_NAME = "approved_users.json"
+STATS_ENTRY_NAME = "stats.json"
+MAX_DATABASE_ENTRY_BYTES = 10 * 1024 * 1024
+
+_last_backed_up_fingerprint: str | None = None
+_backup_lock = asyncio.Lock()
+_backup_warning_sent = False
+
+
+def build_database_zip() -> bytes:
+    """The whole save as the bytes of a Database.zip."""
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(USERS_ENTRY_NAME, approved_users_json_bytes())
+        archive.writestr(STATS_ENTRY_NAME, stats_json_bytes())
+        archive.writestr(QUOTA_ENTRY_NAME, quota_json_bytes())
+        archive.writestr(SUBS_ENTRY_NAME, subscriptions_json_bytes())
+        archive.writestr(REFERRALS_ENTRY_NAME, referrals_json_bytes())
+        archive.writestr(EVENT_ENTRY_NAME, event_json_bytes())
+        archive.writestr(PRICES_ENTRY_NAME, prices_json_bytes())
+
+    return buffer.getvalue()
+
+
+def database_fingerprint() -> str:
+    """Changes only when the saved data changes (zip bytes carry timestamps, so hash the data)."""
+    return hashlib.sha256(
+        approved_users_json_bytes() + b"|" + stats_json_bytes() + b"|" + quota_json_bytes()
+        + b"|" + subscriptions_json_bytes() + b"|" + referrals_json_bytes() + b"|" + event_json_bytes()
+        + b"|" + prices_json_bytes()
+    ).hexdigest()
+
+
+def read_database_bytes(raw: bytes) -> int:
+    """
+    Merge a save into memory. Accepts a Database.zip, or an old
+    approved_users .json. Returns how many NEW users were added.
+    Raises ValueError if the content isn't usable.
+    """
+    if not zipfile.is_zipfile(io.BytesIO(raw)):
+        return merge_approved_users(raw)
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            try:
+                entry = archive.getinfo(USERS_ENTRY_NAME)
+            except KeyError:
+                raise ValueError(f"the zip has no {USERS_ENTRY_NAME} inside") from None
+
+            if entry.file_size > MAX_DATABASE_ENTRY_BYTES:
+                raise ValueError("the zip's contents are too large")
+
+            added = merge_approved_users(archive.read(entry))
+
+            if STATS_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_stats_bytes(archive.read(STATS_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the stats.", STATS_ENTRY_NAME)
+
+            if QUOTA_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_quota_bytes(archive.read(QUOTA_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the daily limits.", QUOTA_ENTRY_NAME)
+
+            if SUBS_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_subscriptions_bytes(archive.read(SUBS_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the subscriptions.", SUBS_ENTRY_NAME)
+
+            if REFERRALS_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_referrals_bytes(archive.read(REFERRALS_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the invites.", REFERRALS_ENTRY_NAME)
+
+            if EVENT_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_event_bytes(archive.read(EVENT_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the event.", EVENT_ENTRY_NAME)
+
+            if PRICES_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_prices_bytes(archive.read(PRICES_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the prices.", PRICES_ENTRY_NAME)
+
+            return added
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"not a valid zip ({error})") from error
+
+
+async def warn_admin_once(bot, text: str) -> None:
+    """Tell the admin about a backup problem once (not every 5 minutes)."""
+    global _backup_warning_sent
+
+    if _backup_warning_sent:
+        return
+
+    _backup_warning_sent = True
+
+    try:
+        await bot.send_message(chat_id=ADMIN_USER_ID, text=text)
+    except Exception:
+        logger.warning("Couldn't send the backup warning to the admin")
+
+
+async def backup_database_if_changed(bot, force: bool = False) -> bool:
+    """Upload + pin a fresh Database.zip if the data changed. Returns True if it uploaded."""
+    global _last_backed_up_fingerprint, _backup_warning_sent
+
+    if not BACKUP_CHANNEL_ID:
+        return False
+
+    async with _backup_lock:
+        fingerprint = database_fingerprint()
+
+        if not force and fingerprint == _last_backed_up_fingerprint:
+            return False
+
+        save_approved_users()
+        count = len(approved_users)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        try:
+            sent = await with_retries(
+                bot.send_document,
+                chat_id=BACKUP_CHANNEL_ID,
+                document=build_database_zip(),
+                filename=DATABASE_ZIP_FILENAME,
+                caption=(
+                    MSG_DATABASE_BACKUP_APPROVED_USER_S.format(count=count, totals_jobs=stats['totals']['jobs'], stamp=stamp)
+                ),
+                disable_notification=True,
+            )
+        except Exception as error:
+            logger.exception("Couldn't post Database.zip to channel %s", BACKUP_CHANNEL_ID)
+            await warn_admin_once(
+                bot,
+                MSG_I_COULDN_T_POST_DATABASE.format(BACKUP_CHANNEL_ID=BACKUP_CHANNEL_ID, error=error),
+            )
+            return False
+
+        _last_backed_up_fingerprint = fingerprint
+        pinned = await pin_backup_file(bot, sent)
+
+        if pinned:
+            _backup_warning_sent = False
+
+        logger.info("Database.zip backed up to channel %s (%d user(s)).", BACKUP_CHANNEL_ID, count)
+        return True
+
+
+async def pin_backup_file(bot, sent_message) -> bool:
+    """
+    Pin the freshly posted Database.zip, then unpin the previous one so
+    the pinned message is always the newest save. The new one is pinned
+    FIRST, so a failure can never leave the channel with no pinned backup.
+    """
+    old_message_id = None
+
+    try:
+        chat = await bot.get_chat(BACKUP_CHANNEL_ID)
+        old = getattr(chat, "pinned_message", None)
+        old_document = getattr(old, "document", None) if old is not None else None
+
+        if (
+            old is not None
+            and old.message_id != sent_message.message_id
+            and old_document is not None
+            and (old_document.file_name or "").lower().endswith((".zip", ".json"))
+        ):
+            old_message_id = old.message_id
+    except Exception:
+        logger.warning("Couldn't look up the previously pinned backup in %s", BACKUP_CHANNEL_ID)
+
+    try:
+        await bot.pin_chat_message(
+            chat_id=BACKUP_CHANNEL_ID,
+            message_id=sent_message.message_id,
+            disable_notification=True,
+        )
+    except Exception:
+        logger.exception("Couldn't pin Database.zip in %s", BACKUP_CHANNEL_ID)
+        await warn_admin_once(
+            bot,
+            MSG_I_POSTED_DATABASE_ZIP_IN,
+        )
+        return False
+
+    if old_message_id is not None:
+        try:
+            await bot.unpin_chat_message(chat_id=BACKUP_CHANNEL_ID, message_id=old_message_id)
+        except Exception:
+            logger.warning("Couldn't unpin the previous backup (message %s)", old_message_id)
+
+    return True
+
+
+async def restore_from_pinned_backup(bot) -> None:
+    """
+    At startup: download the Database.zip pinned in the backup channel and
+    restore it. Railway wipes local files on every redeploy, so this is
+    what brings the data back.
+    """
+    global _last_backed_up_fingerprint
+
+    if not BACKUP_CHANNEL_ID:
+        return
+
+    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    temp_path = Path(TEMP_DIR) / "pinned_backup.bin"
+    had_data_before = bool(approved_users) or _stats_activity(stats) > 0
+
+    try:
+        chat = await bot.get_chat(BACKUP_CHANNEL_ID)
+        pinned = getattr(chat, "pinned_message", None)
+        document = getattr(pinned, "document", None) if pinned is not None else None
+
+        if document is None:
+            logger.info("No pinned Database.zip in channel %s — nothing to restore.", BACKUP_CHANNEL_ID)
+            return
+
+        telegram_file = await with_retries(bot.get_file, document.file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(temp_path))
+
+        added = read_database_bytes(temp_path.read_bytes())
+        save_approved_users()
+
+        # Fresh server (no local data before) => memory now equals the pinned
+        # file, so there's no need to upload an identical copy.
+        if not had_data_before:
+            _last_backed_up_fingerprint = database_fingerprint()
+
+        logger.info(
+            "Restored from the pinned Database.zip: %d new user(s), %d approved in total.",
+            added, len(approved_users),
+        )
+
+        if added:
+            await bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    MSG_BOT_RESTARTED_RESTORED_APPROVED_USER.format(added=added, count_approved_users=len(approved_users))
+                ),
+            )
+    except Exception:
+        logger.exception("Couldn't restore from the pinned Database.zip.")
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+async def backup_loop(bot) -> None:
+    """Every BACKUP_INTERVAL_SECONDS: upload a new Database.zip if anything changed."""
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
+
+        try:
+            await backup_database_if_changed(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Backup check failed")
+
+
+async def post_init(application: Application) -> None:
+    if os.environ.get(RESTART_ENV_FLAG):
+        with contextlib.suppress(Exception):
+            await application.bot.send_message(chat_id=ADMIN_USER_ID, text=MSG_RAM_CLEAN_BACK)
+
+    swept = sweep_temp_dir()
+    if swept:
+        logger.info("Removed %d leftover item(s) from %s", swept, TEMP_DIR)
+
+    await restore_from_pinned_backup(application.bot)
+    application.bot_data["backup_task"] = asyncio.create_task(backup_loop(application.bot))
+    application.bot_data["idle_task"] = asyncio.create_task(idle_cleanup_loop(application.bot))
+
+
+async def post_stop(application: Application) -> None:
+    """On shutdown/redeploy: stop the loop and make one last upload if something changed."""
+    for key in ("backup_task", "idle_task"):
+        task = application.bot_data.pop(key, None)
+
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    try:
+        await asyncio.wait_for(backup_database_if_changed(application.bot), timeout=8)
+    except Exception:
+        logger.warning("Final backup before shutdown didn't finish.")
+
+
+async def report_forwarded_channel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin forwards a text post from a channel -> reply with that channel's ID."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    origin_chat = getattr(getattr(message, "forward_origin", None), "chat", None)
+
+    if origin_chat is None or getattr(origin_chat, "type", None) != "channel":
+        return
+
+    await message.reply_text(
+        MSG_THAT_CHANNEL_S_ID_IS.format(origin_chat_id=origin_chat.id)
     )
-    if u["lat"] is not None:
-        n = next_prayer(u["lat"], u["lon"], u["tz"], now_utc())
-        if n:
-            text += f"\nأقرب صلاة: {PRAYER_AR[n[0]]} الساعة {fmt12(n[1].hour, n[1].minute)}"
-    text += "\n\n(المواعيد تقريبية، اتأكد منها من مصدر رسمي)"
+
+
+async def resolve_user_info(bot, user_id: int) -> dict:
+    """Best-effort name/username for a user we no longer have a pending entry for (e.g. after a restart)."""
+    known = pending_access_requests.get(user_id) or approved_users.get(user_id)
+    if known:
+        return {"name": known.get("name"), "username": known.get("username")}
+
+    try:
+        chat = await bot.get_chat(user_id)
+        return {"name": user_display_name(chat), "username": getattr(chat, "username", None)}
+    except Exception:
+        return {"name": f"User {user_id}", "username": None}
+
+
+async def handle_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin tapped Accept / Deny / Revoke on an access-request message."""
+    query = update.callback_query
+
+    if query is None or query.data is None:
+        return
+
+    if not is_admin(query.from_user.id if query.from_user else None):
+        await query.answer(MSG_ONLY_THE_ADMIN_CAN_DO, show_alert=True)
+        return
+
+    try:
+        _, decision, user_id_text = query.data.split(":", 2)
+        user_id = int(user_id_text)
+    except ValueError:
+        await query.answer()
+        return
+
+    if decision not in ("accept", "deny", "revoke"):
+        await query.answer()
+        return
+
+    bot = context.bot
+    info = await resolve_user_info(bot, user_id)
+
+    async def update_request_message(status: str, state: str) -> None:
+        try:
+            await query.edit_message_text(
+                access_request_text(user_id, info, status),
+                reply_markup=access_request_keyboard(user_id, state),
+            )
+        except Exception:
+            logger.exception("Couldn't edit the access request message for %s", user_id)
+
+    async def tell_user(text: str) -> None:
+        try:
+            await bot.send_message(chat_id=user_id, text=text)
+        except Exception:
+            # They may have blocked the bot or never opened the chat.
+            logger.warning("Couldn't notify user %s about their access decision", user_id)
+
+    if decision == "accept":
+        approved_users[user_id] = {
+            "name": info.get("name") or "Unknown",
+            "username": info.get("username"),
+            "approved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        pending_access_requests.pop(user_id, None)
+        denied_users.discard(user_id)
+        _last_access_notice.pop(user_id, None)
+
+        save_approved_users()
+
+        await query.answer(MSG_ACCEPTED)
+        await update_request_message(MSG_ACCEPTED_2, "accepted")
+        await tell_user(
+            MSG_GREEN_CARD_GRANTED_THE_ADMIN
+        )
+        # Database.zip is re-uploaded to the backup channel by the 5-minute loop.
+        return
+
+    if decision == "deny":
+        pending_access_requests.pop(user_id, None)
+        denied_users.add(user_id)
+
+        await query.answer(MSG_DENIED)
+        await update_request_message(MSG_DENIED_2, "denied")
+        await tell_user(MSG_YOUR_REQUEST_TO_USE_THIS)
+        return
+
+    # revoke
+    if user_id in ALLOWED_USER_IDS or user_id == ADMIN_USER_ID:
+        await query.answer(
+            MSG_THAT_USER_IS_HARD_CODED,
+            show_alert=True,
+        )
+        return
+
+    approved_users.pop(user_id, None)
+    denied_users.add(user_id)
+
+    save_approved_users()
+
+    await query.answer(MSG_ACCESS_REVOKED)
+    await update_request_message(MSG_ACCESS_REVOKED_2, "revoked")
+    await tell_user(MSG_YOUR_ACCESS_TO_THIS_BOT)
+    # Database.zip is re-uploaded to the backup channel by the 5-minute loop.
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _read_number(path: str) -> int | None:
+    text = _read_text(path)
+
+    if text is None:
+        return None
+
+    text = text.strip()
+
+    if not text.isdigit():
+        return None   # e.g. "max" = no limit
+
+    value = int(text)
+    return None if value >= (1 << 60) else value   # cgroup v1 shows "unlimited" as a huge number
+
+
+def _proc_rss_bytes(status_text: str | None) -> int:
+    """VmRSS (in bytes) out of a /proc/<pid>/status file."""
+    for line in (status_text or "").splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return int(parts[1]) * 1024
+
+    return 0
+
+
+def memory_snapshot() -> dict | None:
+    """Current RAM numbers, read straight from Linux (no extra packages). None if unreadable."""
+    result: dict = {}
+
+    # What the container is actually using, and its limit (cgroup v2, then v1).
+    used = _read_number("/sys/fs/cgroup/memory.current")
+    limit = _read_number("/sys/fs/cgroup/memory.max")
+    inactive_file_key = "inactive_file"
+    stat_text = _read_text("/sys/fs/cgroup/memory.stat")
+
+    if used is None:
+        used = _read_number("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        limit = _read_number("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        stat_text = _read_text("/sys/fs/cgroup/memory/memory.stat")
+        inactive_file_key = "total_inactive_file"
+
+    if used is not None:
+        # Cached file data is handed back when needed, so it isn't counted (same as `docker stats`).
+        for line in (stat_text or "").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == inactive_file_key and parts[1].isdigit():
+                used = max(0, used - int(parts[1]))
+                break
+
+        result["container_used"] = used
+        result["container_limit"] = limit
+
+    # The whole machine (on shared hosting this is bigger than the container's share).
+    meminfo = _read_text("/proc/meminfo")
+    if meminfo:
+        values = {}
+        for line in meminfo.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                values[parts[0].rstrip(":")] = int(parts[1]) * 1024
+
+        if "MemTotal" in values:
+            result["host_total"] = values["MemTotal"]
+            result["host_available"] = values.get("MemAvailable", values.get("MemFree", 0))
+
+    result["bot_rss"] = _proc_rss_bytes(_read_text("/proc/self/status"))
+
+    # FFmpeg processes started by the bot.
+    ffmpeg_count = 0
+    ffmpeg_rss = 0
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+
+            comm = _read_text(f"/proc/{entry}/comm")
+            if comm and comm.strip() == "ffmpeg":
+                ffmpeg_count += 1
+                ffmpeg_rss += _proc_rss_bytes(_read_text(f"/proc/{entry}/status"))
+    except OSError:
+        pass
+
+    result["ffmpeg_count"] = ffmpeg_count
+    result["ffmpeg_rss"] = ffmpeg_rss
+
+    if "container_used" not in result and "host_total" not in result:
+        return None
+
+    return result
+
+
+# Set by /ram_clean: once the bot has shut down cleanly, main() starts it again.
+RESTART_REQUESTED = False
+RESTART_ENV_FLAG = "BOT_RESTARTED_AT"
+
+
+def dir_size_bytes(path: Path) -> int:
+    total = 0
+
+    try:
+        for item in path.rglob("*"):
+            with contextlib.suppress(OSError):
+                if item.is_file():
+                    total += item.stat().st_size
+    except OSError:
+        pass
+
+    return total
+
+
+def kill_stray_ffmpeg() -> None:
+    """Stop any FFmpeg/FFprobe still running (so nothing keeps writing to deleted files)."""
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit() or int(entry) == os.getpid():
+                continue
+
+            comm = _read_text(f"/proc/{entry}/comm")
+            if comm and comm.strip() in ("ffmpeg", "ffprobe"):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(int(entry), signal.SIGKILL)
+    except OSError:
+        pass
+
+
+async def ram_clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ram_clean (admin only): asks for confirmation, then clears everything and restarts."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    running = sum(1 for job in running_jobs.values() if not job.get("done"))
+    menus = max(0, len(pending_compressions) - running)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(BTN_YES_CLEAN_RESTART, callback_data="ramclean:yes:0"),
+        InlineKeyboardButton(BTN_CANCEL, callback_data="ramclean:no:0"),
+    ]])
+
+    await message.reply_text(
+        MSG_RAM_CLEAN_CONFIRM.format(
+            running=running,
+            menus=menus,
+            temp_size=format_size(dir_size_bytes(Path(TEMP_DIR))),
+        ),
+        reply_markup=keyboard,
+    )
+
+
+async def perform_ram_clean(query) -> None:
+    """The confirmed part of /ram_clean. Never leaves the bot half-cleaned: it always ends in a restart."""
+    global RESTART_REQUESTED
+
+    # Guard against a restart loop (e.g. the confirmation tap being delivered again).
+    restarted_at = os.environ.get(RESTART_ENV_FLAG)
+    if restarted_at:
+        try:
+            if time.time() - float(restarted_at) < 45:
+                await query.edit_message_text(MSG_RAM_CLEAN_TOO_SOON)
+                return
+        except ValueError:
+            pass
+
+    await query.edit_message_text(MSG_RAM_CLEAN_WORKING)
+
+    temp_before = dir_size_bytes(Path(TEMP_DIR))
+
+    # 1. Cancel running jobs the normal way (their quota is refunded and the people are told).
+    jobs_cancelled = 0
+    cancelled_ids: list[int] = []
+    for source_id, job in list(running_jobs.items()):
+        if job.get("done"):
+            continue
+
+        job["cancelled"] = True
+        jobs_cancelled += 1
+        cancelled_ids.append(source_id)
+        process = job.get("process")
+
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+
+    # Give them a moment to wind down: refund, "cancelled" message and file cleanup.
+    # (A job leaves active_job_ids only at the very end of all that.)
+    for _ in range(30):
+        if not any(source_id in active_job_ids for source_id in cancelled_ids):
+            break
+        await asyncio.sleep(0.5)
+
+    # 2. Open menus: give the daily limit back, then remove their files.
+    menus_removed = 0
+    for message_id in list(pending_compressions):
+        if message_id in active_job_ids:
+            continue   # still being handled by a job (it refunds / cleans up itself)
+
+        entry = pending_compressions.get(message_id) or {}
+        owner_id = entry.get("owner_id")
+        charged = int(entry.get("charged_bytes") or 0)
+
+        if owner_id is not None and charged > 0:
+            quota_refund(owner_id, charged)
+
+        clear_pending(message_id)
+        menus_removed += 1
+
+    # 3. Anything else on disk.
+    kill_stray_ffmpeg()
+    files_deleted = menus_removed + sweep_temp_dir()
+
+    await with_retries(
+        query.edit_message_text,
+        MSG_RAM_CLEAN_DONE.format(
+            jobs=jobs_cancelled,
+            menus=menus_removed,
+            files=files_deleted,
+            freed=format_size(temp_before),
+        ),
+    )
+
+    # 4. Stop cleanly (post_stop saves a last backup), then main() starts the bot again.
+    RESTART_REQUESTED = True
+    asyncio.get_running_loop().call_later(1.0, os.kill, os.getpid(), signal.SIGTERM)
+
+
+async def ram_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ram (admin only): how much memory the bot is using right now."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    snapshot = memory_snapshot()
+
+    if snapshot is None:
+        await message.reply_text(MSG_RAM_UNAVAILABLE)
+        return
+
+    lines = [MSG_RAM_TITLE, ""]
+
+    used = snapshot.get("container_used")
+    limit = snapshot.get("container_limit")
+
+    if used is not None and limit:
+        lines.append(
+            MSG_RAM_CONTAINER.format(
+                used=format_size(used),
+                limit=format_size(limit),
+                bar=render_progress_bar(used / limit * 100),
+            )
+        )
+    elif used is not None:
+        lines.append(MSG_RAM_CONTAINER_NO_LIMIT.format(used=format_size(used)))
+
+    lines.append(MSG_RAM_BOT.format(size=format_size(snapshot["bot_rss"])))
+
+    if snapshot["ffmpeg_count"]:
+        lines.append(
+            MSG_RAM_FFMPEG.format(count=snapshot["ffmpeg_count"], size=format_size(snapshot["ffmpeg_rss"]))
+        )
+    else:
+        lines.append(MSG_RAM_FFMPEG_IDLE)
+
+    if "host_total" in snapshot:
+        lines.append(
+            MSG_RAM_HOST.format(
+                available=format_size(snapshot["host_available"]),
+                total=format_size(snapshot["host_total"]),
+            )
+        )
+
+    await message.reply_text("\n".join(lines))
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/users (admin only): send the current Database.zip on demand."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    await context.bot.send_document(
+        chat_id=ADMIN_USER_ID,
+        document=build_database_zip(),
+        filename=DATABASE_ZIP_FILENAME,
+        caption=MSG_APPROVED_USER_S_RIGHT_NOW.format(count_approved_users=len(approved_users)),
+    )
+
+
+# ------------------------------------------------------------
+# Daily data limit: each person can send DAILY_LIMIT_MB of files per day
+# (the total size of everything they send — a single 500 MB video uses it all).
+# It resets at 12:00 AM in QUOTA_TIMEZONE (Egypt time by default). Usage is
+# saved inside Database.zip (quota.json), so restarting the bot can't be used
+# to get a fresh allowance.
+# ------------------------------------------------------------
+DAILY_LIMIT_MB = float(os.getenv("DAILY_LIMIT_MB", "300"))      # 0 = no limit for anyone
+DAILY_LIMIT_BYTES = int(DAILY_LIMIT_MB * 1024 * 1024)
+
+# Telegram user IDs with NO daily limit (and no need to join the channel). Add more IDs here.
+UNLIMITED_USER_IDS: set[int] = {
+    ADMIN_USER_ID,
+    # 123456789,
+}
+
+QUOTA_ENTRY_NAME = "quota.json"
+
+try:
+    from zoneinfo import ZoneInfo
+
+    QUOTA_TZ = ZoneInfo(os.getenv("QUOTA_TIMEZONE", "Africa/Cairo"))
+except Exception:
+    # No timezone database in this image: use fixed Egypt winter time (UTC+2).
+    # (Add `tzdata` to requirements.txt to get the real, daylight-saving-aware one.)
+    QUOTA_TZ = timezone(timedelta(hours=2))
+    logger.warning("Timezone database not found — daily limit resets at midnight UTC+2.")
+
+daily_usage: dict = {"date": "", "used": {}}   # used: user id (text) -> bytes sent today
+
+
+def quota_now() -> datetime:
+    return datetime.now(QUOTA_TZ)
+
+
+def quota_today() -> str:
+    return quota_now().strftime("%Y-%m-%d")
+
+
+def _quota_rollover() -> None:
+    """New day (after 12 AM): everyone starts fresh."""
+    today = quota_today()
+
+    if daily_usage["date"] != today:
+        daily_usage["date"] = today
+        daily_usage["used"] = {}
+
+
+def is_unlimited(user_id: int | None) -> bool:
+    return user_id in UNLIMITED_USER_IDS
+
+
+def quota_applies(user_id: int | None) -> bool:
+    return user_id is not None and not is_unlimited(user_id) and daily_limit_bytes(user_id) > 0
+
+
+def quota_used_bytes(user_id: int) -> int:
+    _quota_rollover()
+    return int(daily_usage["used"].get(str(user_id), 0))
+
+
+def quota_allows(user_id: int | None, size_bytes: int) -> bool:
+    """Would a file of this size fit in what's left of today's allowance?"""
+    if not quota_applies(user_id):
+        return True
+
+    return quota_used_bytes(user_id) + max(0, size_bytes) <= daily_limit_bytes(user_id)
+
+
+def quota_consume(user_id: int | None, size_bytes: int) -> None:
+    if not quota_applies(user_id) or size_bytes <= 0:
+        return
+
+    _quota_rollover()
+    daily_usage["used"][str(user_id)] = quota_used_bytes(user_id) + size_bytes
+
+
+def quota_refund(user_id: int | None, size_bytes: int) -> None:
+    """Give the bytes back (the file couldn't be processed)."""
+    if not quota_applies(user_id) or size_bytes <= 0:
+        return
+
+    _quota_rollover()
+    daily_usage["used"][str(user_id)] = max(0, quota_used_bytes(user_id) - size_bytes)
+
+
+def quota_today_summary() -> tuple[int, int]:
+    """(people who sent something today, total bytes they sent)."""
+    if daily_usage["date"] != quota_today():
+        return 0, 0
+
+    amounts = [int(value) for value in daily_usage["used"].values()]
+    return sum(1 for amount in amounts if amount > 0), sum(amounts)
+
+
+def time_until_reset_text() -> str:
+    now = quota_now()
+    next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    hours, remainder = divmod(int((next_midnight - now).total_seconds()), 3600)
+    minutes = remainder // 60
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+def quota_status_text(user_id: int | None) -> str:
+    if user_id is not None and is_unlimited(user_id):
+        return MSG_YOU_HAVE_NO_DAILY_LIMIT
+
+    limit = daily_limit_bytes(user_id)
+    plan = plan_status_text(user_id)
+
+    if limit <= 0:
+        return MSG_NO_DAILY_LIMIT_RIGHT_NOW.format(plan=plan)
+
+    used = quota_used_bytes(user_id)
+    left = max(0, limit - used)
+    return (
+        MSG_TODAY_YOU_VE_SENT_OF.format(plan=plan, size_used=format_size(used), size_limit=format_size(limit), size_left=format_size(left), reset_in=time_until_reset_text())
+    )
+
+
+def file_too_large_text(user_id: int | None, size_bytes: int) -> str:
+    return (
+        MSG_THIS_FILE_IS_BUT_YOUR.format(size_bytes=format_size(size_bytes), plan_get_tier=tier_label(get_tier(user_id)), size_max_file_bytes=format_size(max_file_bytes(user_id)), upgrade_hint=upgrade_hint(user_id))
+    )
+
+
+def quota_refusal_text(user_id: int | None, size_bytes: int) -> str:
+    limit = daily_limit_bytes(user_id)
+    left = max(0, limit - (quota_used_bytes(user_id) if user_id is not None else 0))
+
+    if left <= 0:
+        first_line = MSG_YOU_VE_USED_ALL_OF.format(size_limit=format_size(limit))
+    else:
+        first_line = (
+            MSG_THIS_FILE_IS_BUT_YOU.format(size_bytes=format_size(size_bytes), size_left=format_size(left), size_limit=format_size(limit))
+        )
+
+    return (
+        MSG_THE_LIMIT_RESETS_EVERY_DAY.format(first_line=first_line, reset_in=time_until_reset_text(), upgrade_hint=upgrade_hint(user_id))
+    )
+
+
+def quota_json_bytes() -> bytes:
+    return json.dumps(daily_usage, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def merge_quota_bytes(raw: bytes) -> bool:
+    """Load today's usage from a Database.zip (older days are ignored). Raises ValueError if unusable."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"quota is not valid JSON ({error})") from error
+
+    if not isinstance(data, dict) or not isinstance(data.get("used"), dict):
+        raise ValueError("not a quota file")
+
+    if data.get("date") != quota_today():
+        return False
+
+    _quota_rollover()
+    changed = False
+
+    for key, value in data["used"].items():
+        try:
+            amount = int(value)
+        except (TypeError, ValueError):
+            continue
+
+        if amount > int(daily_usage["used"].get(str(key), 0)):
+            daily_usage["used"][str(key)] = amount
+            changed = True
+
+    return changed
+
+
+async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/limit: how much of today's data allowance is left."""
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    await message.reply_text(quota_status_text(user.id))
+
+
+# ------------------------------------------------------------
+# Subscriptions (manual): the admin gives a plan with /grant. Plans change the
+# daily data limit, the biggest file allowed, and the place in the queue.
+# Saved inside Database.zip (subscriptions.json).
+# ------------------------------------------------------------
+SUBS_ENTRY_NAME = "subscriptions.json"
+REFERRALS_ENTRY_NAME = "referrals.json"
+EVENT_ENTRY_NAME = "event.json"
+PRICES_ENTRY_NAME = "prices.json"
+SUBSCRIBE_CONTACT = os.getenv("SUBSCRIBE_CONTACT", "")   # e.g. "@yourusername" — shown to people who hit a limit
+
+# Subscriptions are ON by default. To switch the Subscribe buttons off again
+# (they turn into a "coming soon" notice), set SUBSCRIPTIONS_ENABLED=0 in Railway.
+SUBSCRIPTIONS_ENABLED = os.getenv("SUBSCRIPTIONS_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", "")
+
+FREE_MAX_FILE_MB = float(os.getenv("FREE_MAX_FILE_MB", "200"))
+
+# How people pay: the text you want shown to them (account numbers, prices...).
+# Set PAYMENT_INSTRUCTIONS in Railway; use \n for a new line.
+PAYMENT_INSTRUCTIONS = os.getenv(
+    "PAYMENT_INSTRUCTIONS",
+    "send {price} using Vodafone cash to this number: 01016471909",
+).replace("\\n", "\n")
+
+# The Arabic version of the line above (shown under it). {price} works here too.
+PAYMENT_INSTRUCTIONS_AR = os.getenv(
+    "PAYMENT_INSTRUCTIONS_AR",
+    "ابعت {price} على فودافون كاش على الرقم ده: 01016471909",
+).replace("\\n", "\n")
+
+TIERS: dict[str, dict] = {
+    "free": {"label": MSG_FREE, "emoji": "🆓", "daily_mb": DAILY_LIMIT_MB, "max_file_mb": FREE_MAX_FILE_MB, "priority": 0},
+    "plus": {"label": MSG_PLUS, "emoji": "⭐", "daily_mb": 1536, "max_file_mb": 500, "priority": 1},
+    "pro":  {"label": MSG_PRO,  "emoji": "💎", "daily_mb": 3072, "max_file_mb": 800, "priority": 2},
+}
+
+subscriptions: dict[str, dict] = {}   # user id (text) -> {"tier": "plus", "until": unix time}
+
+# Global event (/event): while it runs, EVERYONE gets this tier's limits (if it's better than theirs).
+event: dict = {}   # {"tier": "pro", "until": unix time, "started": unix time} — empty = no event
+
+# Invite rewards (/invite). Saved inside Database.zip (referrals.json).
+referrals: dict = {
+    "pending": {},    # new person (text id) -> who invited them; opened the bot via the link, not counted yet
+    "progress": {},   # inviter (text id) -> [people counted since their last reward]
+    "counted": {},    # everyone ever counted (text id) -> inviter, so nobody counts twice
+    "rewards": {},    # inviter (text id) -> how many groups of 3 they were rewarded for (OLD system)
+    "rewarded": {},   # friend (text id) -> inviter: people already rewarded one by one (NEW system)
+    "bonus": {},      # user (text id) -> {"tier": ..., "until": ...} free days; runs next to a paid plan
+    "links": {},        # custom links (/newlink): code -> {"tier", "days", "max", "name", "created", "active"}
+    "link_claims": {},  # person (text id) -> code: who already got their free plan from a custom link
+    "link_pending": {}, # new person (text id) -> code: opened the bot through a custom link, not credited yet
+}
+
+
+# Plan prices (/price). Saved inside Database.zip (prices.json), so a redeploy keeps them.
+PRICE_CURRENCY = os.getenv("PRICE_CURRENCY", "EGP")
+PRICE_MAX = 1_000_000
+prices: dict = {"plus": 10, "pro": None, "updated": 0}   # "updated" = unix time of the last /price change
+
+
+PRICE_CURRENCY_AR = os.getenv("PRICE_CURRENCY_AR", "جنيه" if PRICE_CURRENCY.upper() == "EGP" else PRICE_CURRENCY)
+
+
+def price_text(tier: str, arabic: bool = False) -> str:
+    """'10 EGP' ('10 جنيه' in Arabic), or a stand-in sentence while that plan has no price yet."""
+    value = prices.get(tier)
+
+    if not value:
+        return "سعر الباقة (اسأل المالك)" if arabic else "the plan price (ask the owner)"
+
+    return f"{float(value):g} {PRICE_CURRENCY_AR if arabic else PRICE_CURRENCY}"
+
+
+def prices_json_bytes() -> bytes:
+    return json.dumps(prices, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def merge_prices_bytes(raw: bytes) -> bool:
+    """Load prices from a Database.zip. The copy changed most recently wins. Raises ValueError if unusable."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"prices are not valid JSON ({error})") from error
+
+    if not isinstance(data, dict):
+        raise ValueError("not a prices file")
+
+    try:
+        updated = float(data.get("updated") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("prices have no valid timestamp") from None
+
+    if updated <= float(prices.get("updated") or 0):
+        return False
+
+    loaded: dict = {"updated": updated}
+
+    for tier in ("plus", "pro"):
+        try:
+            value = float(data.get(tier))
+        except (TypeError, ValueError):
+            value = None
+        loaded[tier] = value if value and 0 < value <= PRICE_MAX else None
+
+    prices.update(loaded)
+    return True
+
+
+def tier_label(tier: str) -> str:
+    return f"{TIERS[tier]['emoji']} {TIERS[tier]['label']}"
+
+
+def _paid_subscription(user_id: int | None) -> dict | None:
+    if user_id is None:
+        return None
+
+    entry = subscriptions.get(str(user_id))
+
+    if entry is None:
+        return None
+
+    if float(entry.get("until", 0)) <= time.time() or entry.get("tier") not in TIERS:
+        subscriptions.pop(str(user_id), None)   # expired: back to Free
+        return None
+
+    return entry
+
+
+def _active_bonus(user_id: int | None) -> dict | None:
+    """Free days earned with /invite."""
+    if user_id is None:
+        return None
+
+    entry = referrals["bonus"].get(str(user_id))
+
+    if entry is None:
+        return None
+
+    if float(entry.get("until", 0)) <= time.time() or entry.get("tier") not in TIERS:
+        referrals["bonus"].pop(str(user_id), None)
+        return None
+
+    return entry
+
+
+def _active_event() -> dict | None:
+    """The running /event, or None (an expired event is cleared)."""
+    if not event:
+        return None
+
+    if float(event.get("until", 0)) <= time.time() or event.get("tier") not in TIERS:
+        event.clear()
+        return None
+
+    return event
+
+
+def active_subscription(user_id: int | None) -> dict | None:
+    if user_id is None:
+        return None
+
+    def rank(entry: dict) -> tuple:
+        return (TIERS[entry["tier"]]["priority"], float(entry["until"]))
+
+    candidates = [entry for entry in (_paid_subscription(user_id), _active_bonus(user_id), _active_event()) if entry]
+    return max(candidates, key=rank) if candidates else None
+
+
+def get_tier(user_id: int | None) -> str:
+    entry = active_subscription(user_id)
+    return entry["tier"] if entry else "free"
+
+
+def daily_limit_bytes(user_id: int | None) -> int:
+    return int(TIERS[get_tier(user_id)]["daily_mb"] * 1024 * 1024)
+
+
+def max_file_bytes(user_id: int | None) -> int:
+    return int(TIERS[get_tier(user_id)]["max_file_mb"] * 1024 * 1024)
+
+
+def file_too_large(user_id: int | None, size_bytes: int) -> bool:
+    if user_id is None or is_unlimited(user_id) or TIERS[get_tier(user_id)]["max_file_mb"] <= 0:
+        return False
+
+    return size_bytes > max_file_bytes(user_id)
+
+
+def user_priority(user_id: int | None) -> int:
+    """
+    Who goes first in the queue (bigger = sooner):
+      unlimited users, then people who BOUGHT a plan (Pro, then Plus),
+      then people on free days (invite rewards / custom links / events: Pro, then Plus), then Free.
+    """
+    if user_id is not None and is_unlimited(user_id):
+        return 99
+
+    paid = _paid_subscription(user_id)
+
+    if paid is not None:
+        return 10 + TIERS[paid["tier"]]["priority"]   # 11 = Plus, 12 = Pro — always ahead of free days
+
+    return TIERS[get_tier(user_id)]["priority"]       # 0 = Free, 1 = Plus days, 2 = Pro days
+
+
+def user_plan_label(user_id: int | None) -> str | None:
+    """Shown in the queue message — only for paying users."""
+    if user_id is None or is_unlimited(user_id):
+        return None
+
+    tier = get_tier(user_id)
+    return None if tier == "free" else tier_label(tier)
+
+
+def format_until(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, QUOTA_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def plan_status_text(user_id: int | None) -> str:
+    entry = active_subscription(user_id)
+
+    if entry is None:
+        return f"{tier_label('free')} plan"
+
+    return f"{tier_label(entry['tier'])} plan — active until {format_until(entry['until'])}"
+
+
+def dm_text() -> str:
+    extra = f" or message {SUBSCRIBE_CONTACT}" if SUBSCRIBE_CONTACT else ""
+    return f"You can also message us directly through the Direct Messages of our channel{extra}: {REQUIRED_CHANNEL_URL}"
+
+
+def upgrade_hint(user_id: int | None) -> str:
+    tier = get_tier(user_id)
+
+    if tier == "pro":
+        return ""
+
+    return MSG_WANT_MORE_SEE_PLANS_THEN.format(dm_text=dm_text())
+
+
+def plans_text(user_id: int | None) -> str:
+    lines = [MSG_PLANS, ""]
+
+    for tier in ("free", "plus", "pro"):
+        info = TIERS[tier]
+        perk = {
+            "free": "normal queue",
+            "plus": "served before Free users",
+            "pro": "served first",
+        }[tier]
+        line = MSG_DAY_FILES_UP_TO.format(emoji=info['emoji'], label=info['label'], size_daily_mb=format_size(int(info['daily_mb'] * 1024 * 1024)), size_max_file_mb=format_size(int(info['max_file_mb'] * 1024 * 1024)), perk=perk)
+
+        if tier != "free" and prices.get(tier):
+            line += f" · {price_text(tier)}"
+
+        lines.append(line)
+
+    lines += ["", MSG_YOUR_PLAN.format(plan=plan_status_text(user_id))]
+
+    lines.append("")
+    lines.append(MSG_TO_SUBSCRIBE_SEND_SUBSCRIBE_PAY)
+    lines.append(dm_text())
+
+    return "\n".join(lines)
+
+
+def subscribers_summary() -> str:
+    counts = {"plus": 0, "pro": 0}
+
+    for user_id in list(subscriptions):
+        entry = active_subscription(int(user_id))
+        if entry:
+            counts[entry["tier"]] += 1
+
+    return f"{TIERS['plus']['label']} {counts['plus']} · {TIERS['pro']['label']} {counts['pro']}"
+
+
+def subscriptions_json_bytes() -> bytes:
+    return json.dumps(subscriptions, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def merge_subscriptions_bytes(raw: bytes) -> int:
+    """Load subscriptions from a Database.zip; for each person the later expiry wins. Returns how many changed."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"subscriptions are not valid JSON ({error})") from error
+
+    if not isinstance(data, dict):
+        raise ValueError("not a subscriptions file")
+
+    changed = 0
+
+    for key, entry in data.items():
+        if not isinstance(entry, dict) or entry.get("tier") not in TIERS or "until" not in entry:
+            continue
+
+        try:
+            until = float(entry["until"])
+        except (TypeError, ValueError):
+            continue
+
+        if until <= time.time():
+            continue
+
+        current = subscriptions.get(str(key))
+        if current is None or until > float(current.get("until", 0)):
+            subscriptions[str(key)] = {"tier": entry["tier"], "until": until}
+            changed += 1
+
+    return changed
+
+
+def event_json_bytes() -> bytes:
+    return json.dumps(event, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def merge_event_bytes(raw: bytes) -> bool:
+    """Load the running event from a Database.zip (the later end wins). Raises ValueError if unusable."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"event is not valid JSON ({error})") from error
+
+    if not isinstance(data, dict):
+        raise ValueError("not an event file")
+
+    if not data:
+        return False
+
+    try:
+        until = float(data["until"])
+        started = float(data.get("started", time.time()))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("event has no valid end time") from None
+
+    if data.get("tier") not in TIERS or until <= time.time():
+        return False
+
+    if not event or until > float(event.get("until", 0)):
+        event.clear()
+        event.update({"tier": data["tier"], "until": until, "started": started})
+        return True
+
+    return False
+
+
+MSG_EVENT_STARTED = (
+    "🎉 A special event has started!\n"
+    "\n"
+    "For the next {duration}, everyone gets the {plan_tier} limits — for free:\n"
+    "• {size_daily_mb} per day\n"
+    "• files up to {size_max_file_mb}\n"
+    "\n"
+    "Event ends: {date_until}\n"
+    "Send me a video or audio file and enjoy! 🚀"
+)
+MSG_EVENT_USAGE = (
+    "Usage:\n"
+    "/event <plus|pro> <days> — start an event for everyone\n"
+    "/event off — end the running event\n"
+    "/event — show the running event\n"
+    "Example: /event pro 7"
+)
+MSG_EVENT_NONE = "ℹ️ There is no event running right now.\n\n"
+MSG_EVENT_RUNNING = "🎉 Event running: {plan_tier} limits for everyone until {date_until} ({days_left} left)."
+MSG_EVENT_ENDED = "🛑 The event was ended."
+MSG_EVENT_BROADCAST_START = "📣 Event started ({plan_tier}, {days}). Sending the announcement to {total} user(s)..."
+MSG_EVENT_BROADCAST_DONE = "✅ Announcement finished: {sent} delivered, {failed} couldn't be reached."
+
+EVENT_MAX_DAYS = 365
+_event_broadcast_task: asyncio.Task | None = None
+
+
+def event_audience() -> list[int]:
+    """Everyone the bot knows: people who used it and approved users."""
+    ids: set[int] = set()
+
+    for key in list(stats["users"]):
+        with contextlib.suppress(ValueError):
+            ids.add(int(key))
+
+    ids.update(int(user_id) for user_id in approved_users)
+    ids.add(ADMIN_USER_ID)
+    return sorted(ids)
+
+
+async def _send_event_announcement(bot, text: str, admin_chat_id: int, header: str) -> None:
+    recipients = event_audience()
+    sent = failed = 0
+
+    with contextlib.suppress(Exception):
+        await bot.send_message(chat_id=admin_chat_id, text=header.format(total=len(recipients)))
+
+    for user_id in recipients:
+        for attempt in range(2):
+            try:
+                await bot.send_message(chat_id=user_id, text=text)
+                sent += 1
+                break
+            except RetryAfter as error:
+                await asyncio.sleep(float(error.retry_after) + 1)   # Telegram asked us to slow down — then retry once
+            except Exception:
+                failed += 1   # blocked the bot, deleted their account, ...
+                break
+        else:
+            failed += 1
+
+        await asyncio.sleep(0.05)   # stay well under Telegram's ~30 messages/second
+
+    with contextlib.suppress(Exception):
+        await bot.send_message(chat_id=admin_chat_id, text=MSG_EVENT_BROADCAST_DONE.format(sent=sent, failed=failed))
+
+
+def event_status_text(entry: dict) -> str:
+    days_left = max(0.0, (float(entry["until"]) - time.time()) / 86400)
+    return MSG_EVENT_RUNNING.format(plan_tier=tier_label(entry["tier"]), date_until=format_until(entry["until"]), days_left=f"{days_left:.1f} days")
+
+
+async def event_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/event <plus|pro> <days> | off — admin only: give EVERYONE a plan's limits for a while."""
+    global _event_broadcast_task
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    args = [arg.lower() for arg in context.args]
+    running = _active_event()
+
+    if not args:
+        await message.reply_text(event_status_text(running) if running else MSG_EVENT_NONE + MSG_EVENT_USAGE)
+        return
+
+    if args[0] in ("off", "stop", "end", "cancel"):
+        if running is None:
+            await message.reply_text(MSG_EVENT_NONE.strip())
+            return
+
+        event.clear()
+        save_approved_users()
+        await message.reply_text(MSG_EVENT_ENDED)
+        return
+
+    tier = args[0]
+
+    try:
+        days = int(args[1]) if len(args) > 1 else 0
+    except ValueError:
+        days = 0
+
+    if tier not in ("plus", "pro") or not 1 <= days <= EVENT_MAX_DAYS:
+        await message.reply_text(MSG_EVENT_USAGE)
+        return
+
+    now = time.time()
+    until = now + days * 86400
+    event.clear()
+    event.update({"tier": tier, "until": until, "started": now})
+    save_approved_users()
+
+    info = TIERS[tier]
+    announcement = MSG_EVENT_STARTED.format(
+        duration=_days_text(days),
+        plan_tier=tier_label(tier),
+        size_daily_mb=format_size(int(info["daily_mb"] * 1024 * 1024)),
+        size_max_file_mb=format_size(int(info["max_file_mb"] * 1024 * 1024)),
+        date_until=format_until(until),
+    )
+    header = MSG_EVENT_BROADCAST_START.format(plan_tier=tier_label(tier), days=_days_text(days), total="{total}")
+
+    # Send in the background so the bot keeps working while thousands of messages go out.
+    _event_broadcast_task = asyncio.create_task(
+        _send_event_announcement(context.bot, announcement, message.chat_id, header)
+    )
+
+
+def find_user_id(target: str) -> int | None:
+    """A numeric ID, or an @username of someone the bot has seen."""
+    target = target.strip()
+
+    if target.lstrip("-").isdigit():
+        return int(target)
+
+    wanted = target.lstrip("@").lower()
+    for user_id, entry in stats["users"].items():
+        if (entry.get("username") or "").lower() == wanted:
+            return int(user_id)
+
+    return None
+
+
+def display_name_for(user_id: int) -> str:
+    entry = stats["users"].get(str(user_id))
+    return entry["name"] if entry else str(user_id)
+
+
+def grant_plan(user_id: int, tier: str, days: int) -> tuple[float, str]:
+    """Give (or extend) a plan. Returns (expiry time, wording)."""
+    current = _paid_subscription(user_id)
+
+    if current is not None and current["tier"] == tier:
+        until = float(current["until"]) + days * 86400      # same plan: add the days on top
+        verb = f"extended by {days} days"
+    else:
+        until = time.time() + days * 86400                   # new or changed plan: starts now
+        verb = f"granted for {days} days"
+
+    subscriptions[str(user_id)] = {"tier": tier, "until": until}
+    return until, verb
+
+
+async def notify_user_granted(bot, user_id: int, tier: str, until: float) -> bool:
+    info = TIERS[tier]
+
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                MSG_YOU_RE_NOW_ON_THE.format(plan_tier=tier_label(tier), date_until=format_until(until), size_daily_mb=format_size(int(info['daily_mb'] * 1024 * 1024)), size_max_file_mb=format_size(int(info['max_file_mb'] * 1024 * 1024)))
+            ),
+        )
+        return True
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------
+# /invite — every user gets a personal link. For EVERY brand-new person who
+# opens the bot through it AND is in the channel, the inviter gets INVITER_DAYS
+# of Pro straight away and that person gets INVITEE_DAYS of Plus.
+# Each inviter can earn this for at most INVITE_MAX_FRIENDS friends.
+# (Old system: groups of INVITE_TARGET friends — people counted under it still count.)
+# ------------------------------------------------------------
+INVITE_TARGET = 3          # only used to convert old "groups of 3" rewards into a friends count
+INVITER_TIER, INVITER_DAYS = "pro", 1
+INVITEE_TIER, INVITEE_DAYS = "plus", 2
+MAX_PENDING_INVITES = 5000
+INVITE_MAX_FRIENDS = 6     # each person can be rewarded for at most this many friends
+
+MSG_INVITE_PAGE = (
+    "🎁 Invite friends, get free Pro!\n\n"
+    "Your personal link:\n{link}\n\n"
+    "For every new person who opens the bot through it and joins our channel:\n"
+    "• you get {inviter_days} of {inviter_tier}\n"
+    "• they get {invitee_days} of {invitee_tier}\n\n"
+    "👥 Friends joined: {friends}/{max_friends}"
+)
+MSG_INVITE_LIMIT_REACHED = (
+    "🏆 {max_friends} friends joined through your link — that's the maximum.\n"
+    "Thanks for spreading the word! 💙"
+)
+MSG_INVITE_JOINED = (
+    "🎉 {name} joined through your link — you got {inviter_days} of {inviter_tier}!\n"
+    "👥 Friends joined: {friends}/{max_friends}"
+)
+MSG_INVITE_DONE_INVITEE = "🎁 You joined through {name}'s invite — you got {invitee_days} of {invitee_tier}!"
+BTN_SHARE_INVITE = "📤 Share my link"
+BTN_INVITE_TO_WIN = "🎁 Invite to win!"
+MSG_SHARE_INVITE_TEXT = "Free video & audio compressor on Telegram (مش هكر والله 😁❤️)"
+
+
+def _days_text(days: int) -> str:
+    return f"{days} day" + ("" if days == 1 else "s")
+
+
+def referrals_json_bytes() -> bytes:
+    return json.dumps(referrals, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def merge_referrals_bytes(raw: bytes) -> None:
+    """Load invites from a Database.zip (adds what's missing; never removes anything)."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"referrals are not valid JSON ({error})") from error
+
+    if not isinstance(data, dict):
+        raise ValueError("not a referrals file")
+
+    for key, inviter in (data.get("counted") or {}).items():
+        referrals["counted"].setdefault(str(key), inviter)
+
+    for key, inviter in (data.get("pending") or {}).items():
+        if str(key) not in referrals["counted"]:
+            referrals["pending"].setdefault(str(key), inviter)
+
+    for inviter, people in (data.get("progress") or {}).items():
+        mine = referrals["progress"].setdefault(str(inviter), [])
+        for person in people if isinstance(people, list) else []:
+            if person not in mine:
+                mine.append(person)
+
+    for key, inviter in (data.get("rewarded") or {}).items():
+        referrals["rewarded"].setdefault(str(key), inviter)
+
+    for code, link in (data.get("links") or {}).items():
+        if isinstance(link, dict) and link.get("tier") in ("plus", "pro"):
+            referrals["links"].setdefault(str(code), link)
+
+    for key, code in (data.get("link_claims") or {}).items():
+        referrals["link_claims"].setdefault(str(key), code)
+
+    for inviter, amount in (data.get("rewards") or {}).items():
+        try:
+            referrals["rewards"][str(inviter)] = max(int(amount), int(referrals["rewards"].get(str(inviter), 0)))
+        except (TypeError, ValueError):
+            continue
+
+    for key, entry in (data.get("bonus") or {}).items():
+        try:
+            until = float(entry["until"])
+            tier = entry["tier"]
+        except (TypeError, KeyError, ValueError):
+            continue
+
+        if tier not in TIERS or until <= time.time():
+            continue
+
+        current = referrals["bonus"].get(str(key))
+        if current is None or until > float(current.get("until", 0)):
+            referrals["bonus"][str(key)] = {"tier": tier, "until": until}
+
+    while len(referrals["pending"]) > MAX_PENDING_INVITES:
+        referrals["pending"].pop(next(iter(referrals["pending"])))
+
+
+def grant_bonus(user_id: int, tier: str, days: int) -> float:
+    """Free days that never downgrade or shorten anything. Returns the new expiry."""
+    paid = _paid_subscription(user_id)
+
+    # They already pay for this tier or a better one: just add the days to their paid plan.
+    if paid is not None and TIERS[paid["tier"]]["priority"] >= TIERS[tier]["priority"]:
+        until, _ = grant_plan(user_id, paid["tier"], days)
+        return until
+
+    current = _active_bonus(user_id)
+
+    if current is not None and TIERS[current["tier"]]["priority"] >= TIERS[tier]["priority"]:
+        current["until"] = float(current["until"]) + days * 86400
+        return float(current["until"])
+
+    until = time.time() + days * 86400
+    referrals["bonus"][str(user_id)] = {"tier": tier, "until": until}
+    return until
+
+
+def invite_friends(user_id: int) -> int:
+    """How many friends this person has been rewarded for (old groups of 3 count as 3 each)."""
+    new_system = sum(1 for inviter in referrals["rewarded"].values() if str(inviter) == str(user_id))
+    return new_system + int(referrals["rewards"].get(str(user_id), 0)) * INVITE_TARGET
+
+
+def invite_limit_reached(user_id: int) -> bool:
+    return invite_friends(user_id) >= INVITE_MAX_FRIENDS
+
+
+def invite_link(bot, user_id: int) -> str:
+    return f"https://t.me/{bot.username}?start=ref_{user_id}"
+
+
+def _parse_ref_start(text: str | None) -> int | None:
+    parts = (text or "").split()
+
+    if len(parts) < 2 or not parts[0].lower().startswith("/start"):
+        return None
+
+    payload = parts[1]
+    return int(payload[4:]) if payload.startswith("ref_") and payload[4:].isdigit() else None
+
+
+async def capture_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before the channel gate: remembers who invited a brand-new person."""
+    try:
+        message = update.message
+        user = update.effective_user
+
+        if message is None or user is None or user.is_bot:
+            return
+
+        link_code = _parse_link_start(message.text)
+
+        if link_code is not None:
+            await capture_custom_link(message, context, user, link_code)
+            return
+
+        inviter_id = _parse_ref_start(message.text)
+
+        if inviter_id is None or inviter_id == user.id:
+            return
+
+        uid = str(user.id)
+
+        # Only people who have never used the bot count as "new".
+        if uid in stats["users"] or uid in referrals["counted"] or uid in referrals["pending"] or is_unlimited(user.id):
+            return
+
+        if str(inviter_id) not in stats["users"] or invite_limit_reached(inviter_id):
+            return
+
+        referrals["pending"][uid] = inviter_id
+
+        while len(referrals["pending"]) > MAX_PENDING_INVITES:
+            referrals["pending"].pop(next(iter(referrals["pending"])))
+
+        if REQUIRED_CHANNEL_ID == 0:   # no channel to join: count straight away
+            await credit_referral(context.bot, user)
+    except Exception:
+        logger.exception("Couldn't record an invite")
+
+
+async def reward_friend(bot, inviter_id: int, person_id: int, person_name: str) -> bool:
+    """One friend counted: the inviter gets Pro days, the friend gets Plus days. False if the inviter is at the maximum."""
+    if invite_limit_reached(inviter_id) or str(person_id) in referrals["rewarded"]:
+        return False
+
+    referrals["rewarded"][str(person_id)] = inviter_id
+    grant_bonus(inviter_id, INVITER_TIER, INVITER_DAYS)
+    grant_bonus(person_id, INVITEE_TIER, INVITEE_DAYS)
+
+    fmt = dict(
+        inviter_days=_days_text(INVITER_DAYS), inviter_tier=tier_label(INVITER_TIER),
+        invitee_days=_days_text(INVITEE_DAYS), invitee_tier=tier_label(INVITEE_TIER),
+        friends=invite_friends(inviter_id), max_friends=INVITE_MAX_FRIENDS,
+    )
+
+    with contextlib.suppress(Exception):
+        await bot.send_message(chat_id=inviter_id, text=MSG_INVITE_JOINED.format(name=person_name, **fmt))
+
+    with contextlib.suppress(Exception):
+        await bot.send_message(
+            chat_id=person_id,
+            text=MSG_INVITE_DONE_INVITEE.format(name=display_name_for(inviter_id), **fmt),
+        )
+
+    return True
+
+
+async def credit_referral(bot, user) -> None:
+    """The invited person is now in the channel: count them and reward both of you straight away."""
+    uid = str(user.id)
+
+    link_code = referrals["link_pending"].pop(uid, None)
+    if link_code is not None:
+        await credit_custom_link(bot, user, link_code)
+        return
+
+    inviter_id = referrals["pending"].pop(uid, None)
+
+    if inviter_id is None or uid in referrals["counted"] or invite_limit_reached(inviter_id):
+        return
+
+    referrals["counted"][uid] = inviter_id
+
+    # People counted under the OLD system but not rewarded yet (a group of 3 that never completed): reward them now.
+    for person_id in referrals["progress"].pop(str(inviter_id), []):
+        if person_id != user.id:
+            await reward_friend(bot, inviter_id, person_id, display_name_for(person_id))
+
+    await reward_friend(bot, inviter_id, user.id, user_display_name(user))
+
+
+# ------------------------------------------------------------
+# Custom links (admin): /newlink <plus|pro> <days> <max people> [name]
+# Anyone who opens the bot through the link (new OR old user) and is in the channel gets that plan
+# for that many days — added on top of any days they already have — until the link has been
+# used by its maximum number of people. Each person can use each link once.
+#   /links              every link, how many people used it, and its address
+#   /stoplink <code>    stop a link        /resumelink <code>   turn it back on
+# ------------------------------------------------------------
+LINK_MAX_PEOPLE = 100_000
+LINK_MAX_DAYS = 3650
+MAX_PENDING_LINK_USERS = 5000
+
+MSG_NEWLINK_USAGE = (
+    "Usage: /newlink <plus|pro> <days> <max people> [name]\n"
+    "Example: /newlink pro 7 50 Telegram group\n"
+    "→ the first 50 new people who join through it get 7 days of Pro."
+)
+MSG_NEWLINK_CREATED = (
+    "✅ Link created\n\n"
+    "🔗 {link}\n\n"
+    "🎁 {days} of {tier} for each new person · up to {max_people} people\n"
+    "{name_line}"
+    "Code: {code}\n\n"
+    "/links — all links · /stoplink {code} — stop it"
+)
+MSG_LINK_WELCOME = "🎁 This link gave you {days} of {tier} — active until {until}. Enjoy! 🚀"
+MSG_LINK_FULL = "⚠️ This link has already been used by everyone it was made for, so there's no free plan this time. You can still use the bot normally!"
+MSG_LINK_FULL_ADMIN = "🔗 Your link “{name}” is full: {used}/{max_people} people joined."
+MSG_LINKS_NONE = "You haven't made any links yet.\n\n" + MSG_NEWLINK_USAGE
+MSG_LINK_UNKNOWN = "I don't have a link with that code. /links shows them all."
+
+
+def _parse_link_start(text: str | None) -> str | None:
+    parts = (text or "").split()
+
+    if len(parts) < 2 or not parts[0].lower().startswith("/start"):
+        return None
+
+    payload = parts[1]
+    return payload[4:] if payload.startswith("lnk_") and len(payload) > 4 else None
+
+
+def link_used(code: str) -> int:
+    """How many people have used this link (new claims are stored as "code:user"; older ones as user -> code)."""
+    prefix = f"{code}:"
+    return sum(1 for key, value in referrals["link_claims"].items() if key.startswith(prefix) or value == code)
+
+
+def link_already_claimed(code: str, user_id) -> bool:
+    return f"{code}:{user_id}" in referrals["link_claims"] or referrals["link_claims"].get(str(user_id)) == code
+
+
+def link_address(bot, code: str) -> str:
+    return f"https://t.me/{bot.username}?start=lnk_{code}"
+
+
+async def capture_custom_link(message, context: ContextTypes.DEFAULT_TYPE, user, code: str) -> None:
+    """Someone opened the bot through a custom link: remember it until they're in the channel."""
+    uid = str(user.id)
+
+    if is_unlimited(user.id) or link_already_claimed(code, uid):
+        return
+
+    link = referrals["links"].get(code)
+
+    if link is None or not link.get("active", True):
+        return
+
+    if link_used(code) >= int(link.get("max", 0)):
+        await message.reply_text(MSG_LINK_FULL)
+        return
+
+    referrals["link_pending"][uid] = code
+
+    while len(referrals["link_pending"]) > MAX_PENDING_LINK_USERS:
+        referrals["link_pending"].pop(next(iter(referrals["link_pending"])))
+
+    if REQUIRED_CHANNEL_ID == 0:   # no channel to join: give the plan straight away
+        await credit_custom_link(context.bot, user, code)
+
+
+async def credit_custom_link(bot, user, code: str) -> None:
+    """The person is in (and in the channel): give them the link's plan, if there is still room."""
+    uid = str(user.id)
+    link = referrals["links"].get(code)
+
+    if link is None or not link.get("active", True) or link_already_claimed(code, uid):
+        return
+
+    max_people = int(link.get("max", 0))
+
+    if link_used(code) >= max_people:
+        with contextlib.suppress(Exception):
+            await bot.send_message(chat_id=user.id, text=MSG_LINK_FULL)
+        return
+
+    referrals["link_claims"][f"{code}:{uid}"] = time.time()
+    # Adds the days on top if they already have some of this plan (or a better one); otherwise starts now.
+    until = grant_bonus(user.id, link["tier"], int(link["days"]))
+
+    with contextlib.suppress(Exception):
+        await bot.send_message(
+            chat_id=user.id,
+            text=MSG_LINK_WELCOME.format(
+                days=_days_text(int(link["days"])), tier=tier_label(link["tier"]), until=format_until(until)
+            ),
+        )
+
+    if link_used(code) >= max_people:
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=MSG_LINK_FULL_ADMIN.format(name=link.get("name") or code, used=max_people, max_people=max_people),
+            )
+
+
+async def newlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    args = context.args or []
+
+    try:
+        tier = args[0].lower()
+        days = int(args[1])
+        max_people = int(args[2])
+    except (IndexError, ValueError):
+        await message.reply_text(MSG_NEWLINK_USAGE)
+        return
+
+    if tier not in ("plus", "pro") or not 1 <= days <= LINK_MAX_DAYS or not 1 <= max_people <= LINK_MAX_PEOPLE:
+        await message.reply_text(MSG_NEWLINK_USAGE)
+        return
+
+    name = " ".join(args[3:])[:40].strip()
+    code = secrets.token_urlsafe(6)
+
+    while code in referrals["links"]:
+        code = secrets.token_urlsafe(6)
+
+    referrals["links"][code] = {
+        "tier": tier, "days": days, "max": max_people, "name": name, "created": time.time(), "active": True,
+    }
+
+    await message.reply_text(MSG_NEWLINK_CREATED.format(
+        link=link_address(context.bot, code), days=_days_text(days), tier=tier_label(tier),
+        max_people=max_people, name_line=f"🏷 {name}\n" if name else "", code=code,
+    ))
+
+
+async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    if not referrals["links"]:
+        await message.reply_text(MSG_LINKS_NONE)
+        return
+
+    newest_first = sorted(referrals["links"].items(), key=lambda item: item[1].get("created", 0), reverse=True)
+    blocks = []
+
+    for code, link in newest_first[:20]:
+        used, max_people = link_used(code), int(link.get("max", 0))
+        state = "🟢" if link.get("active", True) and used < max_people else ("🔴" if used >= max_people else "⏸")
+        title = link.get("name") or code
+        blocks.append(
+            f"{state} {title} — {_days_text(int(link['days']))} of {tier_label(link['tier'])} · {used}/{max_people} people\n"
+            f"{link_address(context.bot, code)}"
+        )
+
+    extra = f"\n\n(+{len(newest_first) - 20} older links not shown)" if len(newest_first) > 20 else ""
+    await message.reply_text("🔗 Your links\n\n" + "\n\n".join(blocks) + extra, disable_web_page_preview=True)
+
+
+async def _set_link_active(update: Update, context: ContextTypes.DEFAULT_TYPE, active: bool) -> None:
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    raw = (context.args[0] if context.args else "").strip()
+    code = raw.split("lnk_")[-1] if "lnk_" in raw else raw
+    link = referrals["links"].get(code)
+
+    if link is None:
+        await message.reply_text(MSG_LINK_UNKNOWN)
+        return
+
+    link["active"] = active
+    title = link.get("name") or code
+    await message.reply_text(f"▶️ Link “{title}” is on again." if active else f"⏸ Link “{title}” is stopped. /resumelink {code} turns it back on.")
+
+
+async def stoplink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_link_active(update, context, False)
+
+
+async def resumelink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_link_active(update, context, True)
+
+
+def invite_page(bot, user_id: int, with_back: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
+    """The invite screen (text + buttons). with_back adds a Back button for the home-menu version."""
+    back_row = [[ui_button(BTN_BACK, callback_data="home:back:0")]] if with_back else []
+
+    if invite_limit_reached(user_id):
+        text = MSG_INVITE_LIMIT_REACHED.format(max_friends=INVITE_MAX_FRIENDS)
+        return text, (InlineKeyboardMarkup(back_row) if back_row else None)
+
+    link = invite_link(bot, user_id)
+    text = MSG_INVITE_PAGE.format(
+        link=link,
+        inviter_days=_days_text(INVITER_DAYS), inviter_tier=tier_label(INVITER_TIER),
+        invitee_days=_days_text(INVITEE_DAYS), invitee_tier=tier_label(INVITEE_TIER),
+        friends=invite_friends(user_id),
+        max_friends=INVITE_MAX_FRIENDS,
+    )
+    share_row = [ui_button(
+        BTN_SHARE_INVITE,
+        url=f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(MSG_SHARE_INVITE_TEXT)}",
+    )]
+    return text, InlineKeyboardMarkup([share_row] + back_row)
+
+
+async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/invite — your personal link and how far along you are."""
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    text = invite_page(context.bot, user.id)[0]
+    await with_style_fallback(lambda: message.reply_text(text, reply_markup=invite_page(context.bot, user.id)[1]))
+
+
+# ---- /subscribe: pick a plan, pay, send a screenshot -> the admin approves with one tap
+awaiting_payment_proof: dict[int, dict] = {}   # user id -> {"tier": ..., "since": time}
+_last_proof_at: dict[int, float] = {}
+PAYMENT_PROOF_WAIT_SECONDS = 1800
+
+
+# ------------------------------------------------------------
+# Homepage (/start): Usage / Subscribe / About
+# ------------------------------------------------------------
+def subscribe_callback(real_callback: str) -> str:
+    """The real callback when subscriptions are on; an inert "coming soon" one while they're off."""
+    return real_callback if SUBSCRIPTIONS_ENABLED else "subsoon:_:0"
+
+
+def home_plans_text() -> str:
+    """One short line per plan (Free / Plus / Pro) for the homepage."""
+    lines = []
+
+    for tier in ("free", "plus", "pro"):
+        info = TIERS[tier]
+        lines.append(
+            MSG_HOME_PLAN_LINE.format(
+                emoji=info["emoji"],
+                label=info["label"],
+                size_daily_mb=format_size(int(info["daily_mb"] * 1024 * 1024)),
+                size_max_file_mb=format_size(int(info["max_file_mb"] * 1024 * 1024)),
+            )
+        )
+
+    return "\n".join(lines)
+
+
+def home_your_plan_text(user_id: int | None) -> str:
+    """The user's own plan, plus how much of today's limit is left."""
+    if user_id is not None and is_unlimited(user_id):
+        return MSG_YOU_HAVE_NO_DAILY_LIMIT
+
+    text = MSG_YOUR_PLAN.format(plan=plan_status_text(user_id))
+    limit = daily_limit_bytes(user_id)
+
+    if limit > 0 and user_id is not None:
+        left = max(0, limit - quota_used_bytes(user_id))
+        text += "\n" + MSG_HOME_LEFT_TODAY.format(
+            size_left=format_size(left), size_limit=format_size(limit)
+        )
+
     return text
 
 
-def prayer_keyboard(u: dict) -> InlineKeyboardMarkup:
-    def btn(p):
-        mark = "✅" if u["prayers"].get(p, True) else "⬜"
-        return InlineKeyboardButton(f"{mark} {PRAYER_AR[p]}", callback_data=f"pray_{p}")
+def home_text(user) -> str:
+    name = user_display_name(user) if user is not None else "there"
+    user_id = user.id if user is not None else None
 
-    toggle = "⏸ إيقاف التنبيهات" if u["prayer_on"] else "✅ تشغيل التنبيهات"
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(toggle, callback_data="pray_toggle")],
-            [btn(p) for p in PRAYERS[:3]],
-            [btn(p) for p in PRAYERS[3:]],
-            [InlineKeyboardButton("📍 اختار المدينة", callback_data="set_tz")],
-            back_row("settings"),
-        ]
+    return MSG_HI_SEND_ME_A_VIDEO.format(
+        name=name,
+        SAMPLE_SECONDS=SAMPLE_SECONDS,
+        plans=home_plans_text(),
+        your_plan=home_your_plan_text(user_id),
     )
 
 
-# ───────────────────────── طريقة الاستخدام ─────────────────────────
-HOWTO_TEXT = (
-    "📚 <b>طريقة استخدام ترتيل</b>\n\n"
-    "<b>الفكرة:</b> بتحدد وردك اليومي، وأنا ببعتلك صفحات النهاردة بس من المصحف "
-    "في الميعاد اللي تختاره، وبفكّرك قبل الصلوات.\n\n"
-    "<b>🚀 ابدأ بـ ٤ خطوات</b>\n"
-    "١. حدد وردك: /pages (عدد صفحات في اليوم) أو /goal (ختمة في عدد أيام)\n"
-    "٢. حدد ميعاد التذكير: /time\n"
-    "٣. اختار مدينتك: /timezone\n"
-    "٤. لما تخلّص قراءة دوس على زرار «✅ خلّصت وردي»\n\n"
-    "<b>📖 القراءة والتقدّم</b>\n"
-    "/today — يبعتلك ورد النهاردة (صور الصفحات)\n"
-    "/progress — تقدّمك، وأيامك ورا بعض، وعدد الختمات، وحالتك من هدف الختمة\n"
-    "/setpage 120 — تبدأ وردك من صفحة معيّنة (من ١ لـ ٦٠٤)\n\n"
-    "<b>⚙️ الإعدادات</b>\n"
-    "/settings — كل إعداداتك في مكان واحد\n"
-    "/pages — عدد الصفحات في اليوم. لو عندك هدف ختمة شغّال وغيّرت العدد "
-    "هيتلغي الهدف\n"
-    "/goal — حدد تخلّص المصحف في كام يوم، وأنا أحسبلك الصفحات اليومية\n"
-    "/time — ميعاد التذكير اليومي (بنظام ٢٤ ساعة، زي 05:30)\n"
-    "/stop — إيقاف التذكير (وتشغّله تاني من /time)\n"
-    "/timezone — المدينة أو المنطقة الزمنية، أو ابعت موقعك\n\n"
-    "<b>🕌 تنبيهات الصلاة</b>\n"
-    "/prayer — شغّل التنبيهات واختار الصلوات اللي عايز تتنبّه ليها. هبعتلك قبل "
-    "الصلاة بساعة وبنص ساعة، ولو دوست «✅ لقد صليت» مش هنبّهك تاني لنفس الصلاة. "
-    "محتاج تحدد مدينتك أو موقعك الأول، والمواعيد تقريبية.\n\n"
-    "<b>🧭 أوامر تانية</b>\n"
-    "/menu — القائمة الرئيسية\n"
-    "/how_to_use — الشرح ده\n\n"
-    "<b>💡 ملحوظة:</b> وردك مبيتقدّمش للصفحات اللي بعدها غير لما تدوس "
-    "«✅ خلّصت وردي»، فلو نسيت هتلاقي نفس الصفحات تاني بكرة.\n\n"
-    "تقبّل الله منك 🤍"
-)
+# ---- button colours ----
+# Telegram can colour an inline button: "primary" = blue, "success" = green, "danger" = red.
+# Menu buttons are blue; Subscribe is green. If the Bot API server ever rejects coloured
+# buttons, with_style_fallback() switches the colours off (once) and resends plain buttons.
+UI_BUTTON_STYLE = {"on": True}
 
 
-def set_pages_per_day(chat_id: int, n: int) -> str:
-    """بيغيّر عدد الصفحات. لو فيه هدف ختمة شغّال بيتلغي لأن حسابه كان مبني على العدد القديم."""
-    u = get_user(chat_id)
-    if u["goal_days"] and n != u["pages_per_day"]:
-        update_user(
-            chat_id, pages_per_day=n, goal_days=None, goal_start=None, goal_read=0
-        )
-        return (
-            f"✅ وردك دلوقتي {ar(n)} صفحة في اليوم\n"
-            "🎯 هدف الختمة اتلغى لأن عدد الصفحات اتغيّر. تقدر تحدد هدف جديد من /goal"
-        )
-    update_user(chat_id, pages_per_day=n)
-    return f"✅ وردك دلوقتي {ar(n)} صفحة في اليوم"
+def ui_button(text: str, style: str | None = "primary", **kwargs) -> InlineKeyboardButton:
+    if style and UI_BUTTON_STYLE["on"]:
+        kwargs["api_kwargs"] = {"style": style}
+
+    return InlineKeyboardButton(text, **kwargs)
 
 
-# ───────────────────────── الأوامر ─────────────────────────
-WELCOME = (
-    "السلام عليكم ورحمة الله 🌙\n"
-    "أهلاً بيك في <b>ترتيل</b>\n\n"
-    "أنا بظبطلك وردك اليومي من المصحف، وببعتلك صفحات النهاردة بس، "
-    "وبفكّرك في الميعاد اللي تحدده.\n\n"
-    "يلا نبدأ نظبط الإعدادات 👇"
-)
+def is_style_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return "not modified" not in text and any(hint in text for hint in ("style", "button", "markup"))
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_chat.id)
-    schedule_reminder(context.application, user)
-    await update.message.reply_text(WELCOME, parse_mode="HTML", reply_markup=main_menu())
-    await update.message.reply_text(
-        settings_text(user), parse_mode="HTML", reply_markup=settings_menu()
-    )
-
-
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("القائمة", reply_markup=main_menu())
-
-
-async def howto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HOWTO_TEXT, parse_mode="HTML")
-
-
-async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = get_user(update.effective_chat.id)
-    await update.message.reply_text(
-        settings_text(u), parse_mode="HTML", reply_markup=settings_menu()
-    )
-
-
-async def goal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = get_user(update.effective_chat.id)
-    await update.message.reply_text(
-        GOAL_TEXT, parse_mode="HTML", reply_markup=goal_keyboard(u)
-    )
-
-
-async def prayer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = get_user(update.effective_chat.id)
-    await update.message.reply_text(
-        prayer_text(u), parse_mode="HTML", reply_markup=prayer_keyboard(u)
-    )
-
-
-async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_chat.id)
-    await deliver_today(context.bot, update.effective_chat.id, user)
-
-
-async def pages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ask_pages(context.bot, update.effective_chat.id)
-
-
-async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ask_time(context.bot, update.effective_chat.id, context)
-
-
-async def progress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_progress(context.bot, update.effective_chat.id)
-
-
-async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    update_user(chat_id, reminders_on=False)
-    schedule_reminder(context.application, get_user(chat_id))
-    await update.message.reply_text("🔕 وقّفت التذكير. ابعت /time لو عايز تشغّله تاني.")
-
-
-async def setpage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    arg = en_digits(context.args[0]) if context.args else ""
-    if arg.isdigit() and 1 <= int(arg) <= TOTAL_PAGES:
-        update_user(chat_id, current_page=int(arg))
-        await update.message.reply_text(f"✅ وردك هيبدأ من صفحة {ar(arg)}")
-    else:
-        await update.message.reply_text(
-            f"استخدم الأمر كده: /setpage 120   (من ١ لـ {ar(TOTAL_PAGES)})"
-        )
-
-
-async def timezone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        TZ_TEXT, parse_mode="HTML", reply_markup=tz_keyboard()
-    )
-
-
-async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بيعمل نسخة احتياطية فوراً (للأدمن بس)."""
-    if not is_admin(update):
-        return
-    await flush(context.bot, force=True)
-
-
-async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إحصائيات البوت (للأدمن بس)."""
-    if not is_admin(update):
-        await update.message.reply_text("الأمر ده للأدمن بس 🙂")
-        return
-    await update.message.reply_text(format_health(health_report()), parse_mode="HTML")
-
-
-# ───────────────────────── خطوات الإعدادات ─────────────────────────
-async def ask_pages(bot, chat_id: int):
-    nums = [1, 2, 3, 4, 5, 10, 20]
-    rows = [
-        [InlineKeyboardButton(ar(n), callback_data=f"pages_{n}") for n in nums[:4]],
-        [InlineKeyboardButton(ar(n), callback_data=f"pages_{n}") for n in nums[4:]],
-        [InlineKeyboardButton("✏️ رقم تاني", callback_data="pages_custom")],
-    ]
-    await bot.send_message(
-        chat_id,
-        "عايز تقرا كام صفحة في اليوم؟\n(٢٠ صفحة في اليوم = ختمة في شهر تقريباً)",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
-
-
-async def ask_time(bot, chat_id: int, context):
-    context.user_data["awaiting"] = "time"
-    await bot.send_message(
-        chat_id,
-        "ابعتلي ميعاد التذكير بنظام ٢٤ ساعة، زي: 05:30 أو 21:00\n"
-        "ولو عايز توقّفه ابعت /stop",
-    )
-
-
-async def ask_tz(bot, chat_id: int, context):
-    context.user_data["awaiting"] = "tz"
-    await bot.send_message(
-        chat_id,
-        "ابعتلي المنطقة الزمنية بتاعتك، زي:\n"
-        "Africa/Cairo\nAsia/Riyadh\nEurope/London\nAmerica/New_York",
-    )
-
-
-async def show_progress(bot, chat_id: int):
-    u = get_user(chat_id)
-    pages = today_pages(u)
-    read = u["current_page"] - 1
-    pct = read / TOTAL_PAGES * 100
-    left = TOTAL_PAGES - read
-    days = -(-left // u["pages_per_day"])
-    bar = "█" * int(pct // 10) + "░" * (10 - int(pct // 10))
-    reminder = ar(u["remind_time"]) if u["reminders_on"] else "واقف"
-    lines = [
-        "📊 <b>تقدّمك</b>",
-        f"{bar} {num(pct)}٪",
-        f"الصفحة الحالية: {ar(u['current_page'])} من {ar(TOTAL_PAGES)}",
-        f"ورد النهاردة: من {ar(pages[0])} لـ {ar(pages[-1])}",
-        f"🔥 أيام ورا بعض: {ar(u['streak'])}",
-        f"📗 الختمات: {ar(u['khatmas'])}",
-        f"⏳ فاضل على الختمة: حوالي {ar(days)} يوم",
-        f"⏰ التذكير: {reminder} ({html.escape(tz_label(u['tz']))})",
-    ]
-    goal = goal_lines(u)
-    if goal:
-        lines += [""] + goal
-    await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
-
-
-async def edit_or_send(q, bot, text: str, markup=None):
-    """بيعدّل الرسالة الحالية (عشان الشات ميتملاش)، ولو معرفش بيبعت رسالة جديدة."""
+async def with_style_fallback(make_call):
+    """
+    make_call() builds AND awaits a Telegram call that carries coloured buttons. If Telegram
+    rejects the colours, they are switched off for good and the call is made again plain.
+    """
     try:
-        await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
-    except BadRequest as e:
-        if "not modified" in str(e).lower():
+        return await make_call()
+    except BadRequest as error:
+        if not (UI_BUTTON_STYLE["on"] and is_style_error(error)):
+            raise
+
+        UI_BUTTON_STYLE["on"] = False
+        logger.warning("Telegram rejected coloured buttons (%s) — sending plain buttons from now on.", error)
+        return await make_call()
+
+
+def home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [ui_button(BTN_INVITE_TO_WIN, callback_data="home:invite:0")],
+        [
+            ui_button(BTN_PLANS, callback_data="home:plans:0"),
+            ui_button(BTN_SUBSCRIBE, "success", callback_data=subscribe_callback("home:subscribe:0")),
+        ],
+        [
+            ui_button(BTN_USAGE, callback_data="home:usage:0"),
+            ui_button(BTN_HOW_TO_USE, callback_data="home:howto:0"),
+        ],
+    ])
+
+
+# ---- the menu in Telegram's own keyboard (the one you type with) ----
+# Same five buttons as the homepage, but they sit above the typing box like a normal keyboard.
+# Tapping one sends its label as a message; reply_menu_button() below answers it.
+# Colours work here too: blue for everything, green ("success") for Subscribe.
+def ui_reply_button(text: str, style: str | None = "primary") -> KeyboardButton:
+    if style and UI_BUTTON_STYLE["on"]:
+        return KeyboardButton(text, api_kwargs={"style": style})
+
+    return KeyboardButton(text)
+
+
+def home_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [ui_reply_button(BTN_INVITE_TO_WIN)],
+            [ui_reply_button(BTN_PLANS), ui_reply_button(BTN_SUBSCRIBE, "success")],
+            [ui_reply_button(BTN_USAGE), ui_reply_button(BTN_HOW_TO_USE)],
+        ],
+        resize_keyboard=True,
+        is_persistent=False,   # so people can collapse it with the keyboard icon next to the text box (and open it again)
+    )
+
+
+REPLY_MENU_LABELS = (BTN_INVITE_TO_WIN, BTN_PLANS, BTN_SUBSCRIBE, BTN_USAGE, BTN_HOW_TO_USE)
+
+
+def _ar_days(days: int) -> str:
+    return {1: "يوم", 2: "يومين"}.get(days, f"{days} أيام" if 3 <= days <= 10 else f"{days} يوم")
+
+
+def how_to_use_text_en() -> str:
+    idle = f"{IDLE_FILE_TTL_MINUTES} minutes" if IDLE_FILE_TTL_MINUTES > 0 else "a few minutes"
+
+    return (
+        "📖 How to use — the full guide\n"
+        "\n"
+        "🎬 VIDEOS\n"
+        "1️⃣ Send me a video (or forward one).\n"
+        f"2️⃣ I encode a {SAMPLE_SECONDS:.0f}s sample from the middle at each of the 5 levels (Low → Extreme) and send them, "
+        "so you can see the real quality, together with the estimated final size of each level.\n"
+        "3️⃣ \"Smart analysis\" reads your video's resolution, frame rate, codec and bitrate and recommends the best level.\n"
+        "4️⃣ Pick a level, then the audio quality: Low / Medium / High, or Original to keep the sound untouched.\n"
+        "5️⃣ Optional: noise reduction, voice enhancement and a volume boost — you can listen to a preview before choosing.\n"
+        "6️⃣ Get your compressed video ✅ (tap Cancel any time while it's working).\n"
+        "A red level button means that level would make the file bigger, so it's switched off.\n"
+        "\n"
+        "Under a video you'll also find:\n"
+        "• 🎧 Just edit audio — change the sound, the picture stays exactly as it is\n"
+        "• 🔁 Replace audio — send a recording to replace the video's sound\n"
+        "• 🖼 Set video cover — use your own image as the cover\n"
+        "• 📄 Extract to PDF — the video's frames in a PDF (every 15–60 s, or auto-detect changes, or in 3 parts). "
+        "Then remove near-duplicate frames, or delete slides by sending their page numbers\n"
+        "• ✂️ Split video — cut it at a time you choose into two videos\n"
+        "• 🎵 Extract audio — get the soundtrack as an audio file\n"
+        "• 🔗 Merge with other videos — join several videos into one (or use /merge)\n"
+        "\n"
+        "🎧 AUDIO\n"
+        "Send an audio file or a voice message: compress it (Low / Medium / High) or send it as is with no compression. "
+        "You can rename it and set the artist, album and cover, boost or clean up the sound, "
+        "or merge it with other audios (or use /mergeaudio).\n"
+        "\n"
+        "📄 PDF & RAR\n"
+        "Send a PDF to merge PDFs, compress it, delete duplicate pages, or change its name and thumbnail. "
+        "Send a .rar and I'll unpack it and send you the files inside.\n"
+        "\n"
+        "📊 POWERPOINT\n"
+        f"Send a .pptx that has a recording on its slides and choose: a PDF of all the slides, one audio file with all the "
+        f"recordings joined in slide order, or a video where each slide plays with its own recording "
+        f"(slides without a recording are shown for {PPTX_SLIDE_SECONDS:g} s).\n"
+        "\n"
+        "📊 LIMITS & PLANS\n"
+        "• Everyone has a daily data limit and a biggest file size — see 📊 Usage. It resets every day at 12:00 AM.\n"
+        "• 📦 Plans and 💎 Subscribe give bigger limits and a place ahead in the queue (Pro, then Plus, then Free).\n"
+        f"• 🎁 Invite to win: for every friend you invite, get {_days_text(INVITER_DAYS)} of Pro free (/invite).\n"
+        "\n"
+        f"🔒 Your files are deleted as soon as they're processed, or after {idle} without any action.\n"
+        "\n"
+        "Commands: /start · /plans · /subscribe · /limit · /invite · /setlevel · /merge · /mergeaudio"
+    )
+
+
+def how_to_use_text_ar() -> str:
+    idle = f"{IDLE_FILE_TTL_MINUTES} دقايق" if IDLE_FILE_TTL_MINUTES > 0 else "كام دقيقة"
+
+    return (
+        "📖 طريقة الاستخدام — الشرح الكامل\n"
+        "\n"
+        "🎬 الفيديو\n"
+        "1️⃣ ابعتلي فيديو (أو حوّل فيديو).\n"
+        f"2️⃣ هعمل عينة قصيرة ({SAMPLE_SECONDS:.0f} ثواني) من نص الفيديو بكل مستوى من الـ5 مستويات (من Low لحد Extreme) "
+        "وأبعتهالك عشان تشوف الجودة بنفسك، مع الحجم المتوقع لكل مستوى.\n"
+        "3️⃣ \"التحليل الذكي\" بيقرا دقة الفيديو وعدد الفريمات والكودك والبت ريت، وبيرشحلك أنسب مستوى.\n"
+        "4️⃣ اختار المستوى، وبعدين جودة الصوت: Low / Medium / High، أو Original لو عايز الصوت زي ما هو.\n"
+        "5️⃣ اختياري: إزالة الضوضاء، تحسين الصوت، ورفع الصوت — وتقدر تسمع معاينة قبل ما تختار.\n"
+        "6️⃣ هيوصلك الفيديو المضغوط ✅ (تقدر تدوس Cancel في أي وقت وهو شغال).\n"
+        "الزرار الأحمر في قايمة المستويات معناه إن المستوى ده هيكبّر حجم الملف، فهو مقفول.\n"
+        "\n"
+        "وتحت الفيديو هتلاقي كمان:\n"
+        "• 🎧 تعديل الصوت فقط — بتغيّر الصوت والصورة زي ما هي\n"
+        "• 🔁 استبدال الصوت — ابعت تسجيل يحل مكان صوت الفيديو\n"
+        "• 🖼 غلاف للفيديو — حط صورة من عندك كغلاف\n"
+        "• 📄 استخراج PDF — صور الفيديو في ملف PDF (كل 15–60 ثانية، أو اكتشاف التغييرات تلقائي، أو على 3 أجزاء). "
+        "وبعدها تقدر تمسح الصور المتشابهة، أو تمسح سلايدات بإنك تبعت أرقام صفحاتها\n"
+        "• ✂️ تقسيم الفيديو — قصّه في الوقت اللي تحدده لفيديوهين\n"
+        "• 🎵 استخراج الصوت — الصوت كملف صوتي\n"
+        "• 🔗 دمج مع فيديوهات تانية — ضم كذا فيديو في فيديو واحد (أو استخدم /merge)\n"
+        "\n"
+        "🎧 الصوت\n"
+        "ابعت ملف صوتي أو رسالة صوتية: اضغطه (Low / Medium / High) أو ابعته زي ما هو من غير ضغط. "
+        "تقدر تغيّر الاسم وتحط الفنان والألبوم والغلاف، وترفع الصوت أو تنضّفه، "
+        "أو تدمجه مع ملفات صوتية تانية (أو استخدم /mergeaudio).\n"
+        "\n"
+        "📄 PDF و RAR\n"
+        "ابعت PDF عشان تدمج ملفات PDF، أو تضغطه، أو تمسح الصفحات المتكررة، أو تغيّر اسمه وصورته المصغرة. "
+        "وابعت ملف .rar وأنا أفكه وأبعتلك الملفات اللي جواه.\n"
+        "\n"
+        "📊 باوربوينت\n"
+        f"ابعت ملف .pptx فيه تسجيلات صوتية على السلايدات واختار: PDF لكل السلايدات، أو ملف صوتي واحد فيه كل التسجيلات "
+        f"ورا بعض بترتيب السلايدات، أو فيديو كل سلايد فيه بيشتغل مع تسجيله (والسلايد اللي من غير تسجيل بيظهر {PPTX_SLIDE_SECONDS:g} ثواني).\n"
+        "\n"
+        "📊 الحدود والباقات\n"
+        "• كل مستخدم له حد يومي للبيانات وأقصى حجم للملف الواحد — شوفهم في 📊 Usage. بيتجدد كل يوم الساعة 12:00 صباحًا.\n"
+        "• 📦 Plans و 💎 Subscribe بيدّوك حدود أكبر وأولوية في الطابور (Pro ثم Plus ثم Free).\n"
+        f"• 🎁 Invite to win: لكل صاحب بتدعوه بتكسب {_ar_days(INVITER_DAYS)} Pro مجانًا (/invite).\n"
+        "\n"
+        f"🔒 ملفاتك بتتمسح أول ما تخلص معالجتها، أو بعد {idle} من غير أي حركة.\n"
+        "\n"
+        "الأوامر: /start · /plans · /subscribe · /limit · /invite · /setlevel · /merge · /mergeaudio"
+    )
+
+
+def how_to_use_keyboard(with_back: bool = True) -> InlineKeyboardMarkup | None:
+    rows = []
+
+    if REQUIRED_CHANNEL_URL:
+        rows.append([ui_button(BTN_OUR_CHANNEL, url=REQUIRED_CHANNEL_URL)])
+
+    if with_back:
+        rows.append([ui_button(BTN_BACK, callback_data="home:back:0")])
+
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def send_guide(context: ContextTypes.DEFAULT_TYPE, chat_id: int, with_back: bool = True) -> None:
+    """The guide as two messages — English first, then Arabic (the last one carries the buttons)."""
+    await with_retries(context.bot.send_message, chat_id=chat_id, text=how_to_use_text_en())
+    await with_style_fallback(
+        lambda: context.bot.send_message(
+            chat_id=chat_id, text=how_to_use_text_ar(), reply_markup=how_to_use_keyboard(with_back)
+        )
+    )
+
+
+async def send_how_to_use(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The inline "How to use" button on the homepage."""
+    chat_id = query.message.chat_id if query.message else None
+
+    if chat_id is None:
+        return
+
+    await send_guide(context, chat_id)
+
+
+def usage_page_text(user_id: int | None) -> str:
+    text = MSG_YOUR_USAGE.format(usage=quota_status_text(user_id))
+
+    if user_id is not None and not is_unlimited(user_id):
+        text += MSG_BIGGEST_FILE_YOU_CAN_SEND.format(size_max_file_bytes=format_size(max_file_bytes(user_id)))
+
+    return text
+
+
+def usage_keyboard(user_id: int | None, with_back: bool = True) -> InlineKeyboardMarkup | None:
+    rows = []
+
+    if user_id is not None and not is_unlimited(user_id) and get_tier(user_id) != "pro":
+        rows.append([ui_button(BTN_GET_MORE_SUBSCRIBE, "success", callback_data=subscribe_callback("home:subscribe:0"))])
+
+    if with_back:
+        rows.append([ui_button(BTN_BACK, callback_data="home:back:0")])
+
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def plans_keyboard(user_id: int | None, with_back: bool = True) -> InlineKeyboardMarkup | None:
+    rows = []
+
+    if user_id is not None and not is_unlimited(user_id) and get_tier(user_id) != "pro":
+        rows.append([ui_button(BTN_SUBSCRIBE, "success", callback_data=subscribe_callback("home:subscribe:0"))])
+
+    if with_back:
+        rows.append([ui_button(BTN_BACK, callback_data="home:back:0")])
+
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def subscribe_page_text(user_id: int | None) -> str:
+    return plans_text(user_id).split("\n\nTo subscribe")[0] + MSG_WHICH_PLAN_DO_YOU_WANT
+
+
+def about_text() -> str:
+    idle = (
+        f" or after {IDLE_FILE_TTL_MINUTES} minutes without any action ({IDLE_OTHER_TTL_MINUTES} for audio and other files)"
+        if IDLE_FILE_TTL_MINUTES > 0
+        else ""
+    )
+
+    return (
+        MSG_ABOUT_THIS_BOT_COMPRESSES_VIDEOS.format(idle=idle)
+    )
+
+
+def about_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+
+    if REQUIRED_CHANNEL_URL:
+        rows.append([ui_button(BTN_OUR_CHANNEL, url=REQUIRED_CHANNEL_URL)])
+
+    rows.append([ui_button(BTN_BACK, callback_data="home:back:0")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_page(query, text: str, keyboard) -> None:
+    """
+    Swap the homepage message for another page (ignoring 'message is not modified').
+    keyboard is a markup, or a function returning one (so it can be rebuilt without colours).
+    """
+    try:
+        await with_style_fallback(
+            lambda: query.edit_message_text(text, reply_markup=keyboard() if callable(keyboard) else keyboard)
+        )
+    except Exception as error:
+        if "not modified" not in str(error).lower():
+            logger.warning("Couldn't show the page: %s", error)
+
+
+def subscribe_keyboard(with_back: bool = True) -> InlineKeyboardMarkup:
+    rows = [[
+        ui_button(tier_label("plus"), callback_data=subscribe_callback("subpick:plus:0")),
+        ui_button(tier_label("pro"), callback_data=subscribe_callback("subpick:pro:0")),
+    ]]
+
+    if with_back:
+        rows.append([ui_button(BTN_BACK, callback_data="home:back:0")])
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def reply_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A tap on one of the five buttons of the Telegram-keyboard menu (see home_reply_keyboard)."""
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None or not message.text:
+        return
+
+    if not is_allowed(user.id):
+        await reject_unauthorized(message, user.id)
+        return
+
+    label = message.text.strip()
+
+    if label == BTN_INVITE_TO_WIN:
+        text = invite_page(context.bot, user.id)[0]
+        await with_style_fallback(lambda: message.reply_text(text, reply_markup=invite_page(context.bot, user.id)[1]))
+    elif label == BTN_PLANS:
+        await with_style_fallback(
+            lambda: message.reply_text(plans_text(user.id), reply_markup=plans_keyboard(user.id, with_back=False))
+        )
+    elif label == BTN_SUBSCRIBE:
+        if not SUBSCRIPTIONS_ENABLED:
+            await message.reply_text(MSG_SUBSCRIPTIONS_COMING_SOON)
             return
-        await bot.send_message(
-            q.message.chat_id, text, reply_markup=markup, parse_mode="HTML"
+
+        await with_style_fallback(
+            lambda: message.reply_text(subscribe_page_text(user.id), reply_markup=subscribe_keyboard(with_back=False))
+        )
+    elif label == BTN_USAGE:
+        await with_style_fallback(
+            lambda: message.reply_text(usage_page_text(user.id), reply_markup=usage_keyboard(user.id, with_back=False))
+        )
+    elif label == BTN_HOW_TO_USE:
+        await send_guide(context, message.chat_id, with_back=False)
+
+
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/subscribe: choose a plan, then send a screenshot of the payment."""
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    await with_style_fallback(lambda: message.reply_text(subscribe_page_text(user.id), reply_markup=subscribe_keyboard()))
+
+
+PAYMENT_PERKS = {"plus": "priority over free users", "pro": "highest priority"}
+
+
+def payment_steps_text(tier: str, user_id: int | None = None) -> str:
+    """The payment screen. It is sent as HTML (so the channel name is a link) — everything dynamic is escaped."""
+    info = TIERS[tier]
+    how_to_pay = (
+        PAYMENT_INSTRUCTIONS.replace("{price}", price_text(tier))   # {price} = this plan's price (/price)
+        or "Ask the owner for the payment details (see the last line)."
+    )
+
+    how_to_pay_ar = (
+        PAYMENT_INSTRUCTIONS_AR.replace("{price}", price_text(tier, arabic=True))
+        or MSG_PAYMENT_NO_DETAILS_AR
+    )
+
+    def link_to_channel(label: str) -> str:
+        if REQUIRED_CHANNEL_URL:
+            return f'<a href="{html_escape(REQUIRED_CHANNEL_URL, quote=True)}">{html_escape(label)}</a>'
+        return html_escape(label)
+
+    channel_link = link_to_channel(MSG_PAYMENT_MAIN_CHANNEL)
+    user_id_text = f"<code>{user_id}</code>" if user_id is not None else "—"
+
+    english = MSG_30_DAYS_PER_DAY_FILES.format(
+        plan_tier=html_escape(tier_label(tier)),
+        size_daily_mb=format_size(int(info['daily_mb'] * 1024 * 1024)),
+        size_max_file_mb=format_size(int(info['max_file_mb'] * 1024 * 1024)),
+        perk=PAYMENT_PERKS.get(tier, ""),
+        how_to_pay=html_escape(how_to_pay),
+        channel_link=channel_link,
+        user_id=user_id_text,
+    )
+
+    arabic = MSG_PAYMENT_ARABIC.format(
+        how_to_pay=html_escape(how_to_pay_ar),
+        channel_link=link_to_channel(MSG_PAYMENT_MAIN_CHANNEL_AR),
+        user_id=user_id_text,
+    )
+
+    return f"{english}\n\n{MSG_PAYMENT_DIVIDER}\n\n{arabic}"
+
+
+async def maybe_handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, kind: str) -> bool:
+    """If this person is in the middle of /subscribe, an image is their payment proof. Returns True if used."""
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return False
+
+    state = awaiting_payment_proof.get(user.id)
+
+    if state is None:
+        return False
+
+    if time.time() - state["since"] > PAYMENT_PROOF_WAIT_SECONDS:
+        awaiting_payment_proof.pop(user.id, None)
+        return False
+
+    if time.time() - _last_proof_at.get(user.id, 0) < 20:
+        return True   # ignore a flood of screenshots
+
+    tier = state["tier"]
+    username = f"@{user.username}" if user.username else "no username"
+    caption = (
+        MSG_PAYMENT_PROOF_FROM_ID_WANTS.format(name=user_display_name(user), username=username, id=user.id, plan_tier=tier_label(tier), plan_id=plan_status_text(user.id))
+    )
+
+    def mark(candidate: str) -> str:
+        return " (requested)" if candidate == tier else ""
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(BTN_APPROVE.format(plan_plus=tier_label('plus'), mark_plus=mark('plus')), callback_data=f"payok:plus:{user.id}")],
+        [InlineKeyboardButton(BTN_APPROVE_2.format(plan_pro=tier_label('pro'), mark_pro=mark('pro')), callback_data=f"payok:pro:{user.id}")],
+        [InlineKeyboardButton(BTN_REJECT, callback_data=f"payno:_:{user.id}")],
+    ])
+
+    try:
+        if kind == "photo":
+            await context.bot.send_photo(chat_id=ADMIN_USER_ID, photo=file_id, caption=caption, reply_markup=keyboard)
+        else:
+            await context.bot.send_document(chat_id=ADMIN_USER_ID, document=file_id, caption=caption, reply_markup=keyboard)
+    except Exception:
+        logger.exception("Couldn't forward the payment proof to the admin")
+        await message.reply_text(MSG_I_COULDN_T_PASS_THAT.format(REQUIRED_CHANNEL_URL=REQUIRED_CHANNEL_URL))
+        return True
+
+    _last_proof_at[user.id] = time.time()
+    awaiting_payment_proof.pop(user.id, None)
+    await message.reply_text(MSG_GOT_IT_I_VE_SENT)
+    return True
+
+
+async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/grant <user> <plus|pro> [days=30] — admin only. <user> is a numeric ID or @username."""
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    usage = "Usage: /grant <user> <plus|pro> [days]\nExample: /grant 123456789 plus 30\n(<user> = numeric ID, or @username if they've used the bot)"
+
+    if len(context.args) < 2:
+        await message.reply_text(usage)
+        return
+
+    user_id = find_user_id(context.args[0])
+    tier = context.args[1].lower()
+
+    try:
+        days = int(context.args[2]) if len(context.args) > 2 else 30
+    except ValueError:
+        days = 0
+
+    if user_id is None:
+        await message.reply_text(
+            "I don't know that username. Use their numeric ID (they can get it from @userinfobot) "
+            "or ask them to send me /start first.\n\n" + usage
+        )
+        return
+
+    if tier not in ("plus", "pro") or not 1 <= days <= 3650:
+        await message.reply_text(usage)
+        return
+
+    until, verb = grant_plan(user_id, tier, days)
+
+    await message.reply_text(
+        MSG_FOR_ACTIVE_UNTIL.format(plan_tier=tier_label(tier), verb=verb, name=display_name_for(user_id), user_id=user_id, date_until=format_until(until), QUOTA_TZ=QUOTA_TZ)
+    )
+
+    if not await notify_user_granted(context.bot, user_id, tier, until):
+        await message.reply_text(MSG_I_COULDN_T_MESSAGE_THEM)
+
+
+async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/revoke <user> — admin only: end someone's plan now."""
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    user_id = find_user_id(context.args[0]) if context.args else None
+
+    if user_id is None:
+        await message.reply_text(MSG_USAGE_REVOKE_USER_NUMERIC_ID)
+        return
+
+    if _paid_subscription(user_id) is None and _active_bonus(user_id) is None:
+        await message.reply_text(MSG_HAS_NO_ACTIVE_PLAN.format(name=display_name_for(user_id), user_id=user_id))
+        return
+
+    subscriptions.pop(str(user_id), None)
+    referrals["bonus"].pop(str(user_id), None)
+    await message.reply_text(MSG_PLAN_ENDED_FOR_BACK_TO.format(name=display_name_for(user_id), user_id=user_id))
+
+
+async def subs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/subs — admin only: who is subscribed."""
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    rows = []
+    for key in list(subscriptions):
+        entry = active_subscription(int(key))
+        if entry:
+            rows.append((entry["until"], int(key), entry["tier"]))
+
+    if not rows:
+        await message.reply_text(MSG_NO_ACTIVE_SUBSCRIBERS)
+        return
+
+    rows.sort()
+    lines = [MSG_ACTIVE_SUBSCRIBERS.format(subscribers=subscribers_summary()), ""]
+
+    for until, user_id, tier in rows[:40]:
+        days_left = max(0, int((until - time.time()) // 86400))
+        lines.append(MSG_UNTIL_D_LEFT.format(plan_tier=tier_label(tier), name=display_name_for(user_id), user_id=user_id, date_until=format_until(until), days_left=days_left))
+
+    await message.reply_text("\n".join(lines)[:4000])
+
+
+MSG_PRICE_USAGE = (
+    "Usage:\n"
+    "/price — show the current prices\n"
+    "/price plus 10 — set one plan\n"
+    "/price plus 10 pro 25 — set both\n"
+    "/price 10 25 — same, Plus first then Pro\n"
+    "(amounts are in {currency})"
+)
+MSG_PRICE_CURRENT = "💰 Plan prices\n⭐ Plus: {plus}\n💎 Pro: {pro}"
+MSG_PRICE_NOT_SET = "⚠️ {name} has no price yet — set it with /price {tier} <amount>."
+MSG_PRICE_SAVED = "✅ Saved.\n\n"
+MSG_PRICE_BAD = "⚠️ I couldn't read that. The price must be a number above 0 (up to {max}).\n\n"
+
+
+def parse_price(text: str) -> float | None:
+    cleaned = text.strip().lower().replace(",", "").replace(PRICE_CURRENCY.lower(), "").strip()
+
+    if not re.fullmatch(r"\d+(\.\d+)?", cleaned):
+        return None
+
+    value = float(cleaned)
+    return value if 0 < value <= PRICE_MAX else None
+
+
+def price_overview_text() -> str:
+    text = MSG_PRICE_CURRENT.format(
+        plus=price_text("plus") if prices.get("plus") else "not set",
+        pro=price_text("pro") if prices.get("pro") else "not set",
+    )
+
+    for tier, name in (("plus", "Plus"), ("pro", "Pro")):
+        if not prices.get(tier):
+            text += "\n" + MSG_PRICE_NOT_SET.format(name=name, tier=tier)
+
+    return text
+
+
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/price [plus <amount>] [pro <amount>] — admin only: show or set the plan prices (saved)."""
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    args = list(context.args)
+
+    if not args:
+        await message.reply_text(price_overview_text() + "\n\n" + MSG_PRICE_USAGE.format(currency=PRICE_CURRENCY))
+        return
+
+    # "/price 10 25" = Plus 10, Pro 25
+    if len(args) == 2 and all(parse_price(arg) is not None for arg in args):
+        args = ["plus", args[0], "pro", args[1]]
+
+    if len(args) % 2:
+        await message.reply_text(MSG_PRICE_BAD.format(max=f"{PRICE_MAX:,}") + MSG_PRICE_USAGE.format(currency=PRICE_CURRENCY))
+        return
+
+    changes: dict[str, float] = {}
+
+    for tier_name, amount in zip(args[0::2], args[1::2]):
+        tier = tier_name.lower()
+        value = parse_price(amount)
+
+        if tier not in ("plus", "pro") or value is None:
+            await message.reply_text(MSG_PRICE_BAD.format(max=f"{PRICE_MAX:,}") + MSG_PRICE_USAGE.format(currency=PRICE_CURRENCY))
+            return
+
+        changes[tier] = value
+
+    prices.update(changes)          # nothing is changed unless every pair above was valid
+    prices["updated"] = time.time()
+    save_approved_users()
+
+    # Back it up right away, so a restart in the next few minutes can't lose it.
+    try:
+        await backup_database_if_changed(context.bot)
+    except Exception:
+        logger.exception("Couldn't back up right after /price")
+
+    await message.reply_text(MSG_PRICE_SAVED + price_overview_text())
+
+
+async def plans_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/plans — what each plan gives, and the person's own plan."""
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    await message.reply_text(plans_text(user.id))
+
+
+# ------------------------------------------------------------
+# Join-the-channel gate: nobody can use the bot until they have joined
+# REQUIRED_CHANNEL (the bot must be an ADMIN of that channel to see its
+# members). Runs before every other handler; the admin and UNLIMITED_USER_IDS
+# are exempt. Set REQUIRED_CHANNEL_ID=0 to switch it off.
+# ------------------------------------------------------------
+REQUIRED_CHANNEL_ID = int(os.getenv("REQUIRED_CHANNEL_ID", "-1004286055380"))
+REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL", "https://t.me/Kemopression")
+JOIN_CACHE_SECONDS = 600   # a member isn't re-checked for 10 minutes
+
+
+_joined_until: dict[int, float] = {}
+_join_check_warned = False
+
+
+def join_keyboard(styled: bool = True) -> InlineKeyboardMarkup:
+    # Telegram can colour a button ("style": "success" = green). It goes in
+    # api_kwargs, so it works on any python-telegram-bot version.
+    join_button = InlineKeyboardButton(
+        BTN_JOIN_THE_CHANNEL,
+        url=REQUIRED_CHANNEL_URL,
+        api_kwargs={"style": "success"} if styled else None,
+    )
+    return InlineKeyboardMarkup([
+        [join_button],
+        [InlineKeyboardButton(BTN_I_VE_JOINED, callback_data="joincheck")],
+    ])
+
+
+async def is_channel_member(bot, user_id: int) -> bool | None:
+    """True / False, or None when it can't be checked (bot isn't an admin of the channel)."""
+    now = time.monotonic()
+
+    if _joined_until.get(user_id, 0) > now:
+        return True
+
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL_ID, user_id=user_id)
+    except Exception:
+        logger.exception("Couldn't check channel membership for %s", user_id)
+        return None
+
+    joined = member.status in ("member", "administrator", "creator") or (
+        member.status == "restricted" and bool(getattr(member, "is_member", False))
+    )
+
+    if joined:
+        _joined_until[user_id] = now + JOIN_CACHE_SECONDS
+
+    return joined
+
+
+async def send_join_prompt(bot, chat_id: int) -> None:
+    try:
+        await bot.send_message(chat_id=chat_id, text=JOIN_TEXT, reply_markup=join_keyboard(styled=True))
+    except Exception:
+        # Maybe this Bot API server doesn't know button colours: send it plain.
+        logger.warning("Styled join button failed — sending a plain one", exc_info=True)
+        await bot.send_message(chat_id=chat_id, text=JOIN_TEXT, reply_markup=join_keyboard(styled=False))
+
+
+async def require_channel_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _join_check_warned
+
+    user = update.effective_user
+
+    if REQUIRED_CHANNEL_ID == 0 or user is None or user.is_bot or is_unlimited(user.id):
+        return
+
+    joined = await is_channel_member(context.bot, user.id)
+
+    if joined is None:
+        # Can't check (bot not an admin there?): let people through instead of locking everyone out.
+        if not _join_check_warned:
+            _join_check_warned = True
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text=(
+                        MSG_I_CAN_T_CHECK_WHO
+                    ),
+                )
+            except Exception:
+                pass
+        return
+
+    query = update.callback_query
+    is_recheck = query is not None and query.data == "joincheck"
+
+    if joined:
+        if str(user.id) in referrals["pending"] or str(user.id) in referrals["link_pending"]:
+            await credit_referral(context.bot, user)
+
+        if is_recheck:
+            await query.answer(MSG_THANKS_FOR_JOINING)
+            with contextlib.suppress(Exception):
+                await query.edit_message_text(MSG_YOU_RE_IN_SEND_ME)
+            raise ApplicationHandlerStop
+        return
+
+    if is_recheck:
+        await query.answer(MSG_YOU_HAVEN_T_JOINED_YET, show_alert=True)
+        raise ApplicationHandlerStop
+
+    if query is not None:
+        await query.answer(MSG_PLEASE_JOIN_OUR_CHANNEL_FIRST, show_alert=True)
+
+    chat_id = update.effective_chat.id if update.effective_chat else user.id
+    await send_join_prompt(context.bot, chat_id)
+    raise ApplicationHandlerStop
+
+
+# ------------------------------------------------------------
+# Statistics (/stats, admin only). Saved inside Database.zip (stats.json)
+# so they survive restarts. All dates/times are UTC.
+# ------------------------------------------------------------
+STATS_RECENT_LIMIT = 500
+STATS_DAILY_DAYS = 60
+
+
+def _empty_stats() -> dict:
+    return {
+        "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "totals": {
+            "jobs": 0, "video": 0, "audio": 0, "audio_edit": 0, "audio_replace": 0, "cover_only": 0, "smart_jobs": 0,
+            "failed": 0, "cancelled": 0, "received_video": 0, "received_audio": 0,
+            "original_bytes": 0, "compressed_bytes": 0,
+            "media_seconds": 0.0, "encode_seconds": 0.0, "wait_seconds": 0.0,
+            "pct_sum": 0.0, "pct_n": 0,
+            "max_original_bytes": 0, "best_saved_pct": None, "worst_saved_pct": None,
+        },
+        "levels": {},   # level label -> jobs / bytes / seconds
+        "users": {},    # user id (as text) -> name, username, first/last seen, jobs, bytes
+        "hours": [0] * 24,
+        "daily": {},    # "YYYY-MM-DD" -> jobs
+        "recent": [],   # the last STATS_RECENT_LIMIT jobs, one dict each
+    }
+
+
+stats: dict = _empty_stats()
+
+
+def _stats_activity(data: dict) -> int:
+    totals = data.get("totals", {})
+    return (
+        int(totals.get("jobs", 0)) + int(totals.get("failed", 0))
+        + int(totals.get("received_video", 0)) + int(totals.get("received_audio", 0))
+        + len(data.get("users", {}))
+    )
+
+
+def stats_json_bytes() -> bytes:
+    return json.dumps(stats, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def merge_stats_bytes(raw: bytes) -> bool:
+    """
+    Load stats from a Database.zip. If this server already has stats, the
+    bigger set wins (so an old backup can't overwrite newer numbers).
+    Returns True if the loaded stats were adopted. Raises ValueError if unusable.
+    """
+    global stats
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"stats are not valid JSON ({error})") from error
+
+    if not isinstance(data, dict) or not isinstance(data.get("totals"), dict):
+        raise ValueError("not a stats file")
+
+    loaded = _empty_stats()
+    loaded["since"] = str(data.get("since") or loaded["since"])
+    loaded["totals"].update({k: v for k, v in data["totals"].items() if k in loaded["totals"]})
+
+    for key in ("levels", "users", "daily"):
+        if isinstance(data.get(key), dict):
+            loaded[key] = data[key]
+
+    hours = data.get("hours")
+    if isinstance(hours, list) and len(hours) == 24 and all(isinstance(h, int) for h in hours):
+        loaded["hours"] = hours
+
+    if isinstance(data.get("recent"), list):
+        loaded["recent"] = data["recent"][-STATS_RECENT_LIMIT:]
+
+    if _stats_activity(loaded) >= _stats_activity(stats):
+        stats = loaded
+        return True
+
+    return False
+
+
+def _touch_user(user) -> dict | None:
+    """Create/refresh this user's entry (dates only, so it doesn't change on every message)."""
+    if user is None or getattr(user, "is_bot", False):
+        return None
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    name = user_display_name(user)
+    username = getattr(user, "username", None)
+    entry = stats["users"].get(str(user.id))
+
+    if entry is None:
+        entry = {
+            "name": name, "username": username,
+            "first_seen": today, "last_seen": today,
+            "jobs": 0, "original_bytes": 0, "compressed_bytes": 0,
+        }
+        stats["users"][str(user.id)] = entry
+    else:
+        entry["name"] = name
+        entry["username"] = username
+        entry["last_seen"] = today
+
+    return entry
+
+
+async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every other handler: keeps the list of users up to date."""
+    _touch_user(update.effective_user)
+
+
+def record_received(media_type: str) -> None:
+    key = "received_audio" if media_type == "audio" else "received_video"
+    stats["totals"][key] += 1
+
+
+def record_cancel() -> None:
+    stats["totals"]["cancelled"] = stats["totals"].get("cancelled", 0) + 1
+
+
+def record_failure(user) -> None:
+    stats["totals"]["failed"] += 1
+    _touch_user(user)
+
+
+def record_job(
+    *, user, kind: str, level_label: str | None, original_size, compressed_size,
+    media_seconds, encode_seconds, wait_seconds, total_seconds,
+    audio_label: str, boost: int, noise_reduction: bool, voice_enhancement: bool,
+    smart: bool = False,
+) -> None:
+    """Log one finished job. kind: video | audio | audio_edit | audio_replace."""
+    now = datetime.now(timezone.utc)
+    totals = stats["totals"]
+
+    # Only real compressions count towards size/percentage numbers —
+    # audio edits/replacements keep the video, so "saved %" means nothing there.
+    is_compression = kind in ("video", "audio")
+    saved_pct = None
+    if is_compression and original_size and compressed_size is not None:
+        saved_pct = (original_size - compressed_size) / original_size * 100
+
+    totals["jobs"] += 1
+    totals[kind] = totals.get(kind, 0) + 1
+    if smart:
+        totals["smart_jobs"] = totals.get("smart_jobs", 0) + 1
+    totals["media_seconds"] += float(media_seconds or 0)
+    totals["encode_seconds"] += float(encode_seconds or 0)
+    totals["wait_seconds"] += float(wait_seconds or 0)
+    totals["max_original_bytes"] = max(totals["max_original_bytes"], int(original_size or 0))
+
+    if is_compression:
+        totals["original_bytes"] += int(original_size or 0)
+        totals["compressed_bytes"] += int(compressed_size or 0)
+
+    if saved_pct is not None:
+        totals["pct_sum"] += saved_pct
+        totals["pct_n"] += 1
+        best, worst = totals["best_saved_pct"], totals["worst_saved_pct"]
+        totals["best_saved_pct"] = saved_pct if best is None else max(best, saved_pct)
+        totals["worst_saved_pct"] = saved_pct if worst is None else min(worst, saved_pct)
+
+    label = level_label or {
+        "audio": "Audio only", "audio_edit": "Audio edit", "audio_replace": "Audio replace",
+        "cover_only": "Cover only", "audio_copy": "Audio tags (no compression)",
+    }.get(kind, "Video")
+    level_entry = stats["levels"].setdefault(
+        label, {"jobs": 0, "original_bytes": 0, "compressed_bytes": 0, "encode_seconds": 0.0, "media_seconds": 0.0}
+    )
+    level_entry["jobs"] += 1
+    level_entry["encode_seconds"] += float(encode_seconds or 0)
+    level_entry["media_seconds"] += float(media_seconds or 0)
+    if is_compression:
+        level_entry["original_bytes"] += int(original_size or 0)
+        level_entry["compressed_bytes"] += int(compressed_size or 0)
+
+    user_entry = _touch_user(user)
+    if user_entry is not None:
+        user_entry["jobs"] += 1
+        if is_compression:
+            user_entry["original_bytes"] += int(original_size or 0)
+            user_entry["compressed_bytes"] += int(compressed_size or 0)
+
+    stats["hours"][now.hour] += 1
+    day = now.strftime("%Y-%m-%d")
+    stats["daily"][day] = stats["daily"].get(day, 0) + 1
+    for old_day in sorted(stats["daily"])[:-STATS_DAILY_DAYS]:
+        stats["daily"].pop(old_day, None)
+
+    stats["recent"].append({
+        "t": now.isoformat(timespec="seconds"),
+        "user_id": getattr(user, "id", None),
+        "user": user_display_name(user) if user is not None else "Unknown",
+        "kind": kind,
+        "level": label,
+        "original_bytes": original_size,
+        "compressed_bytes": compressed_size,
+        "saved_pct": None if saved_pct is None else round(saved_pct, 1),
+        "media_seconds": None if media_seconds is None else round(media_seconds, 1),
+        "encode_seconds": None if encode_seconds is None else round(encode_seconds, 1),
+        "wait_seconds": None if wait_seconds is None else round(wait_seconds, 1),
+        "total_seconds": None if total_seconds is None else round(total_seconds, 1),
+        "audio": audio_label,
+        "boost_percent": boost,
+        "noise_reduction": noise_reduction,
+        "voice_enhancement": voice_enhancement,
+        "smart": bool(smart),
+    })
+    del stats["recent"][:-STATS_RECENT_LIMIT]
+
+
+def _pct_text(value) -> str:
+    return "n/a" if value is None else f"{value:.1f}%"
+
+
+def stats_overview_text() -> str:
+    t = stats["totals"]
+    jobs = t["jobs"]
+    orig, comp = t["original_bytes"], t["compressed_bytes"]
+    overall_pct = (orig - comp) / orig * 100 if orig else None
+    avg_pct = t["pct_sum"] / t["pct_n"] if t["pct_n"] else None
+    now = datetime.now(timezone.utc)
+
+    def jobs_in_last(days: int) -> int:
+        days_list = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+        return sum(stats["daily"].get(d, 0) for d in days_list)
+
+    lines = [
+        MSG_BOT_STATISTICS_TIMES_IN_UTC,
+        MSG_SINCE_USER_S.format(since=stats['since'][:10], count_users=len(stats['users'])),
+        "",
+        MSG_FINISHED_JOBS.format(jobs=jobs),
+        MSG_VIDEO_COMPRESSIONS.format(video=t['video']),
+        MSG_AUDIO_COMPRESSIONS.format(audio=t['audio']),
+        MSG_AUDIO_EDITS_AUDIO_REPLACED.format(audio_edit=t['audio_edit'], audio_replace=t['audio_replace']),
+        MSG_FAILED.format(failed=t['failed']),
+        MSG_STATS_CANCELLED.format(cancelled=t.get('cancelled', 0)),
+        MSG_FILES_RECEIVED_VIDEO_AUDIO.format(received_video=t['received_video'], received_audio=t['received_audio']),
+        MSG_JOBS_TODAY_LAST_7_DAYS.format(jobs=jobs_in_last(1), jobs_2=jobs_in_last(7)),
+        MSG_TODAY_PERSON_S_SENT_FILES.format(quota_today_summary=quota_today_summary()[0], size=format_size(quota_today_summary()[1])),
+        MSG_ACTIVE_SUBSCRIBERS.format(subscribers=subscribers_summary()),
+    ]
+
+    if orig:
+        lines += [
+            "",
+            MSG_COMPRESSION,
+            MSG_ORIGINAL_TOTAL.format(size_orig=format_size(orig)),
+            MSG_COMPRESSED_TOTAL.format(size_comp=format_size(comp)),
+            MSG_SPACE_SAVED_OVERALL.format(size_orig_comp=format_size(orig - comp), pct_text_overall_pct=_pct_text(overall_pct)),
+            MSG_AVERAGE_SAVING_PER_FILE.format(pct_text_avg_pct=_pct_text(avg_pct)),
+            MSG_BEST_WORST.format(pct_text_best_saved_pct=_pct_text(t['best_saved_pct']), pct_text_worst_saved_pct=_pct_text(t['worst_saved_pct'])),
+            MSG_BIGGEST_FILE_RECEIVED.format(size_max_original_bytes=format_size(t['max_original_bytes'])),
+        ]
+
+    if jobs and t["encode_seconds"]:
+        speed = t["media_seconds"] / t["encode_seconds"]
+        lines += [
+            "",
+            MSG_TIME,
+            MSG_MEDIA_PROCESSED_LONG.format(time_media_seconds=format_duration(t['media_seconds'])),
+            MSG_TOTAL_ENCODING_TIME.format(time_encode_seconds=format_duration(t['encode_seconds'])),
+            MSG_AVERAGE_PER_JOB_REAL_TIME.format(time_encode_seconds_jobs=format_duration(t['encode_seconds'] / jobs), speed=speed),
+            MSG_AVERAGE_QUEUE_WAIT.format(time_wait_seconds_jobs=format_duration(t['wait_seconds'] / jobs)),
+        ]
+
+    if stats["levels"]:
+        lines += ["", MSG_BY_LEVEL]
+        for label, entry in sorted(stats["levels"].items(), key=lambda item: -item[1]["jobs"]):
+            level_pct = (
+                (entry["original_bytes"] - entry["compressed_bytes"]) / entry["original_bytes"] * 100
+                if entry["original_bytes"] else None
+            )
+            lines.append(
+                MSG_JOB_S_SAVED_AVG_ENCODE.format(label=label, jobs=entry['jobs'], pct_text_level_pct=_pct_text(level_pct), time_encode_seconds_jobs=format_duration(entry['encode_seconds'] / entry['jobs']))
+            )
+
+    if any(stats["hours"]):
+        peak = max(range(24), key=lambda h: stats["hours"][h])
+        lines += ["", MSG_BUSIEST_HOUR_00_59_UTC.format(peak=peak, hours_peak=stats['hours'][peak])]
+
+    recent = stats["recent"][-10:]
+    if recent:
+        lines += ["", MSG_LAST_JOBS_NEWEST_FIRST]
+        for job in reversed(recent):
+            when = job["t"][5:16].replace("T", " ")
+            if job.get("saved_pct") is not None:
+                size_part = (
+                    MSG_STATS_OVERVIEW_TEXT.format(size_original_bytes=format_size(job['original_bytes']), size_compressed_bytes=format_size(job['compressed_bytes']), saved_pct=job['saved_pct'])
+                )
+            else:
+                size_part = format_size(job["original_bytes"])
+            enc = job.get("encode_seconds")
+            enc_part = f" · encode {format_duration(enc)}" if enc is not None else ""
+            lines.append(MSG_STATS_OVERVIEW_TEXT_2.format(when=when, value=job['user'], level=job['level'], size_part=size_part, enc_part=enc_part))
+
+    lines += ["", MSG_MORE_STATS_USERS_STATS_CSV]
+    return "\n".join(lines)
+
+
+def stats_users_text() -> str:
+    users = sorted(
+        stats["users"].items(),
+        key=lambda item: (-item[1]["jobs"], item[1].get("last_seen", "")),
+    )
+    active = sum(1 for _, entry in users if entry["jobs"])
+
+    lines = [MSG_USER_S_HAVE_FINISHED_AT.format(count_users=len(users), active=active), ""]
+
+    for rank, (user_id, entry) in enumerate(users[:25], start=1):
+        saved = entry["original_bytes"] - entry["compressed_bytes"]
+        username = f" ({format_username(entry.get('username'))})" if entry.get("username") else ""
+        lines.append(
+            f"{rank}. {entry['name']}{username} — {entry['jobs']} job(s)"
+            + (f" · saved {format_size(saved)}" if entry["original_bytes"] else "")
+            + f" · first {entry.get('first_seen', '?')} · last {entry.get('last_seen', '?')}"
         )
 
+    if len(users) > 25:
+        lines.append(MSG_AND_MORE.format(len_users=len(users) - 25))
 
-# ───────────────────────── الأزرار ─────────────────────────
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    chat_id = q.message.chat_id
-    data = q.data
-    bot = context.bot
-    u = get_user(chat_id)
+    return "\n".join(lines)
 
-    if data == "today":
-        await deliver_today(bot, chat_id, u)
-    elif data == "howto":
-        await bot.send_message(chat_id, HOWTO_TEXT, parse_mode="HTML")
-    elif data == "menu":
-        await edit_or_send(q, bot, "القائمة", main_menu())
-    elif data == "settings":
-        await edit_or_send(q, bot, settings_text(u), settings_menu())
-    elif data == "progress":
-        await show_progress(bot, chat_id)
-    elif data == "set_pages":
-        await ask_pages(bot, chat_id)
-    elif data == "set_time":
-        await ask_time(bot, chat_id, context)
-    elif data == "set_tz":
-        await edit_or_send(q, bot, TZ_TEXT, tz_keyboard())
-    elif data == "set_goal":
-        await edit_or_send(q, bot, GOAL_TEXT, goal_keyboard(u))
-    elif data == "set_prayer":
-        await edit_or_send(q, bot, prayer_text(u), prayer_keyboard(u))
-    elif data == "tz_typed":
-        await ask_tz(bot, chat_id, context)
-    elif data == "loc_share":
-        await bot.send_message(
-            chat_id,
-            "دوس على الزرار اللي تحت وابعتلي موقعك 📍\n(بنحفظه تقريبي، من غير عنوانك بالظبط)",
-            reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton("📍 ابعت موقعي", request_location=True)]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
+
+def stats_csv_bytes() -> bytes:
+    import csv
+
+    fields = [
+        "t", "user_id", "user", "kind", "level", "original_bytes", "compressed_bytes",
+        "saved_pct", "media_seconds", "encode_seconds", "wait_seconds", "total_seconds",
+        "audio", "boost_percent", "noise_reduction", "voice_enhancement", "smart",
+    ]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(stats["recent"])
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def reset_stats_data() -> None:
+    """Wipe the statistics but KEEP the known users (name, @username, first/last seen).
+
+    Only each user's counters (jobs / bytes) go back to zero, so the totals and the
+    per-user numbers still add up, and /grant @username keeps working after a reset.
+    """
+    global stats
+
+    kept_users: dict = {}
+    for user_id, entry in stats.get("users", {}).items():
+        kept_users[user_id] = {
+            "name": entry.get("name") or "Unknown",
+            "username": entry.get("username"),
+            "first_seen": entry.get("first_seen") or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "last_seen": entry.get("last_seen") or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "jobs": 0, "original_bytes": 0, "compressed_bytes": 0,
+        }
+
+    stats = _empty_stats()
+    stats["users"] = kept_users
+
+
+async def reset_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reset_stats (admin only): asks for confirmation, then wipes the statistics."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(BTN_YES_RESET, callback_data="resetstats:yes:0"),
+        InlineKeyboardButton(BTN_CANCEL, callback_data="resetstats:no:0"),
+    ]])
+
+    await message.reply_text(
+        MSG_RESET_ALL_STATISTICS_THIS_ERASES.format(totals_jobs=stats['totals']['jobs'], count_users=len(stats['users'])),
+        reply_markup=keyboard,
+    )
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats (admin only). /stats users = per-user list, /stats csv = last jobs as a spreadsheet."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    option = (context.args[0].lower() if context.args else "")
+
+    if option == "csv":
+        if not stats["recent"]:
+            await message.reply_text(MSG_NO_FINISHED_JOBS_YET)
+            return
+        await message.reply_document(
+            document=stats_csv_bytes(),
+            filename="stats_jobs.csv",
+            caption=MSG_THE_LAST_JOB_S.format(count_recent=len(stats['recent'])),
+        )
+        return
+
+    text = stats_users_text() if option == "users" else stats_overview_text()
+    await message.reply_text(text[:4000])
+
+
+# How many times to retry a flaky network call (download/upload)
+# before giving up, and the base delay between attempts.
+RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "5"))
+RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "3"))
+
+# Length (seconds) of the sample clip encoded at EACH compression level.
+# The same clip is used two ways: to extrapolate the full-video size
+# estimate, and to send you a real preview of how that level looks
+# before you pick one. Longer = more accurate estimate and a better
+# preview, but the analyze step takes longer on a small CPU.
+SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "5"))
+
+# Caps FFmpeg's own thread usage so it doesn't try to use more
+# CPU than the service is actually allotted (helps avoid getting
+# throttled/killed on tight Railway resource limits).
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "2")
+
+# Threads FFmpeg may use to DECODE the source video. Left alone, the decoder
+# picks its own thread count (often the host's core count), and every thread
+# keeps decoded frames in flight — a big RAM cost on 1080p/4K sources.
+DECODER_THREADS = os.getenv("DECODER_THREADS", "0")  # 0 = let FFmpeg decide
+
+# Priority of the heavy FFmpeg jobs (0 = normal, 19 = lowest). Raising it makes
+# FFmpeg step aside whenever the bot itself, the Telegram API server or anything
+# else needs CPU, so a big encode can no longer starve them. It costs nothing
+# when the server is otherwise idle. Set FFMPEG_NICE=0 to switch it off.
+FFMPEG_NICE = int(os.getenv("FFMPEG_NICE", "10"))
+
+# How many level-estimates run at once during the "analyze" step.
+# Running all 5 fully in parallel spikes CPU/RAM briefly; this
+# caps it so the estimate phase stays within tight resource limits.
+ESTIMATE_CONCURRENCY = int(os.getenv("ESTIMATE_CONCURRENCY", "1"))
+
+# (How many heavy jobs run at once is MAX_CONCURRENT_JOBS, further down:
+# downloads/analysis and compressions share that one slot.)
+
+# ------------------------------------------------------------
+# PDF frame-extraction mode
+# ------------------------------------------------------------
+PDF_INTERVALS = [15, 30, 45, 60]  # seconds
+# No cap on frame count — a long video at a short interval can
+# produce a very large PDF (and take a while for img2pdf to build),
+# but nothing gets silently dropped anymore.
+
+# "Auto-detect changes" mode: sample the video at a fine, fixed
+# granularity, then run the same auto-threshold dedup used elsewhere
+# to keep only frames that actually changed — no fixed interval to
+# pick at all. SMART_CAPTURE_BASE_INTERVAL is the finest we'll ever
+# sample at. SMART_CAPTURE_MAX_CANDIDATES caps how many raw candidate
+# frames get extracted+compared regardless of video length (each one
+# costs an FFmpeg call), by widening the sampling interval for long
+# videos instead of scanning e.g. an hour-long video at 2s resolution.
+SMART_CAPTURE_BASE_INTERVAL = float(os.getenv("SMART_CAPTURE_BASE_INTERVAL", "5"))
+SMART_CAPTURE_MAX_CANDIDATES = int(os.getenv("SMART_CAPTURE_MAX_CANDIDATES", "900"))
+
+# How close two frames' 24x24 grayscale signatures must be to count
+# as "extremely similar" for the auto-delete-similar-frames step.
+# This is the WORST single-cell difference (0-255 scale), not an
+# average — see frames_are_near_identical. A low value means even one
+# badly-differing patch of the frame (a subtitle, a small motion,
+# anything localized) is enough to call the frames different.
+DEDUP_SIMILARITY_THRESHOLD = 10
+
+# The automatic threshold is only trusted inside this range. Real duplicates
+# differ by compression noise only (a few levels out of 255); anything above
+# the cap is a real change (a new slide, new text), so it must never be treated
+# as a duplicate -- no matter how the diffs of this particular video cluster.
+DEDUP_MIN_THRESHOLD = 6
+DEDUP_MAX_THRESHOLD = 14
+# For the automatic split to count, the "duplicate" group must really be noise-
+# level and sit clearly apart from the "real change" group.
+DEDUP_MAX_LOW_GROUP_MEAN = 8
+DEDUP_MIN_GROUP_GAP = 20
+
+# ---- OCR check for the "delete similar frames" step ----
+# Needs the `tesseract` program on the server; without it the step silently
+# works from pixels only. Turn off with DEDUP_OCR=0. For other languages
+# install the language pack and set e.g. OCR_LANGS=eng+ara.
+OCR_ENABLED = os.getenv("DEDUP_OCR", "1") != "0"
+OCR_LANGS = os.getenv("OCR_LANGS", "eng")
+OCR_TIMEOUT = float(os.getenv("OCR_TIMEOUT", "30"))               # seconds per frame
+OCR_TIME_BUDGET = float(os.getenv("OCR_TIME_BUDGET", "900"))      # seconds per dedup run; then pixels only
+OCR_MIN_CHARS = 25          # a frame with at least this many letters/digits "has text"
+OCR_NO_TEXT_CHARS = 10      # fewer than this = "no text" (in between = unsure, no opinion)
+OCR_MIN_CONF = float(os.getenv("OCR_MIN_CONF", "60"))   # ignore words Tesseract itself isn't sure about (0-100)
+OCR_WORD_MATCH_RATIO = 0.8  # two long words this alike count as the same word (OCR flips a letter or two)
+OCR_ALLOWED_CHANGED_WORDS = 1   # on a text with 12+ words, one stray word of OCR noise is tolerated
+# A cursor / pointer / overlay sitting on top of a word hides it: the text only LOSES
+# (or regains) a few words, nothing is replaced. On a text with 20+ words that is
+# tolerated, as long as it's this few words and one-sided.
+OCR_ALLOWED_ONE_SIDED_WORDS = int(os.getenv("OCR_ALLOWED_ONE_SIDED_WORDS", "2"))
+OCR_SKIP_PIXEL_DIFF = 2     # pixel diff this low = the very same image, no need to read it
+# Pixels differ MORE than the duplicate threshold, but the words are the same
+# (webcam, cursor, laser pointer, animation...) -> still a duplicate, as long as
+# the frame has plenty of text and only a SMALL PART of the picture changed.
+OCR_MERGE_SAME_TEXT = os.getenv("DEDUP_OCR_MERGE", "1") != "0"
+OCR_MERGE_MIN_CHARS = 40
+OCR_MERGE_MAX_CHANGED_AREA = float(os.getenv("OCR_MERGE_MAX_CHANGED_AREA", "0.15"))   # share of the picture allowed to differ
+
+# ---- laser pointer / cursor dot ----
+# Lecture videos are full of a small coloured dot (laser pointer) wandering over an
+# otherwise identical slide. It's recognised by shape, no OCR needed: a handful of
+# changed cells on a fine colour grid, in 1-3 small blobs, each with a strongly
+# coloured cell. A real edit (a word, a number, a new line) is wider or not coloured.
+POINTER_ENABLED = os.getenv("DEDUP_POINTER", "1") != "0"
+POINTER_GRID_W, POINTER_GRID_H = 160, 90
+POINTER_CELL_DIFF = 30          # a grid cell counts as changed from this colour difference (0-255)
+POINTER_MAX_CELLS = 24          # more changed cells than this = a real change, not a dot
+POINTER_MAX_CLUSTERS = 3        # the dot's old spot + its new spot (+ one spare)
+POINTER_MAX_SPAN = 6            # a blob is at most this many cells wide / tall (~4% of the frame width)
+POINTER_MIN_COLOUR = int(os.getenv("POINTER_MIN_COLOUR", "40"))   # a blob needs one cell this colourful (strongest channel minus the next)
+POINTER_COARSE_GATE = 0.05      # only look closer when under 5% of the coarse grid changed
+
+# ============================================================
+# Compression levels
+# ============================================================
+#
+# "medium" mirrors the bot's original fixed behavior and can
+# still be tuned via env vars so existing Railway variables
+# keep working.
+#
+# lookahead/refs/bframes control libx264's internal frame
+# buffering, which is the main driver of encoder-side memory
+# use. Lower numbers = less RAM, at some cost to compression
+# efficiency (usually negligible at the CRF values used here).
+
+LEVELS: dict[str, dict] = {
+    "low": {
+        "label": MSG_LOW,
+        "detail": MSG_BEST_QUALITY_BIGGEST_FILE,
+        "crf": "23",
+        "preset": "fast",
+        "max_width": 1920,
+        "audio_bitrate": "128k",
+        "lookahead": "20",
+        "refs": "3",
+        "bframes": "3",
+    },
+    "medium": {
+        "label": MSG_MEDIUM,
+        "detail": MSG_BALANCED_DEFAULT,
+        "crf": os.getenv("CRF", "28"),
+        "preset": os.getenv("PRESET", "veryfast"),
+        "max_width": int(os.getenv("MAX_WIDTH", "1280")),
+        "audio_bitrate": os.getenv("AUDIO_BITRATE", "96k"),
+        "lookahead": "15",
+        "refs": "2",
+        "bframes": "2",
+    },
+    "high": {
+        "label": MSG_HIGH,
+        "detail": MSG_SMALLER_FILE_VISIBLE_QUALITY_LOSS,
+        "crf": "32",
+        "preset": "veryfast",
+        "max_width": 854,
+        "audio_bitrate": "64k",
+        "lookahead": "10",
+        "refs": "1",
+        "bframes": "2",
+    },
+    "very_high": {
+        "label": MSG_VERY_HIGH,
+        "detail": MSG_MUCH_SMALLER_NOTICEABLY_SOFTER,
+        "crf": "36",
+        "preset": "superfast",
+        "max_width": 640,
+        "audio_bitrate": "48k",
+        "lookahead": "8",
+        "refs": "1",
+        "bframes": "1",
+    },
+    "extreme": {
+        "label": MSG_EXTREME,
+        "detail": MSG_SMALLEST_POSSIBLE_ROUGH_QUALITY,
+        "crf": "40",
+        "preset": "ultrafast",
+        "max_width": 426,
+        "audio_bitrate": "32k",
+        "lookahead": "5",
+        "refs": "1",
+        "bframes": "0",
+    },
+}
+
+LEVEL_ORDER = ["low", "medium", "high", "very_high", "extreme"]
+
+DEFAULT_LEVEL = "medium"
+
+# ============================================================
+# Audio quality + volume boost (chosen after the video level)
+# ============================================================
+
+# Five audio tiers (kbps). 32 kbps and below are saved as mono at a lower sample rate
+# (see audio_rate_args) — that is what makes such small files still sound clear.
+AUDIO_LEVELS: dict[str, dict] = {
+    "k16": {"label": "🔈 16 kbps", "detail": "Smallest — voice only, sounds muffled", "bitrate": "16k"},
+    "k32": {"label": "🔈 32 kbps", "detail": "Small — clear speech", "bitrate": "32k"},
+    "k64": {"label": "🔉 64 kbps", "detail": "Good for lectures and calls", "bitrate": "64k"},
+    "k96": {"label": "🔉 96 kbps", "detail": MSG_BALANCED, "bitrate": "96k"},
+    "k128": {"label": "🔊 128 kbps", "detail": "Best quality, biggest audio", "bitrate": "128k"},
+}
+
+AUDIO_LEVEL_ORDER = ["k16", "k32", "k64", "k96", "k128"]
+
+DEFAULT_AUDIO_LEVEL = "k96"
+
+
+def audio_rate_args(bitrate: str | None) -> list[str]:
+    """Extra FFmpeg audio options for very low bitrates: mono + 24 kHz (stereo 44.1 kHz at 16-32 kbps sounds bad)."""
+    try:
+        kbps = int(str(bitrate).rstrip("k"))
+    except ValueError:
+        return []
+
+    return ["-ac", "1", "-ar", "24000"] if kbps <= 32 else []
+
+# Extra choice in the video flow only: keep the original audio exactly as it is
+# (no re-encoding, so no quality loss; enhancements/volume boost don't apply).
+ORIGINAL_AUDIO = "original"
+AUDIO_LEVELS[ORIGINAL_AUDIO] = {
+    "label": MSG_ORIGINAL,
+    "detail": MSG_KEEP_THE_AUDIO_UNTOUCHED_NO,
+    "bitrate": None,
+}
+# Audio formats that can be copied straight into the output MP4.
+MP4_COPY_SAFE_AUDIO = {"aac", "mp3", "ac3", "eac3", "alac"}
+
+# Sentinel used in place of a real LEVELS key when the input is an
+# audio file with no video stream to compress — skips straight to
+# audio quality + volume boost, same buttons/previews as the video
+# flow, just without a video-level step in front of them.
+AUDIO_ONLY_LEVEL = "audio_only"
+
+# Sentinel for a VIDEO input where the user only wants the audio
+# edited (quality / enhancements / volume boost). The video stream is
+# copied as-is (no re-encode), so it's fast and the picture is
+# untouched. Same audio buttons/previews as the other flows.
+AUDIO_EDIT_LEVEL = "audio_edit"
+
+# Sentinel for a VIDEO input where the user wants its audio track
+# swapped for a different recording they send next. Video is copied
+# untouched; the new recording becomes the audio. (Only ever passed
+# to run_compression together with replacement_audio_path — it never
+# appears in callback data, so it's not part of is_flow_level.)
+AUDIO_REPLACE_LEVEL = "audio_replace"
+
+# Sentinel for "only the cover changed": the original video file is
+# uploaded as it is (no re-encode, nothing else touched) with the new
+# cover. Only ever passed to run_compression from the "upload unchanged"
+# button shown after a video cover is set.
+COVER_ONLY_LEVEL = "cover_only"
+
+# Sentinel for an AUDIO file the user wants back with new tags (name /
+# artist / album / cover) but WITHOUT any re-encoding: the sound is
+# stream-copied, so quality and size stay exactly as they were. Only ever
+# passed to run_compression from the "Send as is" button (callback
+# "audiosend") — it never appears in audioset/volumeset callback data.
+AUDIO_COPY_LEVEL = "audio_copy"
+
+# Audio quality used for a replacement recording. The video is copied
+# (not re-encoded), so the extra bitrate over "medium" costs very
+# little size but keeps the user's recording sounding as good as sent.
+REPLACE_AUDIO_LEVEL = "k128"
+
+
+def is_flow_level(level: str) -> bool:
+    """True for a real video level or either audio-flow sentinel."""
+    return level in LEVELS or level in (AUDIO_ONLY_LEVEL, AUDIO_EDIT_LEVEL)
+
+
+def flow_header(level: str, audio_level: str) -> str:
+    """One-line summary of what's been picked so far, shown above the audio menus."""
+    audio_label = AUDIO_LEVELS[audio_level]["label"]
+
+    if level == AUDIO_ONLY_LEVEL:
+        return MSG_AUDIO_QUALITY.format(audio_label=audio_label)
+    if level == AUDIO_EDIT_LEVEL:
+        return MSG_JUST_EDITING_AUDIO_VIDEO_UNTOUCHED.format(audio_label=audio_label)
+    return MSG_AUDIO.format(level_label=LEVELS[level]['label'], audio_label=audio_label)
+
+# Audio file types accepted directly (message.audio/.voice) or as a
+# document upload — routes into the audio-only flow instead of the
+# video flow.
+AUDIO_FILE_EXTENSIONS = (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".flac", ".opus", ".wma")
+
+# Volume boost is intentionally a fixed set of steps (plus "no
+# boost") rather than a free-form percentage — keeps it simple and
+# gives each step its own preview clip below.
+VOLUME_BOOST_OPTIONS = [0, 50, 100, 150, 200]  # percent: no boost, +50%, +100%, +150%, +200%
+
+# Length of the audio-only preview clip sent for each volume level
+# before the user picks one.
+VOLUME_PREVIEW_SECONDS = int(os.getenv("VOLUME_PREVIEW_SECONDS", "20"))
+ENHANCEMENT_PREVIEW_SECONDS = int(os.getenv("ENHANCEMENT_PREVIEW_SECONDS", "10"))
+
+# ------------------------------------------------------------
+# Audio enhancements (optional, toggled before the volume step)
+# ------------------------------------------------------------
+
+# FFT-based denoiser — cuts steady background hiss/hum (fan noise,
+# room tone, mic self-noise). nf is the assumed noise floor in dB;
+# -25 is ffmpeg's own default and works reasonably broadly.
+NOISE_REDUCTION_FILTER = os.getenv("NOISE_REDUCTION_FILTER", "afftdn=nf=-25")
+
+# Tuned for spoken lecture/voice recordings: a highpass to cut
+# low-end rumble/mic handling noise below where voice lives, a
+# presence-band boost around 3kHz for intelligibility, then
+# dynaudnorm to even out volume swings from mic distance changing
+# (walking around, turning away from the mic, etc).
+VOICE_ENHANCEMENT_FILTER = os.getenv(
+    "VOICE_ENHANCEMENT_FILTER",
+    "highpass=f=100,equalizer=f=3000:width_type=o:width=1.5:g=4,dynaudnorm=f=150:g=15",
+)
+
+
+def build_audio_filter_chain(
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+    volume_boost_percent: int = 0,
+) -> str | None:
+    """
+    Combines the optional audio filters into one -af filtergraph, in
+    a sensible order: clean up noise first, then reshape for voice
+    clarity, then apply the volume boost last (so gain staging happens
+    after cleanup, not before it). Returns None if nothing's enabled.
+    """
+
+    parts = []
+
+    if noise_reduction:
+        parts.append(NOISE_REDUCTION_FILTER)
+
+    if voice_enhancement:
+        parts.append(VOICE_ENHANCEMENT_FILTER)
+
+    if volume_boost_percent:
+        parts.append(f"volume={1 + volume_boost_percent / 100:.2f}")
+
+    return ",".join(parts) if parts else None
+
+# Per-chat default level, used only to mark which button is
+# starred in the estimate menu.
+chat_default_level: dict[int, str] = {}
+
+# Videos that have been downloaded and analyzed, waiting on the
+# user to pick a level. Keyed by the original message_id.
+# NOTE: in-memory only — resets on redeploy/restart, and capped
+# below since each entry holds a real downloaded video file.
+pending_compressions: dict[int, dict] = {}
+PENDING_MAX = 5
+
+# After a PDF is extracted, we deliberately keep the downloaded
+# video around (instead of deleting it right away) so the user can
+# still choose to compress it or auto-delete similar frames. Maps
+# chat_id -> the pending_compressions message_id being held open.
+# It's only torn down when the user sends another video or taps
+# "Finish session" — see clear_pending().
+open_pdf_sessions: dict[int, int] = {}
+
+# chat_id -> message_id of the video whose audio is about to be replaced.
+# While an entry exists, the next audio recording that chat sends is
+# treated as the replacement track instead of a new audio file to compress.
+awaiting_audio_replacement: dict[int, int] = {}
+
+# chat_id -> {"mid": pending message_id, "field": "name" | "artist" | "album" | "cover" | "videocover"}
+# While an entry exists, the next text message (name / album) or image
+# (cover / videocover) that chat sends is treated as that value.
+awaiting_input: dict[int, dict] = {}
+
+# active_compressions is a plain counter — safe as a bare int since everything
+# here runs on the single asyncio event loop, no separate threads involved.
+
+# ONE heavy job at a time. A download + analysis (probe + sample encodes) and
+# a compression (encode + upload + temp-file cleanup) share this single slot,
+# so they never run together: the next job only starts once the previous one
+# has finished AND cleaned up its temp files (RAM is tight on this server).
+# Waiting jobs are served by plan first (Pro, then Plus, then Free) and, within
+# the same plan, first-come-first-served. A running job is never interrupted.
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
+
+
+class PriorityGate:
+    """A slot (or a few) that waiting jobs get in order of priority, then arrival."""
+
+    def __init__(self, slots: int) -> None:
+        self.free = slots
+        self.waiters: list[dict] = []
+
+    def locked(self) -> bool:
+        return self.free <= 0 or bool(self.waiters)
+
+    def try_take(self) -> bool:
+        if self.free > 0 and not self.waiters:
+            self.free -= 1
+            return True
+        return False
+
+    def enqueue(self, entry: dict) -> None:
+        entry["future"] = asyncio.get_running_loop().create_future()
+        self.waiters.append(entry)
+
+    async def wait(self, entry: dict) -> None:
+        try:
+            await entry["future"]
+        except asyncio.CancelledError:
+            if entry["future"].done() and not entry["future"].cancelled():
+                self.release()                    # the slot had just been handed to us: give it back
+            elif entry in self.waiters:
+                self.waiters.remove(entry)
+            raise
+
+    def release(self) -> None:
+        self.free += 1
+        self._wake()
+
+    def _wake(self) -> None:
+        while self.free > 0 and self.waiters:
+            entry = min(self.waiters, key=lambda e: (-e["priority"], e["seq"]))
+            self.waiters.remove(entry)
+            if not entry["future"].done():
+                self.free -= 1
+                entry["future"].set_result(None)
+
+
+work_gate = PriorityGate(MAX_CONCURRENT_JOBS)
+work_waiting = work_gate.waiters     # same list: other code only counts it
+work_active = 0
+_gate_sequence = itertools.count()
+
+# /update mode (admin): turn away NEW files so a deploy can happen once the
+# people already in the system have finished. See update_command() below.
+update_mode = {"on": False, "notified": False}
+active_job_ids: set[int] = set()   # message ids with a download/analysis/compression in the system
+other_jobs_running = 0             # PDF / frame-extraction jobs (they don't use the work slot)
+
+# How many Telegram updates the bot may handle at the same time. Without
+# this the bot handles ONE update at a time, so while a video is compressing
+# nobody else's message or button would even be looked at (no queue message,
+# no /stats, no Cancel). 0 = old one-at-a-time behavior.
+CONCURRENT_UPDATES = int(os.getenv("CONCURRENT_UPDATES", "16"))
+
+
+def remaining_encode_seconds() -> float | None:
+    """Rough time left on the compression running right now (None if unknown)."""
+    now = time.monotonic()
+
+    for info in active_job_progress.values():
+        if info["percent"] >= 1:
+            elapsed = now - info["start_time"]
+            return elapsed * (100 - info["percent"]) / info["percent"]
+
+    return None
+
+
+async def acquire_work_slot(post_status, priority: int = 0, plan_label: str | None = None) -> None:
+    """
+    Wait for the single heavy-work slot. If there's a line, post_status(text)
+    (awaited; it should post the first message and edit it afterwards) shows the
+    person their place and refreshes it every few seconds. Subscribers (higher
+    priority) are served before free users. Returns once the slot is theirs — the
+    caller MUST call release_work_slot() when completely done (for a compression:
+    after the result is sent and the temp files are gone).
+    """
+    global work_active
+
+    entry = {"priority": priority, "seq": next(_gate_sequence), "future": None}
+    refresher = None
+
+    if not work_gate.try_take():
+        work_gate.enqueue(entry)
+
+        def wait_text() -> str:
+            my_key = (-entry["priority"], entry["seq"])
+            ahead = work_active + sum(
+                1 for other in work_gate.waiters if (-other["priority"], other["seq"]) < my_key
+            )
+
+            lines = []
+            if plan_label:
+                lines.append(MSG_YOU_RE_SUBSCRIBED_SO_YOU.format(plan_label=plan_label))
+            lines.append(
+                MSG_JOB_S_AHEAD_OF_YOU.format(ahead=ahead)
+            )
+
+            remaining = remaining_encode_seconds()
+            if remaining is not None:
+                lines.append(MSG_THE_COMPRESSION_RUNNING_NOW_HAS.format(time_remaining=format_duration(remaining)))
+
+            if not plan_label and priority == 0:
+                lines.append(MSG_PLUS_AND_PRO_MEMBERS_ARE)
+
+            return "\n".join(lines)
+
+        try:
+            await post_status(wait_text())
+        except Exception:
+            logger.warning("Couldn't post the queue message")
+
+        async def refresh_wait_message() -> None:
+            while True:
+                await asyncio.sleep(8)
+                try:
+                    await post_status(wait_text())
+                except Exception:
+                    pass
+
+        refresher = asyncio.create_task(refresh_wait_message())
+
+        try:
+            await work_gate.wait(entry)
+        finally:
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await refresher
+
+    work_active += 1
+    update_mode["notified"] = False  # new work started: the "all done" message must fire again
+
+
+def release_work_slot() -> None:
+    global work_active
+
+    work_active = max(0, work_active - 1)
+    work_gate.release()
+active_compressions = 0
+
+# job_token (a unique object per compression call) -> live progress, for
+# jobs currently actually encoding. Used to estimate how long a queued
+# job will have to wait.
+active_job_progress: dict[object, dict] = {}
+
+# FIFO of jobs waiting for a compression slot: [{"job_id": token, "duration": seconds|None}, ...]
+compression_queue: list[dict] = []
+
+
+def estimate_queue_wait_seconds(job_token: object) -> float:
+    """
+    Rough estimate of how long job_token will wait for a compression
+    slot: the remaining time on whatever's actively encoding right
+    now, plus the expected encode time of every job ahead of it in
+    the queue. "Expected encode time" for a queued-but-not-yet-started
+    job is guessed from the encode rate (seconds of encoding per
+    second of source video) observed on whichever active job has made
+    enough progress to measure it — falling back to a rough "about
+    real-time" assumption if nothing's measurable yet.
+    """
+
+    now = time.monotonic()
+
+    encode_rate = 1.0  # fallback: assume roughly 1 second of encoding per second of video
+
+    for info in active_job_progress.values():
+        if info["percent"] >= 1 and info["duration"]:
+            elapsed = now - info["start_time"]
+            processed_seconds = info["duration"] * (info["percent"] / 100)
+            if processed_seconds > 0:
+                encode_rate = elapsed / processed_seconds
+                break
+
+    total_wait = 0.0
+
+    for info in active_job_progress.values():
+        elapsed = now - info["start_time"]
+        if info["percent"] >= 1:
+            total_wait += elapsed * (100 - info["percent"]) / info["percent"]
+        elif info["duration"]:
+            total_wait += max(0.0, info["duration"] * encode_rate - elapsed)
+
+    for entry in compression_queue:
+        if entry["job_id"] is job_token:
+            break
+        if entry["duration"]:
+            total_wait += entry["duration"] * encode_rate
+
+    return total_wait
+
+
+def get_default_level(chat_id: int) -> str:
+    return chat_default_level.get(chat_id, DEFAULT_LEVEL)
+
+
+def cleanup_work_dir(work_dir: Path) -> None:
+    try:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    except Exception:
+        logger.exception("Could not clean temporary files in %s", work_dir)
+
+
+def clear_pending(message_id: int) -> None:
+    """
+    Tear down a pending compression: delete its temp/work dir, drop
+    it from pending_compressions, and close out any open PDF session
+    pointing at it. This is the single place that actually deletes a
+    stored video — call it only when a replacement video has arrived
+    or the user has explicitly finished/cancelled the session.
+    """
+
+    pending = pending_compressions.pop(message_id, None)
+    if pending is not None:
+        cleanup_work_dir(pending["work_dir"])
+
+    stale_chats = [
+        chat_id for chat_id, mid in open_pdf_sessions.items() if mid == message_id
+    ]
+    for chat_id in stale_chats:
+        open_pdf_sessions.pop(chat_id, None)
+
+    waiting_chats = [
+        chat_id for chat_id, mid in awaiting_audio_replacement.items() if mid == message_id
+    ]
+    for chat_id in waiting_chats:
+        awaiting_audio_replacement.pop(chat_id, None)
+
+    input_chats = [
+        chat_id for chat_id, info in awaiting_input.items() if info.get("mid") == message_id
+    ]
+    for chat_id in input_chats:
+        awaiting_input.pop(chat_id, None)
+
+
+# ------------------------------------------------------------
+# Disk clean-up: nothing a person uploaded is kept forever.
+#  - IDLE_FILE_TTL_MINUTES without any button tap -> the stored video is deleted
+#    (they're told, and just send it again). 0 switches this off.
+#  - the copy the local Bot API server keeps of every download is deleted
+#    right after we make our own copy.
+#  - at startup, leftovers from before a restart are swept away.
+# ------------------------------------------------------------
+IDLE_FILE_TTL_MINUTES = int(os.getenv("IDLE_FILE_TTL_MINUTES", "5"))          # stored VIDEOS
+# Anything that isn't a video (audio files; merge and PDF lists have their own 15 min timers).
+IDLE_OTHER_TTL_MINUTES = int(os.getenv("IDLE_OTHER_TTL_MINUTES", "15"))
+
+
+def delete_server_copy(telegram_file) -> None:
+    """The local Bot API server never deletes what it downloaded; we have our own copy now."""
+    path = getattr(telegram_file, "file_path", None)
+
+    if path and os.path.isabs(str(path)):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def sweep_temp_dir() -> int:
+    """At startup nothing is in flight, so anything in TEMP_DIR is a leftover."""
+    root = Path(TEMP_DIR)
+    removed = 0
+
+    if not root.is_dir():
+        return 0
+
+    for item in root.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            removed += 1
+        except OSError:
+            logger.warning("Couldn't remove leftover %s", item)
+
+    return removed
+
+
+async def expire_idle_files(bot) -> int:
+    """Delete stored videos whose owner hasn't done anything for IDLE_FILE_TTL_MINUTES."""
+    if IDLE_FILE_TTL_MINUTES <= 0:
+        return 0
+
+    now = time.time()
+    removed = 0
+
+    for message_id, pending in list(pending_compressions.items()):
+        if message_id in active_job_ids:
+            continue   # being analyzed / queued / compressed right now
+
+        is_video = pending.get("media_type", "video") == "video"
+        minutes = IDLE_FILE_TTL_MINUTES if is_video else IDLE_OTHER_TTL_MINUTES
+
+        if now - pending.get("last_active", now) < minutes * 60:
+            continue
+
+        chat_id = pending.get("chat_id")
+
+        # Nothing was sent back for this file, so give the daily-limit bytes back.
+        refunded_text = ""
+        owner_id = pending.get("owner_id")
+        charged = int(pending.get("charged_bytes") or pending.get("original_size") or 0)
+
+        if quota_applies(owner_id) and charged > 0:
+            quota_refund(owner_id, charged)
+            refunded_text = format_size(charged)
+
+        clear_pending(message_id)
+        removed += 1
+
+        if chat_id is not None:
+            with contextlib.suppress(Exception):
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        (
+                            MSG_I_DELETED_YOUR_VIDEO_REFUNDED.format(IDLE_FILE_TTL_MINUTES=minutes, size=refunded_text)
+                            if refunded_text
+                            else MSG_I_DELETED_YOUR_VIDEO_BECAUSE.format(IDLE_FILE_TTL_MINUTES=minutes)
+                        )
+                        if is_video
+                        else (
+                            MSG_I_DELETED_YOUR_AUDIO_REFUNDED.format(minutes=minutes, size=refunded_text)
+                            if refunded_text
+                            else MSG_I_DELETED_YOUR_AUDIO_BECAUSE.format(minutes=minutes)
+                        )
+                    ),
+                )
+
+    return removed
+
+
+async def idle_cleanup_loop(bot) -> None:
+    while True:
+        await asyncio.sleep(60)
+
+        try:
+            removed = await expire_idle_files(bot)
+            removed += await expire_idle_merge_sessions(bot)
+            removed += await expire_idle_pdf_sessions(bot)
+            if removed:
+                logger.info("Deleted %d idle stored video(s).", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Idle clean-up failed")
+
+
+def remember_pending(message_id: int, entry: dict) -> list[dict]:
+    """
+    Store an analyzed file waiting for its owner's choice. If that goes over
+    PENDING_MAX, the oldest stored files are deleted to make room — but never
+    one that is being analyzed / queued / compressed right now, and never the
+    new one. When every other entry is busy the cap is simply exceeded for a
+    while (it shrinks again as jobs finish).
+
+    Returns who was evicted (chat_id + refunded size text) so the caller can tell
+    them — see notify_evicted(). The owner's daily-limit bytes are refunded, the
+    same as when an idle file expires (except for a file whose PDF was already
+    delivered: that one got its result, so nothing is given back).
+    """
+    entry["last_active"] = time.time()   # refreshed on every button tap (see handle_callback_inner)
+    pending_compressions[message_id] = entry
+
+    evicted: list[dict] = []
+
+    while len(pending_compressions) > PENDING_MAX:
+        victim_id = next(
+            (
+                key for key in pending_compressions
+                if key != message_id and key not in active_job_ids and key not in running_jobs
+            ),
+            None,
+        )
+
+        if victim_id is None:
+            break   # everyone else is busy: don't break a running job
+
+        victim = pending_compressions.get(victim_id) or {}
+        owner_id = victim.get("owner_id")
+        charged = int(victim.get("charged_bytes") or victim.get("original_size") or 0)
+        pdf_delivered = victim_id in open_pdf_sessions.values()
+        refunded_text = ""
+
+        if not pdf_delivered and quota_applies(owner_id) and charged > 0:
+            quota_refund(owner_id, charged)
+            refunded_text = format_size(charged)
+
+        evicted.append({"chat_id": victim.get("chat_id"), "refunded": refunded_text})
+        clear_pending(victim_id)
+        logger.info("Evicted stored file %s to make room (PENDING_MAX=%d).", victim_id, PENDING_MAX)
+
+    return evicted
+
+
+async def notify_evicted(bot, evicted: list[dict]) -> None:
+    """Tell the people whose stored file was removed by remember_pending(). Never raises."""
+    for item in evicted:
+        chat_id = item.get("chat_id")
+
+        if chat_id is None:
+            continue
+
+        text = (
+            MSG_EVICTED_MAKE_ROOM_REFUNDED.format(size=item["refunded"])
+            if item.get("refunded")
+            else MSG_EVICTED_MAKE_ROOM
+        )
+
+        with contextlib.suppress(Exception):
+            await bot.send_message(chat_id=chat_id, text=text)
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set.")
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+async def with_retries(func, *args, attempts: int = RETRY_ATTEMPTS, base_delay: float = RETRY_BASE_DELAY, **kwargs):
+    """
+    Call an async Telegram API function, retrying on flaky-network
+    errors (TimedOut / NetworkError) with exponential backoff,
+    instead of failing on the first hiccup.
+    """
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return await func(*args, **kwargs)
+        except (NetworkError, TimedOut) as error:
+            last_error = error
+
+            if attempt == attempts:
+                break
+
+            delay = min(base_delay * (2 ** (attempt - 1)), 30)
+
+            logger.warning(
+                "Network error on attempt %s/%s (%s) — retrying in %.0fs",
+                attempt, attempts, error, delay,
+            )
+
+            await asyncio.sleep(delay)
+
+    assert last_error is not None
+    raise last_error
+
+
+def render_progress_bar(percent: float, width: int = 14) -> str:
+    percent = max(0.0, min(100.0, percent))
+    filled = round(width * percent / 100)
+    bar = "▓" * filled + "░" * (width - filled)
+    return f"[{bar}] {percent:.0f}%"
+
+
+def format_size(size: float | None) -> str:
+    if size is None:
+        return "unknown"
+
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+
+    for unit in units:
+        if value < 1024:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+    return f"{value:.1f} PB"
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def get_video_filter(max_width: int) -> str:
+    # format=yuv420p: the one pixel format every phone/Telegram player can show.
+    # Without it, sources stored as 4:4:4 / 4:2:2 / 10-bit (screen recordings, some
+    # cameras) are encoded as-is and play as a BLACK picture with sound only.
+    return f"scale='min({max_width},iw)':-2,format=yuv420p"
+
+
+def estimate_audio_bytes(bitrate: str, duration: float | None) -> int | None:
+    """
+    Audio is encoded at a constant target bitrate (-b:a), so its size
+    is just bitrate * duration — no sample encode needed, unlike video.
+    """
+
+    if not duration or duration <= 0:
+        return None
+
+    try:
+        kbps = int(bitrate.rstrip("k"))
+    except ValueError:
+        return None
+
+    return int(kbps * 1000 * duration / 8)
+
+
+def level_grows_file(estimate: int | None, original_size: int | None) -> bool:
+    """True when compressing at this level is estimated to make the file BIGGER."""
+    return bool(estimate and original_size and estimate > original_size)
+
+
+def estimate_keyboard(
+    message_id: int,
+    estimates: dict[str, int | None],
+    highlight: str | None,
+    smart: dict | None = None,
+    original_size: int | None = None,
+    styled: bool = True,
+) -> InlineKeyboardMarkup:
+    rows = []
+
+
+    for level in LEVEL_ORDER:
+        info = LEVELS[level]
+        size_text = format_size(estimates.get(level))
+        text = f"{info['label']} — ~{size_text}"
+
+        if level_grows_file(estimates.get(level), original_size):
+            # Would make the file bigger: red button that does nothing but explain why.
+            rows.append([
+                InlineKeyboardButton(
+                    text,
+                    callback_data=f"toobig:{level}:{message_id}",
+                    api_kwargs={"style": "danger"} if styled else None,
+                )
+            ])
+            continue
+
+        if level == highlight:
+            text = MSG_ESTIMATE_KEYBOARD.format(text=text)
+
+        rows.append([
+            InlineKeyboardButton(
+                text,
+                callback_data=f"compress:{level}:{message_id}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            BTN_JUST_EDIT_AUDIO_KEEP_VIDEO,
+            callback_data=f"audioedit:_:{message_id}",
+        )
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            BTN_REPLACE_AUDIO_SEND_A_RECORDING,
+            callback_data=f"audioreplace:_:{message_id}",
+        )
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            BTN_SET_VIDEO_COVER_SEND_AN,
+            callback_data=f"videocover:_:{message_id}",
+        )
+    ])
+
+    rows.append([
+        InlineKeyboardButton(BTN_EXTRACT_TO_PDF, callback_data=f"pdfmenu:_:{message_id}")
+    ])
+
+    rows.append([
+        InlineKeyboardButton(BTN_SPLIT_VIDEO, callback_data=f"splitask:_:{message_id}")
+    ])
+
+    rows.append([
+        InlineKeyboardButton(BTN_EXTRACT_AUDIO, callback_data=f"audioextract:_:{message_id}")
+    ])
+
+    rows.append([
+        InlineKeyboardButton(BTN_MERGE_VIDEO_WITH_OTHERS, callback_data=f"merge:video:{message_id}")
+    ])
+
+    rows.append([
+        InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def audio_keyboard(
+    message_id: int,
+    level: str,
+    estimates: dict[str, int | None],
+    highlight: str,
+    from_video: bool = False,
+    copy_ok: bool = True,
+) -> InlineKeyboardMarkup:
+    rows = []
+
+    for audio_level in AUDIO_LEVEL_ORDER:
+        info = AUDIO_LEVELS[audio_level]
+        size_text = format_size(estimates.get(audio_level))
+        text = f"{info['label']} — ~{size_text} · {info['detail']}"
+
+        if audio_level == highlight:
+            text = MSG_ESTIMATE_KEYBOARD.format(text=text)
+
+        rows.append([
+            InlineKeyboardButton(
+                text,
+                callback_data=f"audioset:{level}|{audio_level}:{message_id}",
+            )
+        ])
+
+    if level in LEVELS:
+        original_info = AUDIO_LEVELS[ORIGINAL_AUDIO]
+        rows.append([
+            InlineKeyboardButton(
+                BTN_AUDIO_KEYBOARD.format(original_info_label=original_info['label'], size_estimates_original_audio=format_size(estimates.get(ORIGINAL_AUDIO)), original_info_detail=original_info['detail']),
+                callback_data=f"audioset:{level}|{ORIGINAL_AUDIO}:{message_id}",
+            )
+        ])
+
+    if level == AUDIO_ONLY_LEVEL and not from_video:
+        rows.append([
+            InlineKeyboardButton(BTN_MERGE_AUDIO_WITH_OTHERS, callback_data=f"merge:audio:{message_id}")
+        ])
+
+    if level == AUDIO_ONLY_LEVEL:
+        # Extracting from a video: "send as is" only when the audio can be copied out untouched.
+        if copy_ok or not from_video:
+            rows.append([
+                InlineKeyboardButton(
+                    BTN_SEND_AS_IS,
+                    callback_data=f"audiosend:_:{message_id}",
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(
+                BTN_RENAME_ALBUM_NAME_COVER,
+                callback_data=f"ameta:open:{message_id}",
+            )
+        ])
+
+    # After picking a compression level (or extracting audio from a video),
+    # let the user go back to the video menu.
+    if level in LEVELS or from_video:
+        rows.append([
+            InlineKeyboardButton(BTN_GO_BACK, callback_data=f"levelback:_:{message_id}")
+        ])
+
+    rows.append([
+        InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def volume_keyboard(
+    message_id: int,
+    level: str,
+    audio_level: str,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+) -> InlineKeyboardMarkup:
+    flags = f"{int(noise_reduction)}{int(voice_enhancement)}"
+    buttons = [
+        InlineKeyboardButton(
+            MSG_NO_BOOST if boost == 0 else MSG_VOLUME_KEYBOARD.format(boost=boost),
+            callback_data=f"volumeset:{level}|{audio_level}|{boost}|{flags}:{message_id}",
+        )
+        for boost in VOLUME_BOOST_OPTIONS
+    ]
+
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def enhancement_keyboard(
+    message_id: int,
+    level: str,
+    audio_level: str,
+    noise_reduction: bool,
+    voice_enhancement: bool,
+) -> InlineKeyboardMarkup:
+    noise_label = MSG_NOISE_REDUCTION.format(noise_reduction_choice='ON ✅' if noise_reduction else 'OFF')
+    voice_label = MSG_VOICE_ENHANCEMENT.format(voice_enhancement_choice='ON ✅' if voice_enhancement else 'OFF')
+
+    # Each toggle button's callback carries the flag state that
+    # results from tapping IT specifically — flip its own bit, leave
+    # the other one as-is.
+    after_noise_toggle = f"{int(not noise_reduction)}{int(voice_enhancement)}"
+    after_voice_toggle = f"{int(noise_reduction)}{int(not voice_enhancement)}"
+    current_flags = f"{int(noise_reduction)}{int(voice_enhancement)}"
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            noise_label,
+            callback_data=f"enhset:{level}|{audio_level}|{after_noise_toggle}:{message_id}",
+        )],
+        [InlineKeyboardButton(
+            voice_label,
+            callback_data=f"enhset:{level}|{audio_level}|{after_voice_toggle}:{message_id}",
+        )],
+        [InlineKeyboardButton(
+            BTN_PREVIEW_NOISE_VOICE_BOTH,
+            callback_data=f"enhpreview:{level}|{audio_level}|{current_flags}:{message_id}",
+        )],
+        [InlineKeyboardButton(
+            BTN_CONTINUE,
+            callback_data=f"enhcontinue:{level}|{audio_level}|{current_flags}:{message_id}",
+        )],
+        [InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")],
+    ])
+
+
+def pdf_interval_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    row = [
+        InlineKeyboardButton(BTN_S.format(seconds=seconds), callback_data=f"pdf:{seconds}:{message_id}")
+        for seconds in PDF_INTERVALS
+    ]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(BTN_AUTO_DETECT_CHANGES, callback_data=f"pdfauto:_:{message_id}")],
+        [InlineKeyboardButton(BTN_PDF_IN_THREE_PARTS, callback_data=f"pdf3:_:{message_id}")],
+        row,
+        [InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")],
+    ])
+
+
+def post_pdf_keyboard(message_id: int, dedup_available: bool = True) -> InlineKeyboardMarkup:
+    rows = []
+
+    if dedup_available:
+        rows.append([
+            InlineKeyboardButton(
+                BTN_AUTO_DELETE_SIMILAR_FRAMES,
+                callback_data=f"pdfdedup:_:{message_id}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(BTN_COMPRESS_VIDEO, callback_data=f"pdfcompress:_:{message_id}")
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            BTN_FINISH_SESSION_DELETES_VIDEO,
+            callback_data=f"pdffinish:_:{message_id}",
+        )
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def sanitize_filename(name: str | None, max_length: int = 100) -> str | None:
+    """
+    Turn user-typed text into a safe file name (no extension). Strips
+    path separators / reserved characters / control characters, drops
+    a trailing audio extension if they typed one, and returns None if
+    nothing usable is left.
+    """
+
+    if not name:
+        return None
+
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', " ", name)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+
+    lowered = cleaned.lower()
+    for extension in AUDIO_FILE_EXTENSIONS:
+        if lowered.endswith(extension):
+            cleaned = cleaned[: -len(extension)].strip(" .")
+            break
+
+    cleaned = cleaned[:max_length].strip(" .")
+    return cleaned or None
+
+
+def audio_meta_text(pending: dict) -> str:
+    original = Path(pending.get("filename") or "audio").stem
+    return (
+        MSG_AUDIO_DETAILS_ALL_OPTIONAL_NAME.format(out_name=pending.get('out_name') or original + ' (original)', artist=pending.get('artist') or '—', album=pending.get('album') or '—', cover_path_choice='✅ set' if pending.get('cover_path') else '—')
+    )
+
+
+def audio_meta_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(BTN_RENAME_FILE, callback_data=f"ameta:name:{message_id}")],
+        [InlineKeyboardButton(BTN_ARTIST_NAME, callback_data=f"ameta:artist:{message_id}")],
+        [InlineKeyboardButton(BTN_ALBUM_NAME, callback_data=f"ameta:album:{message_id}")],
+        [InlineKeyboardButton(BTN_ALBUM_COVER, callback_data=f"ameta:cover:{message_id}")],
+        [InlineKeyboardButton(BTN_CLEAR_ALL, callback_data=f"ameta:clear:{message_id}")],
+        [InlineKeyboardButton(BTN_SEND_AS_IS, callback_data=f"audiosend:_:{message_id}")],
+        [InlineKeyboardButton(BTN_DONE, callback_data=f"ameta:done:{message_id}")],
+    ])
+
+
+def setlevel_keyboard(highlight: str | None) -> InlineKeyboardMarkup:
+    buttons = []
+    for level in LEVEL_ORDER:
+        text = LEVELS[level]["label"]
+        if level == highlight:
+            text = MSG_ESTIMATE_KEYBOARD.format(text=text)
+        buttons.append(InlineKeyboardButton(text, callback_data=f"setlevel:{level}:0"))
+    return InlineKeyboardMarkup([buttons])
+
+
+# ============================================================
+# FFmpeg / FFprobe
+# ============================================================
+
+async def run_command(command: list[str]) -> tuple[int, bytes, bytes]:
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    return process.returncode, stdout, stderr
+
+
+async def get_duration(input_path: str) -> float | None:
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        input_path,
+    ]
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("ffprobe failed: %s", stderr.decode(errors="replace"))
+        return None
+
+    try:
+        return float(stdout.decode().strip())
+    except ValueError:
+        return None
+
+
+async def get_video_dimensions(input_path: str) -> tuple[int | None, int | None]:
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=s=x:p=0",
+        input_path,
+    ]
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("ffprobe (dimensions) failed: %s", stderr.decode(errors="replace"))
+        return None, None
+
+    try:
+        width_str, height_str = stdout.decode().strip().split("x")
+        return int(width_str), int(height_str)
+    except (ValueError, AttributeError):
+        return None, None
+
+
+async def probe_audio_stream(input_path: str) -> tuple[bool, int | None]:
+    """
+    Returns (has_audio, bitrate_in_bits_per_second). The bitrate is
+    None when the file has audio but the container doesn't report a
+    per-stream bitrate (common with mkv/webm) — callers should treat
+    that as "unknown" rather than zero.
+    """
+
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=bit_rate",
+        "-of", "csv=p=0",
+        input_path,
+    ]
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("ffprobe (audio) failed: %s", stderr.decode(errors="replace"))
+        return False, None
+
+    text = stdout.decode(errors="replace").strip()
+
+    if not text:
+        return False, None
+
+    try:
+        return True, int(text.splitlines()[0].strip().rstrip(","))
+    except ValueError:
+        return True, None
+
+
+async def generate_thumbnail(input_path: str, output_path: str, duration: float | None) -> bool:
+    """
+    Grab a frame from roughly the middle of the video as a JPEG
+    thumbnail. Telegram wants thumbnails no larger than 320px on
+    a side and under 200 KB.
+    """
+
+    seek = (duration / 2) if duration else 1.0
+
+    command = [
+        "ffmpeg", "-y",
+        "-ss", f"{seek:.2f}",
+        "-i", input_path,
+        "-frames:v", "1",
+        "-vf", "scale='min(320,iw)':-2",
+        "-q:v", "4",
+        output_path,
+    ]
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0 or not Path(output_path).exists():
+        logger.warning("Thumbnail generation failed: %s", stderr.decode(errors="replace"))
+        return False
+
+    return True
+
+
+async def prepare_cover_image(input_path: str, output_path: str, max_side: int, quality: str = "3") -> bool:
+    """
+    Convert any image (jpg/png/webp...) into a JPEG that fits inside
+    max_side x max_side, keeping its aspect ratio and never upscaling.
+    Used for the full-size cover (embedded in the audio file / sent as
+    the video cover) and a 320px thumbnail (Telegram's limit).
+    """
+
+    command = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-frames:v", "1",
+        "-vf",
+        (
+            f"scale='min({max_side},iw)':'min({max_side},ih)':"
+            "force_original_aspect_ratio=decrease,format=yuvj420p"
+        ),
+        "-q:v", quality,
+        output_path,
+    ]
+
+    returncode, _stdout, stderr = await run_command(command)
+
+    if returncode != 0 or not Path(output_path).exists():
+        logger.warning("Cover preparation failed: %s", stderr.decode(errors="replace"))
+        return False
+
+    return True
+
+
+def build_ffmpeg_command(
+    input_path: str,
+    output_path: str,
+    settings: dict,
+    seek: float | None = None,
+    duration: float | None = None,
+    enable_progress: bool = False,
+    audio_bitrate: str | None = None,
+    volume_boost_percent: int = 0,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+    copy_audio: bool = False,
+) -> list[str]:
+    command = ["ffmpeg", "-y"]
+
+    if enable_progress:
+        # Machine-readable progress (key=value lines) on stdout,
+        # separate from the human-readable logs on stderr.
+        command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    if seek is not None:
+        command += ["-ss", f"{seek:.2f}"]
+
+    # -threads BEFORE -i limits the decoder (the one after the filters limits the encoder).
+    command += ["-threads", DECODER_THREADS, "-i", input_path]
+
+    if duration is not None:
+        command += ["-t", f"{duration:.2f}"]
+
+    x264_params = (
+        f"rc-lookahead={settings['lookahead']}:"
+        f"ref={settings['refs']}:"
+        f"bframes={settings['bframes']}"
+    )
+
+    video_filter = get_video_filter(settings["max_width"])
+    if settings.get("max_fps"):
+        # Smart compression: drop to a lower frame rate BEFORE scaling (cheaper).
+        video_filter = f"fps={settings['max_fps']}," + video_filter
+
+    command += [
+        "-c:v", "libx264",
+        "-preset", settings["preset"],
+        "-crf", settings["crf"],
+        "-x264-params", x264_params,
+        "-threads", FFMPEG_THREADS,
+        "-vf", video_filter,
+    ]
+
+    if copy_audio:
+        # Keep the original audio exactly as is (filters can't apply to a copied stream).
+        command += ["-c:a", "copy"]
+    else:
+        command += ["-c:a", "aac", "-b:a", audio_bitrate or settings["audio_bitrate"],
+                    *audio_rate_args(audio_bitrate or settings["audio_bitrate"])]
+
+        audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
+        if audio_filter_chain:
+            command += ["-af", audio_filter_chain]
+
+    command += [
+        "-movflags", "+faststart",
+        # Prevents an abrupt "Conversion failed!" at finalization if
+        # the muxer's internal packet queue backs up on a tight
+        # memory budget.
+        "-max_muxing_queue_size", "1024",
+        output_path,
+    ]
+
+    return command
+
+
+class JobCancelled(Exception):
+    """The person pressed Cancel while their video was being processed."""
+
+
+# The job whose FFmpeg is running (set per task, so concurrent people don't mix).
+CURRENT_JOB: contextvars.ContextVar = contextvars.ContextVar("current_job", default=None)
+running_jobs: dict[int, dict] = {}   # message id -> {"user_id", "cancelled", "process", "done"}
+
+
+def cancel_job_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(BTN_CANCEL, callback_data=f"canceljob:_:{message_id}")]])
+
+
+async def handle_cancel_job(query, user_id: int | None) -> None:
+    """The Cancel button under a progress bar: stop FFmpeg for that job."""
+    try:
+        source_id = int(query.data.split(":", 2)[2])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+
+    job = running_jobs.get(source_id)
+
+    if job is None or job.get("done"):
+        await query.answer(MSG_TOO_LATE_TO_CANCEL, show_alert=True)
+        return
+
+    if job.get("user_id") != user_id and not is_admin(user_id):
+        await query.answer(MSG_NOT_YOUR_JOB, show_alert=True)
+        return
+
+    job["cancelled"] = True
+    process = job.get("process")
+
+    if process is not None and process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+
+    await query.answer(MSG_CANCELLING_JOB)
+
+
+class AdminJobWatcher:
+    """
+    One message to the admin per job: who is compressing, and how far along it is.
+    The same message is edited as the job runs and ends as done / cancelled / failed.
+    Never raises — a problem here must not affect the person's job. Nothing is
+    sent when the person IS the admin (they already see their own progress bar).
+    """
+
+    def __init__(self, bot, user, kind: str) -> None:
+        self.bot = bot
+        self.kind = kind
+        self.enabled = bool(ADMIN_USER_ID) and user is not None and not is_admin(getattr(user, "id", None))
+        self.header = ""
+        self.message_id: int | None = None
+        self.last_text: str | None = None
+        self.last_percent = -100.0
+        self.last_edit = 0.0
+
+        if self.enabled:
+            self.header = MSG_ADMIN_JOB_HEADER.format(
+                name=user_display_name(user),
+                username=format_username(getattr(user, "username", None)),
+                user_id=user.id,
+            )
+
+    async def _show(self, line: str) -> None:
+        if not self.enabled:
+            return
+
+        text = f"{self.header}\n{line}"
+
+        if text == self.last_text:
+            return
+
+        self.last_edit = time.monotonic()   # also throttles retries when Telegram is failing
+
+        try:
+            if self.message_id is None:
+                sent = await asyncio.wait_for(
+                    self.bot.send_message(chat_id=ADMIN_USER_ID, text=text), timeout=10
+                )
+                self.message_id = sent.message_id
+            else:
+                await asyncio.wait_for(
+                    self.bot.edit_message_text(
+                        chat_id=ADMIN_USER_ID, message_id=self.message_id, text=text
+                    ),
+                    timeout=10,
+                )
+            self.last_text = text
+        except Exception:
+            logger.debug("Couldn't update the admin's job message", exc_info=True)
+
+    async def start(self) -> None:
+        self.last_percent = 0.0
+        await self._show(MSG_ADMIN_JOB_PROGRESS.format(kind=self.kind, percent=0))
+
+    async def progress(self, percent: float) -> None:
+        if not self.enabled:
+            return
+
+        now = time.monotonic()
+
+        if percent < 100:
+            if now - self.last_edit < 3:
+                return
+            if percent - self.last_percent < 5 and now - self.last_edit < 10:
+                return
+
+        self.last_percent = percent
+        await self._show(MSG_ADMIN_JOB_PROGRESS.format(kind=self.kind, percent=percent))
+
+    async def finish(self, outcome: tuple[str, str] | None) -> None:
+        """outcome = (\"done\" | \"cancelled\" | \"failed\", refunded size text or \"\")."""
+        if not self.enabled or self.message_id is None:
+            return
+
+        state, refunded, *extra = outcome or ("stopped", "")
+        summary = extra[0] if extra else ""
+        refund_note = MSG_ADMIN_JOB_REFUND_NOTE.format(size=refunded) if refunded else ""
+
+        if state == "done":
+            line = MSG_ADMIN_JOB_DONE.format(kind=self.kind) + (f"\n{summary}" if summary else "")
+        elif state == "cancelled":
+            line = MSG_ADMIN_JOB_CANCELLED.format(kind=self.kind, refund_note=refund_note)
+        elif state == "failed":
+            line = MSG_ADMIN_JOB_FAILED.format(kind=self.kind, refund_note=refund_note)
+        else:
+            line = MSG_ADMIN_JOB_STOPPED.format(kind=self.kind)
+
+        await self._show(line)
+
+
+async def run_ffmpeg_with_progress(
+    command: list[str],
+    total_duration: float | None = None,
+    progress_callback=None,
+) -> None:
+    """
+    Runs an FFmpeg command that was built with `-progress pipe:1`
+    enabled, streaming real progress (how much of the video's
+    timeline has been processed) to progress_callback as it happens.
+    Shared by any FFmpeg step that wants a progress bar — compression,
+    frame extraction, etc. Raises RuntimeError if FFmpeg exits non-zero.
+    """
+
+    if FFMPEG_NICE > 0 and shutil.which("nice"):
+        command = ["nice", "-n", str(FFMPEG_NICE), *command]
+
+    job = CURRENT_JOB.get()
+
+    if job is not None and job.get("cancelled"):
+        raise JobCancelled()
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    if job is not None:
+        job["process"] = process
+        if job.get("cancelled"):   # they pressed Cancel while it was starting
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+
+    stderr_chunks: list[bytes] = []
+
+    async def drain_stderr() -> None:
+        assert process.stderr is not None
+        async for line in process.stderr:
+            stderr_chunks.append(line)
+
+    async def drain_progress() -> None:
+        # Always drain stdout — ffmpeg's progress pipe must be read
+        # continuously or its write buffer can fill and stall ffmpeg,
+        # regardless of whether we act on the values.
+        assert process.stdout is not None
+
+        async for raw_line in process.stdout:
+            if progress_callback is None or not total_duration:
+                continue
+
+            line = raw_line.decode(errors="replace").strip()
+
+            if line.startswith("out_time_ms="):
+                try:
+                    # ffmpeg's "out_time_ms" key is actually in
+                    # microseconds despite the name.
+                    processed_seconds = int(line.split("=", 1)[1]) / 1_000_000
+                except ValueError:
+                    continue
+
+                percent = (processed_seconds / total_duration) * 100
+                await progress_callback(percent)
+
+            elif line == "progress=end":
+                await progress_callback(100.0)
+
+    await asyncio.gather(drain_stderr(), drain_progress())
+    returncode = await process.wait()
+
+    if job is not None:
+        job["process"] = None
+        if job.get("cancelled"):
+            raise JobCancelled()
+
+    if returncode != 0:
+        error = b"".join(stderr_chunks).decode(errors="replace")
+        logger.error("FFmpeg failed:\n%s", error)
+        raise RuntimeError(f"FFmpeg failed with exit code {returncode}")
+
+
+def make_progress_editor(status_message, label: str):
+    """
+    Returns an async progress_callback(percent) that edits
+    status_message to show `label` plus a progress bar, throttled the
+    same way the compression progress bar is (so it doesn't hammer
+    Telegram's rate limit).
+    """
+
+    state = {"last_percent": -10.0, "last_edit": 0.0}
+
+    async def callback(percent: float) -> None:
+        now = time.monotonic()
+
+        if (
+            percent - state["last_percent"] < 4
+            and now - state["last_edit"] < 3
+            and percent < 100
+        ):
+            return
+
+        state["last_percent"] = percent
+        state["last_edit"] = now
+
+        try:
+            await status_message.edit_text(f"{label}\n{render_progress_bar(percent)}")
+        except Exception:
+            # A rate-limit hiccup or "message not modified" here
+            # shouldn't abort the underlying work.
+            pass
+
+    return callback
+
+
+async def compress_audio_only(
+    input_path: str,
+    output_path: str,
+    audio_bitrate: str,
+    total_duration: float | None = None,
+    progress_callback=None,
+    volume_boost_percent: int = 0,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+    title: str | None = None,
+    album: str | None = None,
+    cover_path: str | None = None,
+    artist: str | None = None,
+) -> None:
+    """
+    Re-encode an audio-only file at the given bitrate (and optional
+    volume boost / noise reduction / voice enhancement) — no video
+    stream involved. Same progress-streaming setup as compress_video,
+    via the shared run_ffmpeg_with_progress.
+
+    Optional tags: title / album are written into the file's metadata,
+    and cover_path (a JPEG) is embedded as the album art. If embedding
+    the cover somehow fails, it retries once without it rather than
+    losing the whole job.
+    """
+
+    def build_command(with_cover: bool) -> list[str]:
+        command = ["ffmpeg", "-y"]
+
+        if progress_callback is not None and total_duration:
+            command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+        command += ["-i", input_path]
+
+        if with_cover:
+            command += [
+                "-i", str(cover_path),
+                "-map", "0:a:0",
+                "-map", "1:v:0",
+                "-c:v", "copy",
+                "-disposition:v:0", "attached_pic",
+            ]
+        else:
+            command += ["-vn"]
+
+        command += ["-c:a", "aac", "-b:a", audio_bitrate, *audio_rate_args(audio_bitrate)]
+
+        audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
+        if audio_filter_chain:
+            command += ["-af", audio_filter_chain]
+
+        if title:
+            command += ["-metadata", f"title={title}"]
+        if artist:
+            command += ["-metadata", f"artist={artist}"]
+        if album:
+            command += ["-metadata", f"album={album}"]
+
+        command.append(output_path)
+        return command
+
+    if cover_path and Path(cover_path).exists():
+        command = build_command(True)
+        logger.info("Running FFmpeg (audio-only, with cover): %s", " ".join(command))
+        try:
+            await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+            return
+        except RuntimeError:
+            logger.warning("Embedding the cover failed — retrying without it.")
+
+    command = build_command(False)
+    logger.info("Running FFmpeg (audio-only): %s", " ".join(command))
+
+    await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+
+
+
+# Containers where a plain stream copy + tags works, mapped to the file
+# extension they should be saved with. Telegram plays only MP3 / M4A as music.
+AUDIO_COPY_EXTENSIONS = {
+    "mp3": ".mp3", "flac": ".flac", "wav": ".wav", "asf": ".wma",
+    "aac": ".m4a",   # raw AAC (ADTS) can't hold tags: it is re-wrapped into M4A, still no re-encode
+}
+AUDIO_PLAYABLE_EXTENSIONS = (".mp3", ".m4a")
+
+
+async def detect_audio_extension(input_path: str, filename: str | None) -> str:
+    """Pick the output extension from the REAL container (voice notes are named .m4a but are Ogg)."""
+    command = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=format_name:stream=codec_name",
+        "-select_streams", "a:0",
+        "-of", "json", input_path,
+    ]
+    returncode, stdout, _ = await run_command(command)
+
+    if returncode == 0:
+        try:
+            data = json.loads(stdout.decode(errors="replace") or "{}")
+            format_names = (data.get("format", {}).get("format_name") or "").lower().split(",")
+            codec = ((data.get("streams") or [{}])[0].get("codec_name") or "").lower()
+
+            for name, extension in AUDIO_COPY_EXTENSIONS.items():
+                if name in format_names:
+                    return extension
+            if "mov" in format_names or "mp4" in format_names or "m4a" in format_names:
+                return ".m4a"
+            if "ogg" in format_names:
+                return ".opus" if codec == "opus" else ".ogg"
+            if "matroska" in format_names or "webm" in format_names:
+                return ".mka"
+        except Exception:
+            logger.exception("Couldn't parse the ffprobe output for the audio format")
+
+    suffix = Path(filename or "").suffix.lower()
+    return suffix if suffix in AUDIO_FILE_EXTENSIONS else ".m4a"
+
+
+async def tag_audio_without_compression(
+    input_path: str,
+    output_path: str,
+    total_duration: float | None = None,
+    progress_callback=None,
+    title: str | None = None,
+    artist: str | None = None,
+    album: str | None = None,
+    cover_path: str | None = None,
+    source_is_video: bool = False,
+) -> bool:
+    """
+    Copy the audio stream as it is (no re-encode, so no quality loss) and
+    write the new tags into the file. Tags the user didn't change keep the
+    values the file already had; an existing embedded cover is kept unless
+    a new one was set. Returns True if the new cover was embedded in the
+    file (False if there was none, or the format can't hold one — the job
+    is retried without it rather than failing).
+    """
+
+    extension = Path(output_path).suffix.lower()
+
+    def build_command(with_cover: bool) -> list[str]:
+        command = ["ffmpeg", "-y"]
+
+        if progress_callback is not None and total_duration:
+            command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+        command += ["-i", input_path]
+
+        if with_cover:
+            command += [
+                "-i", str(cover_path),
+                "-map", "0:a:0", "-map", "1:v:0",
+                "-c", "copy",
+                "-disposition:v:0", "attached_pic",
+            ]
+            if extension == ".mp3":
+                command += ["-id3v2_version", "3", "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
+        else:
+            # Keep the file's own embedded cover (if any) when no new one was set.
+            # (A video's own picture must never be copied into the audio file.)
+            command += ["-map", "0:a:0"] + ([] if source_is_video else ["-map", "0:v?"]) + ["-c", "copy"]
+            if extension == ".mp3":
+                command += ["-id3v2_version", "3"]
+
+        command += ["-map_metadata", "0"]
+
+        if title:
+            command += ["-metadata", f"title={title}"]
+        if artist:
+            command += ["-metadata", f"artist={artist}"]
+        if album:
+            command += ["-metadata", f"album={album}"]
+
+        command.append(output_path)
+        return command
+
+    if cover_path and Path(cover_path).exists():
+        command = build_command(True)
+        logger.info("Running FFmpeg (audio tags, no re-encode, with cover): %s", " ".join(command))
+        try:
+            await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+            return True
+        except RuntimeError:
+            logger.warning("Embedding the cover failed — retrying without it.")
+
+    command = build_command(False)
+    logger.info("Running FFmpeg (audio tags, no re-encode): %s", " ".join(command))
+    try:
+        await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+    except RuntimeError:
+        # Last resort: audio stream only (some containers reject the extra stream).
+        fallback = ["ffmpeg", "-y", "-i", input_path, "-map", "0:a:0", "-c", "copy", "-map_metadata", "0"]
+        if title:
+            fallback += ["-metadata", f"title={title}"]
+        if artist:
+            fallback += ["-metadata", f"artist={artist}"]
+        if album:
+            fallback += ["-metadata", f"album={album}"]
+        fallback.append(output_path)
+        logger.info("Running FFmpeg (audio tags, audio stream only): %s", " ".join(fallback))
+        await run_ffmpeg_with_progress(fallback, total_duration, progress_callback)
+
+    return False
+
+
+async def edit_video_audio(
+    input_path: str,
+    output_path: str,
+    audio_bitrate: str,
+    total_duration: float | None = None,
+    progress_callback=None,
+    volume_boost_percent: int = 0,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+) -> None:
+    """
+    "Just edit audio" for a video: the video stream is copied
+    untouched (-c:v copy, so no quality loss and it finishes in
+    seconds), while the audio is re-encoded at the chosen bitrate with
+    any enabled noise reduction / voice enhancement / volume boost.
+    Only the first video and first audio stream are kept, so stray
+    subtitle/data streams can't break the mp4 mux.
+    """
+
+    command = ["ffmpeg", "-y"]
+
+    if progress_callback is not None and total_duration:
+        command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    command += [
+        "-i", input_path,
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        *audio_rate_args(audio_bitrate),
+    ]
+
+    audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
+    if audio_filter_chain:
+        command += ["-af", audio_filter_chain]
+
+    command += [
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        output_path,
+    ]
+
+    logger.info("Running FFmpeg (audio edit, video copied): %s", " ".join(command))
+
+    await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+
+
+async def replace_video_audio(
+    video_path: str,
+    audio_path: str,
+    output_path: str,
+    audio_bitrate: str,
+    total_duration: float | None = None,
+    progress_callback=None,
+) -> None:
+    """
+    Swap a video's audio track for a different recording. The video
+    stream is copied untouched; the recording is encoded to AAC so it
+    fits in the mp4. The VIDEO decides the final length:
+      - recording longer than the video  -> cut off where the video ends
+      - recording shorter than the video -> silence for the remainder
+    (`apad` pads the audio with silence forever and `-shortest` then
+    stops at the only finite stream, i.e. the video.)
+    """
+
+    command = ["ffmpeg", "-y"]
+
+    if progress_callback is not None and total_duration:
+        command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    command += [
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        *audio_rate_args(audio_bitrate),
+        "-af", "apad",
+        "-shortest",
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        output_path,
+    ]
+
+    logger.info("Running FFmpeg (audio replaced, video copied): %s", " ".join(command))
+
+    await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+
+
+async def compress_video(
+    input_path: str,
+    output_path: str,
+    level: str,
+    total_duration: float | None = None,
+    progress_callback=None,
+    audio_bitrate: str | None = None,
+    volume_boost_percent: int = 0,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+    max_fps: int | None = None,
+    copy_audio: bool = False,
+) -> None:
+    """
+    Compress a video with FFmpeg. If total_duration and a
+    progress_callback are supplied, streams real encode progress
+    (based on how much of the video's timeline has been processed)
+    to the callback as it happens. audio_bitrate overrides the
+    level's default audio bitrate if given; volume_boost_percent
+    applies a volume filter on top (0 = no change).
+    """
+
+    settings = dict(LEVELS[level])
+    if max_fps:
+        settings["max_fps"] = max_fps
+
+    command = build_ffmpeg_command(
+        input_path,
+        output_path,
+        settings,
+        enable_progress=True,
+        audio_bitrate=audio_bitrate,
+        volume_boost_percent=volume_boost_percent,
+        noise_reduction=noise_reduction,
+        voice_enhancement=voice_enhancement,
+        copy_audio=copy_audio,
+    )
+
+    logger.info("Running FFmpeg (%s): %s", level, " ".join(command))
+
+    await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+
+    logger.info("FFmpeg compression completed.")
+
+
+async def extract_frames_at_interval(
+    input_path: str,
+    work_dir: Path,
+    interval: float,
+    total_duration: float | None = None,
+    progress_callback=None,
+    start: float | None = None,
+    length: float | None = None,
+) -> list[Path]:
+    """
+    Grab one frame every `interval` seconds. Returns the sorted list
+    of extracted frame paths (empty list on failure). No cap on frame
+    count — a short interval on a long video will extract a lot of
+    frames. If total_duration and progress_callback are given, streams
+    extraction progress (how much of the video's timeline has been
+    scanned) to the callback.
+
+    For the "3 parts" mode (start/length given) the first attempt uses a
+    fast seek before -i. Some files (odd keyframe layout, damaged packets,
+    extra data/subtitle streams) make that attempt fail or produce no
+    frames for a middle section, so if it does we retry with a slower but
+    more tolerant command (seek after -i, video stream only, ignore
+    decode errors) before giving up.
+    """
+
+    frames_dir = work_dir / "frames"
+    pattern = str(frames_dir / "frame_%04d.jpg")
+
+    def build_command(tolerant: bool) -> list[str]:
+        command = ["ffmpeg", "-y"]
+
+        if progress_callback is not None and total_duration:
+            command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+        if tolerant:
+            command += ["-err_detect", "ignore_err", "-fflags", "+genpts+discardcorrupt"]
+
+        if start and not tolerant:
+            # Seek BEFORE -i = fast jump (used by the "3 parts" mode).
+            command += ["-ss", f"{start:.2f}"]
+
+        command += [
+            # Limit the decoder's threads (same setting the compression uses) —
+            # without this FFmpeg picks its own count from the host's core count
+            # and holds that many decoded frames in RAM.
+            "-threads", DECODER_THREADS,
+            "-i", input_path,
+        ]
+
+        if start and tolerant:
+            # Seek AFTER -i = decodes up to the start point: slow, but works
+            # on files where the fast jump finds nothing.
+            command += ["-ss", f"{start:.2f}"]
+
+        if length:
+            command += ["-t", f"{length:.2f}"]
+
+        command += [
+            # First video stream only: audio/subtitle/data streams can make
+            # the cut fail on some files.
+            "-map", "0:v:0", "-an", "-sn", "-dn",
+            "-vf", f"fps=1/{interval}",
+            "-q:v", "3",
+            pattern,
+        ]
+        return command
+
+    attempts = [False, True] if start else [False]
+
+    for tolerant in attempts:
+        # Fresh folder for every attempt so a half-finished try can't leak in.
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            await run_ffmpeg_with_progress(build_command(tolerant), total_duration, progress_callback)
+        except RuntimeError:
+            logger.error(
+                "PDF frame extraction failed (start=%s, length=%s, tolerant=%s).",
+                start, length, tolerant,
+            )
+            continue
+
+        frames = sorted(frames_dir.glob("frame_*.jpg"))
+        if frames:
+            return frames
+
+        logger.warning(
+            "PDF frame extraction produced no frames (start=%s, length=%s, tolerant=%s).",
+            start, length, tolerant,
+        )
+
+    return []
+
+
+async def extract_pdf_frames(
+    input_path: str,
+    work_dir: Path,
+    interval: float,
+) -> tuple[Path | None, int]:
+    """
+    Fixed-interval capture: extract frames every `interval` seconds
+    and combine them all into a single PDF (one frame per page).
+    Returns (pdf_path, frame_count) — pdf_path is None if extraction
+    failed outright.
+    """
+
+    frame_paths = await extract_frames_at_interval(input_path, work_dir, interval)
+
+    if not frame_paths:
+        return None, 0
+
+    pdf_path = work_dir / "frames.pdf"
+
+    pdf_bytes = img2pdf.convert([str(path) for path in frame_paths])
+    pdf_path.write_bytes(pdf_bytes)
+
+    return pdf_path, len(frame_paths)
+
+
+async def compute_frame_signature(frame_path: str) -> bytes | None:
+    """
+    Render a tiny grayscale raw-pixel signature for a frame via
+    FFmpeg. Cheap way to compare two frames for near-identity without
+    any extra image-processing dependency. Grid is 64x36 (was 24x24) —
+    more sample points makes the comparison more sensitive to real
+    differences between frames (a changed line of text on an otherwise
+    identical slide now shows up), so visually-different frames are
+    much less likely to get averaged down into looking "near-identical".
+    """
+
+    command = [
+        "ffmpeg", "-y",
+        "-i", frame_path,
+        "-vf", "scale=64:36:flags=area,format=gray",
+        "-f", "rawvideo",
+        "-frames:v", "1",
+        "pipe:1",
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+
+    if process.returncode != 0 or not stdout:
+        logger.warning("Frame signature failed for %s", frame_path)
+        return None
+
+    return stdout
+
+
+def signature_diff(sig_a: bytes | None, sig_b: bytes | None) -> int | None:
+    """Worst (max) single-cell difference between two frame signatures, or None if either is missing/mismatched."""
+
+    if not sig_a or not sig_b or len(sig_a) != len(sig_b):
+        return None
+
+    return max(abs(a - b) for a, b in zip(sig_a, sig_b))
+
+
+def signature_changed_fraction(sig_a: bytes | None, sig_b: bytes | None, cell_threshold: float) -> float | None:
+    """Share (0-1) of the picture's cells that differ by more than cell_threshold — a cursor or webcam box is a few %, a new picture is much more."""
+
+    if not sig_a or not sig_b or len(sig_a) != len(sig_b):
+        return None
+
+    changed = sum(1 for a, b in zip(sig_a, sig_b) if abs(a - b) > cell_threshold)
+    return changed / len(sig_a)
+
+
+def frames_are_near_identical(sig_a: bytes, sig_b: bytes, threshold: float) -> bool:
+    """
+    Compares the two frames' grids cell-by-cell and looks at the
+    WORST (max) cell difference, not the average. Averaging washes
+    out localized change — a subtitle or small motion in one corner
+    barely moves an average over 576 cells — so a single badly-
+    differing region is enough to call the frames different, even if
+    the rest of the frame is identical.
+    """
+
+    diff = signature_diff(sig_a, sig_b)
+    return diff is not None and diff <= threshold
+
+
+def compute_auto_threshold(diffs: list[int]) -> float:
+    """
+    Finds the natural split point between "small" (likely duplicate)
+    and "large" (likely real content change) frame-to-frame diffs, so
+    the dedup threshold adapts to how static or noisy THIS video is
+    instead of using one fixed number for every video.
+
+    Simple 1D clustering (an Otsu-style search): tries every possible
+    split point between the observed diff values, and keeps the split
+    that best separates them into a "low" group and a "high" group
+    (maximizes the gap between the two groups' averages, weighted by
+    how many diffs fall on each side). That split point becomes the
+    threshold. Falls back to DEDUP_SIMILARITY_THRESHOLD if there isn't
+    enough data to find a meaningful split.
+    """
+
+    if len(diffs) < 4:
+        return DEDUP_SIMILARITY_THRESHOLD
+
+    candidates = sorted(set(diffs))
+
+    if len(candidates) < 2:
+        return DEDUP_SIMILARITY_THRESHOLD
+
+    best_split = None
+    best_score = -1.0
+    best_means = (0.0, 0.0)
+
+    for i in range(len(candidates) - 1):
+        split = (candidates[i] + candidates[i + 1]) / 2
+        low = [d for d in diffs if d <= split]
+        high = [d for d in diffs if d > split]
+
+        if not low or not high:
+            continue
+
+        weight_low = len(low) / len(diffs)
+        weight_high = len(high) / len(diffs)
+        mean_low = sum(low) / len(low)
+        mean_high = sum(high) / len(high)
+
+        # Between-group variance — bigger when the two groups are both
+        # sizeable AND far apart, which is what a clean "duplicates vs
+        # real changes" split looks like.
+        score = weight_low * weight_high * (mean_high - mean_low) ** 2
+
+        if score > best_score:
+            best_score = score
+            best_split = split
+            best_means = (mean_low, mean_high)
+
+    if best_split is None:
+        return DEDUP_SIMILARITY_THRESHOLD
+
+    # This search ALWAYS finds a split, even when the video has no duplicates
+    # at all (every diff is a real change) -- it would then label the smaller
+    # real changes as "duplicates" and delete real slides. So only trust the
+    # split when the low group really is noise (near zero) and clearly apart
+    # from the high group; otherwise use the safe fixed default.
+    mean_low, mean_high = best_means
+
+    if mean_low > DEDUP_MAX_LOW_GROUP_MEAN or (mean_high - mean_low) < DEDUP_MIN_GROUP_GAP:
+        return DEDUP_SIMILARITY_THRESHOLD
+
+    # Never go above the cap: anything bigger than noise is a real change.
+    return min(max(best_split, DEDUP_MIN_THRESHOLD), DEDUP_MAX_THRESHOLD)
+
+
+# ---------------------------------------------------------------------------
+# OCR helpers for the "delete similar frames" step
+# ---------------------------------------------------------------------------
+# The pixel comparison can't tell "same slide" from "same slide with one word
+# changed" when that word is tiny, and it can't tell "same slide" from "same
+# slide + a moving webcam/cursor/animation". Reading the words with Tesseract
+# settles both: if the words changed, the frame is kept; if the words are
+# identical (and there are plenty of them), it's a duplicate.
+# Needs the `tesseract` program on the server (apt install tesseract-ocr, plus
+# e.g. tesseract-ocr-ara for Arabic). Without it everything works as before,
+# using pixels only.
+
+def ocr_normalize(text: str) -> str:
+    """Lowercase words only (letters/digits of any language), single-spaced; tiny tokens are OCR noise."""
+    tokens = []
+    for token in re.findall(r"\w+", (text or "").lower()):
+        has_digit = any(ch.isdigit() for ch in token)
+        # Stray 1-2 letter "words" are almost always OCR junk (a pointer dot read as "wy"); numbers are kept.
+        if len(token) >= (2 if has_digit else 3):
+            tokens.append(token)
+    return " ".join(tokens)
+
+
+def ocr_char_count(text: str) -> int:
+    return len(text.replace(" ", ""))
+
+
+def ocr_word_differences(text_a: str, text_b: str) -> tuple[int, int]:
+    """
+    (words only in the first text, words only in the second text). Words are lined up
+    in order; where they don't match, look-alike long words (an OCR flipped letter)
+    are paired up and not counted. A truly replaced word shows up on BOTH sides.
+    """
+    words_a, words_b = text_a.split(), text_b.split()
+    matcher = difflib.SequenceMatcher(None, words_a, words_b, autojunk=False)
+    only_a = only_b = 0
+
+    for tag, a1, a2, b1, b2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+
+        leftovers = list(words_b[b1:b2])
+        for word in words_a[a1:a2]:
+            match = None
+            if len(word) >= 3 and not any(ch.isdigit() for ch in word):
+                needed = OCR_WORD_MATCH_RATIO if len(word) >= 5 else 0.66   # short words: one flipped letter is allowed
+                for candidate in leftovers:
+                    if (
+                        len(candidate) >= 3
+                        and not any(ch.isdigit() for ch in candidate)
+                        and difflib.SequenceMatcher(None, word, candidate).ratio() >= needed
+                    ):
+                        match = candidate
+                        break
+            if match is not None:
+                leftovers.remove(match)
+            else:
+                only_a += 1
+        only_b += len(leftovers)
+
+    return only_a, only_b
+
+
+def ocr_changed_word_count(text_a: str, text_b: str) -> int:
+    return sum(ocr_word_differences(text_a, text_b))
+
+
+def ocr_verdict(text_a: str | None, text_b: str | None) -> bool | None:
+    """
+    True  = the words are the same
+    False = the words changed (different text, or text appeared / disappeared)
+    None  = no opinion (OCR unavailable, or neither frame has meaningful text)
+    """
+    if text_a is None or text_b is None:
+        return None
+
+    len_a, len_b = ocr_char_count(text_a), ocr_char_count(text_b)
+    a_has, b_has = len_a >= OCR_MIN_CHARS, len_b >= OCR_MIN_CHARS
+    a_none, b_none = len_a < OCR_NO_TEXT_CHARS, len_b < OCR_NO_TEXT_CHARS
+
+    if a_has and b_has:
+        word_count = max(len(text_a.split()), len(text_b.split()))
+        only_a, only_b = ocr_word_differences(text_a, text_b)
+        changed = only_a + only_b
+
+        if changed <= (OCR_ALLOWED_CHANGED_WORDS if word_count >= 12 else 0):
+            return True
+
+        # One-sided (words only vanished / only reappeared) = something covered them.
+        return (
+            word_count >= 20
+            and min(only_a, only_b) == 0
+            and changed <= OCR_ALLOWED_ONE_SIDED_WORDS
+        )
+    if (a_has and b_none) or (b_has and a_none):
+        return False
+    return None
+
+
+async def ocr_frame_text(frame_path: str) -> str | None:
+    """Normalized words found in a frame, or None if OCR isn't available / failed."""
+    if not OCR_ENABLED or not shutil.which("tesseract"):
+        return None
+
+    env = dict(os.environ)
+    env["OMP_THREAD_LIMIT"] = "1"   # keep CPU/RAM small: one thread per tesseract
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "tesseract", str(frame_path), "stdout", "-l", OCR_LANGS, "--psm", "11", "tsv",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=OCR_TIMEOUT)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+            logger.warning("OCR timed out on %s", frame_path)
+            return None
+    except (OSError, asyncio.CancelledError) as error:
+        if isinstance(error, asyncio.CancelledError):
+            raise
+        logger.warning("OCR could not run: %s", error)
+        return None
+
+    if process.returncode != 0:
+        logger.warning("OCR failed (exit %s) on %s", process.returncode, frame_path)
+        return None
+
+    # TSV columns: level page block par line word left top width height conf text.
+    # Only words Tesseract is confident about are kept — the shaky ones are the
+    # ones that flicker between two otherwise identical frames.
+    words: list[str] = []
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        columns = line.split("\t")
+        if len(columns) < 12 or columns[0] != "5":
+            continue
+        try:
+            confidence = float(columns[10])
+        except ValueError:
+            continue
+        if confidence >= OCR_MIN_CONF:
+            words.append(columns[11])
+
+    return ocr_normalize(" ".join(words))
+
+
+async def compute_fine_signature(frame_path: str) -> bytes | None:
+    """160x90 RGB thumbnail (raw bytes) — fine enough to see a laser-pointer dot."""
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(frame_path),
+        "-vf", f"scale={POINTER_GRID_W}:{POINTER_GRID_H}:flags=area,format=rgb24",
+        "-f", "rawvideo", "-frames:v", "1", "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+
+    if process.returncode != 0 or len(stdout) != POINTER_GRID_W * POINTER_GRID_H * 3:
+        return None
+
+    return stdout
+
+
+def pointer_only_change(fine_a: bytes | None, fine_b: bytes | None) -> bool:
+    """
+    True when the ONLY difference between two frames is a pointer-like dot: a few
+    changed cells forming 1-3 small blobs, each containing a strongly coloured cell
+    (in either frame). Anything bigger, wider, or plain black/grey is not a pointer.
+    """
+    if not fine_a or not fine_b or len(fine_a) != len(fine_b) or fine_a == fine_b:
+        return False
+
+    width = POINTER_GRID_W
+    changed: list[int] = []
+
+    for cell in range(POINTER_GRID_W * POINTER_GRID_H):
+        j = cell * 3
+        if (
+            abs(fine_a[j] - fine_b[j]) >= POINTER_CELL_DIFF
+            or abs(fine_a[j + 1] - fine_b[j + 1]) >= POINTER_CELL_DIFF
+            or abs(fine_a[j + 2] - fine_b[j + 2]) >= POINTER_CELL_DIFF
+        ):
+            changed.append(cell)
+            if len(changed) > POINTER_MAX_CELLS:
+                return False
+
+    if not changed:
+        return False
+
+    # Group changed cells into blobs (cells within 2 steps of each other belong together).
+    remaining = set(changed)
+    clusters: list[list[int]] = []
+    while remaining:
+        stack = [remaining.pop()]
+        blob = list(stack)
+        while stack:
+            cell = stack.pop()
+            cx, cy = cell % width, cell // width
+            for other in list(remaining):
+                if abs(other % width - cx) <= 2 and abs(other // width - cy) <= 2:
+                    remaining.discard(other)
+                    stack.append(other)
+                    blob.append(other)
+        clusters.append(blob)
+
+    if len(clusters) > POINTER_MAX_CLUSTERS:
+        return False
+
+    def colour_margin(buffer: bytes, cell: int) -> int:
+        j = cell * 3
+        top, second = sorted((buffer[j], buffer[j + 1], buffer[j + 2]), reverse=True)[:2]
+        return top - second
+
+    for blob in clusters:
+        xs = [cell % width for cell in blob]
+        ys = [cell // width for cell in blob]
+        if max(xs) - min(xs) + 1 > POINTER_MAX_SPAN or max(ys) - min(ys) + 1 > POINTER_MAX_SPAN:
+            return False
+        if max(max(colour_margin(fine_a, c), colour_margin(fine_b, c)) for c in blob) < POINTER_MIN_COLOUR:
+            return False
+
+    return True
+
+
+async def dedup_frames(
+    frame_paths: list[Path],
+    threshold: float | None = None,
+    progress_callback=None,
+    ocr_merge: bool | None = None,
+) -> tuple[list[Path], list[Path], float]:
+    """
+    Walk frames in order, dropping any frame that's extremely similar
+    to the last frame that was kept. If threshold is None (the normal
+    case), one is computed automatically for this specific video via
+    compute_auto_threshold. Returns (kept_paths, removed_paths,
+    threshold_used) — the threshold is returned so it can be shown to
+    the user for transparency/sanity-checking. If progress_callback is
+    given, it's called with 0-100 as frame signatures are computed.
+
+    On top of the pixel comparison, OCR reads the words (when tesseract is
+    installed): a pixel-duplicate whose words changed is KEPT, and a frame
+    whose pixels moved a bit but whose words are identical is DROPPED.
+    """
+
+    if len(frame_paths) < 2:
+        return list(frame_paths), [], threshold if threshold is not None else DEDUP_SIMILARITY_THRESHOLD
+
+    ocr_on = OCR_ENABLED and bool(shutil.which("tesseract"))
+    merge_enabled = OCR_MERGE_SAME_TEXT if ocr_merge is None else ocr_merge
+    if OCR_ENABLED and not ocr_on:
+        logger.warning("tesseract not found — 'delete similar frames' is using pixels only.")
+
+    # With OCR the work has two phases: signatures (0-50%), then the walk (50-100%).
+    scale = 0.5 if ocr_on else 1.0
+
+    signature_semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
+    completed = 0
+
+    async def bounded_signature(path: Path) -> bytes | None:
+        nonlocal completed
+        async with signature_semaphore:
+            result = await compute_frame_signature(str(path))
+        completed += 1
+        if progress_callback is not None:
+            await progress_callback(completed / len(frame_paths) * 100 * scale)
+        return result
+
+    signatures = await asyncio.gather(*(bounded_signature(path) for path in frame_paths))
+
+    if threshold is None:
+        adjacent_diffs = [
+            diff
+            for diff in (
+                signature_diff(signatures[i], signatures[i + 1])
+                for i in range(len(signatures) - 1)
+            )
+            if diff is not None
+        ]
+        threshold = compute_auto_threshold(adjacent_diffs)
+
+    text_cache: dict[Path, str | None] = {}
+    ocr_started = time.monotonic()
+    ocr_kept = 0     # pixel-duplicates saved because their words changed
+    ocr_merged = 0   # extra duplicates found because their words were identical
+
+    async def text_of(path: Path) -> str | None:
+        nonlocal ocr_on
+        if path in text_cache:
+            return text_cache[path]
+        if not ocr_on:
+            return None
+        if time.monotonic() - ocr_started > OCR_TIME_BUDGET:
+            logger.warning("OCR time budget used up — finishing with pixels only.")
+            ocr_on = False
+            return None
+        text_cache[path] = await ocr_frame_text(str(path))
+        return text_cache[path]
+
+    fine_cache: dict[Path, bytes | None] = {}
+
+    async def fine_of(path: Path) -> bytes | None:
+        if path not in fine_cache:
+            fine_cache[path] = await compute_fine_signature(str(path))
+        return fine_cache[path]
+
+    pointer_merged = 0   # frames dropped because only a pointer dot moved
+
+    kept: list[Path] = []
+    removed: list[Path] = []
+    last_kept_signature: bytes | None = None
+    last_kept_path: Path | None = None
+
+    for index, (path, signature) in enumerate(zip(frame_paths, signatures)):
+        is_duplicate = (
+            signature is not None
+            and last_kept_signature is not None
+            and frames_are_near_identical(signature, last_kept_signature, threshold)
+        )
+
+        pointer_hit = False
+        if (
+            POINTER_ENABLED
+            and last_kept_path is not None
+            and signature is not None
+            and last_kept_signature is not None
+        ):
+            coarse_area = signature_changed_fraction(signature, last_kept_signature, POINTER_CELL_DIFF)
+            if coarse_area is not None and coarse_area <= POINTER_COARSE_GATE:
+                if pointer_only_change(await fine_of(last_kept_path), await fine_of(path)):
+                    pointer_hit = True
+                    is_duplicate = True
+                    pointer_merged += 1
+
+        if (
+            ocr_on
+            and not pointer_hit
+            and last_kept_path is not None
+            and signature is not None
+            and last_kept_signature is not None
+        ):
+            diff = signature_diff(signature, last_kept_signature)
+
+            if diff is not None:
+                if is_duplicate and diff > OCR_SKIP_PIXEL_DIFF:
+                    # Looks the same — but did any words change?
+                    verdict = ocr_verdict(await text_of(last_kept_path), await text_of(path))
+                    if verdict is False:
+                        is_duplicate = False
+                        ocr_kept += 1
+                elif (
+                    not is_duplicate
+                    and merge_enabled
+                    and (signature_changed_fraction(signature, last_kept_signature, threshold) or 0.0)
+                    <= OCR_MERGE_MAX_CHANGED_AREA
+                ):
+                    # Only a small part of the picture moved (cursor, webcam...): are the words the same?
+                    text_a, text_b = await text_of(last_kept_path), await text_of(path)
+                    if (
+                        text_a is not None
+                        and text_b is not None
+                        and ocr_char_count(text_a) >= OCR_MERGE_MIN_CHARS
+                        and ocr_char_count(text_b) >= OCR_MERGE_MIN_CHARS
+                        and ocr_verdict(text_a, text_b) is True
+                    ):
+                        is_duplicate = True
+                        ocr_merged += 1
+
+        if progress_callback is not None and ocr_on:
+            await progress_callback(50 + (index + 1) / len(frame_paths) * 50)
+
+        if is_duplicate:
+            removed.append(path)
+            continue
+
+        kept.append(path)
+        if signature is not None:
+            last_kept_signature = signature
+            last_kept_path = path
+
+    if ocr_kept or ocr_merged or pointer_merged:
+        logger.info(
+            "Dedup extras: %s frame(s) dropped because only a pointer dot moved; OCR kept %s frame(s) whose "
+            "words changed and dropped %s extra frame(s) with identical words.",
+            pointer_merged, ocr_kept, ocr_merged,
+        )
+
+    return kept, removed, threshold
+
+
+async def generate_volume_preview(
+    input_path: str,
+    output_path: str,
+    seek: float,
+    sample_duration: float,
+    audio_bitrate: str,
+    boost_percent: int,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+) -> bool:
+    """
+    Extracts a short audio-only clip with the given volume boost (and
+    any enabled noise reduction / voice enhancement) applied, so the
+    user can listen before picking a level. Returns True on success.
+    """
+
+    command = ["ffmpeg", "-y"]
+
+    if seek:
+        command += ["-ss", f"{seek:.2f}"]
+
+    command += ["-i", input_path, "-t", f"{sample_duration:.2f}", "-vn", "-c:a", "aac", "-b:a", audio_bitrate,
+                *audio_rate_args(audio_bitrate)]
+
+    audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, boost_percent)
+    if audio_filter_chain:
+        command += ["-af", audio_filter_chain]
+
+    command.append(output_path)
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("Volume preview failed (+%s%%): %s", boost_percent, stderr.decode(errors="replace"))
+        return False
+
+    return True
+
+
+async def make_level_sample(
+    input_path: str,
+    duration: float | None,
+    level: str,
+    work_dir: Path,
+) -> tuple[int | None, Path | None]:
+    """
+    Encode a SAMPLE_SECONDS-long clip (from the middle of the video) at
+    this level. Returns (estimated_full_size, sample_path). The size is
+    extrapolated from the clip; the clip itself is KEPT on disk so it can
+    be sent as a preview — the caller is responsible for deleting it.
+    Returns (None, None) if the encode fails (the level can still be
+    picked — it just shows "unknown" and has no preview).
+    """
+
+    settings = LEVELS[level]
+
+    if not duration or duration <= 0:
+        return None, None
+
+    sample_duration = min(SAMPLE_SECONDS, duration)
+    seek = max(0.0, (duration - sample_duration) / 2)
+
+    sample_path = work_dir / f"sample_{level}.mp4"
+
+    command = build_ffmpeg_command(
+        input_path,
+        str(sample_path),
+        settings,
+        seek=seek,
+        duration=sample_duration,
+    )
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0 or not sample_path.exists():
+        logger.warning(
+            "Sample encode failed for %s: %s",
+            level,
+            stderr.decode(errors="replace"),
+        )
+        sample_path.unlink(missing_ok=True)
+        return None, None
+
+    sample_size = sample_path.stat().st_size
+
+    if sample_duration <= 0:
+        sample_path.unlink(missing_ok=True)
+        return None, None
+
+    return int((sample_size / sample_duration) * duration), sample_path
+
+
+async def sample_all_levels(
+    input_path: str,
+    duration: float | None,
+    work_dir: Path,
+    on_progress=None,
+) -> tuple[dict[str, int | None], dict[str, Path]]:
+    """
+    Runs make_level_sample for every level. Returns
+    (estimates, samples): estimates maps level -> estimated full size
+    (or None), samples maps level -> the kept sample clip (only for
+    levels that encoded successfully). on_progress(done, total), if
+    given, is awaited each time a level finishes.
+    """
+
+    # Limit how many sample encodes run at once — 5 fully parallel
+    # ffmpeg processes can spike CPU/RAM past tight resource limits.
+    semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
+    total = len(LEVEL_ORDER)
+    done_count = 0
+
+    async def bounded_sample(level: str) -> tuple[int | None, Path | None]:
+        nonlocal done_count
+
+        async with semaphore:
+            result = await make_level_sample(input_path, duration, level, work_dir)
+
+        done_count += 1
+
+        if on_progress is not None:
+            try:
+                await on_progress(done_count, total)
+            except Exception:
+                # A progress-message hiccup shouldn't abort the encodes.
+                pass
+
+        return result
+
+    results = await asyncio.gather(
+        *(bounded_sample(level) for level in LEVEL_ORDER),
+        return_exceptions=True,
+    )
+
+    estimates: dict[str, int | None] = {}
+    samples: dict[str, Path] = {}
+
+    for level, result in zip(LEVEL_ORDER, results):
+        if isinstance(result, Exception):
+            logger.warning("Sample for %s raised: %s", level, result)
+            estimates[level] = None
+        else:
+            estimate, sample_path = result
+            estimates[level] = estimate
+            if sample_path is not None:
+                samples[level] = sample_path
+
+    return estimates, samples
+
+
+def sample_length_text(duration: float | None) -> str:
+    """'10s' normally, or the whole video's length if it's shorter than that."""
+    seconds = min(SAMPLE_SECONDS, duration) if duration else SAMPLE_SECONDS
+    return f"{seconds:.0f}s"
+
+
+async def send_level_samples(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    samples: dict[str, Path],
+    estimates: dict[str, int | None],
+    duration: float | None,
+) -> None:
+    """
+    Sends the sample clip for each compression level (lowest
+    compression first) so the user can actually watch the quality
+    difference before choosing. Each clip is deleted right after it's
+    sent. A failed send is logged and skipped — it never blocks the
+    level menu that follows.
+    """
+
+    if not samples:
+        return
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            MSG_SAMPLE_AT_EACH_COMPRESSION_LEVEL.format(sample_length_duration=sample_length_text(duration))
+        ),
+    )
+
+    for level in LEVEL_ORDER:
+        sample_path = samples.get(level)
+
+        if sample_path is None:
+            continue
+
+        info = LEVELS[level]
+        thumb_path = sample_path.with_suffix(".jpg")
+
+        try:
+            sample_size = sample_path.stat().st_size
+            sample_duration = await get_duration(str(sample_path))
+            width, height = await get_video_dimensions(str(sample_path))
+            has_thumb = await generate_thumbnail(str(sample_path), str(thumb_path), sample_duration)
+
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+            await with_retries(
+                context.bot.send_video,
+                chat_id=chat_id,
+                video=str(sample_path),
+                supports_streaming=True,
+                width=width,
+                height=height,
+                duration=round(sample_duration) if sample_duration else None,
+                thumbnail=str(thumb_path) if has_thumb else None,
+                caption=(
+                    MSG_SAMPLE_FULL_VIDEO.format(label=info['label'], detail=info['detail'], size_sample_size=format_size(sample_size), size_estimates_level=format_size(estimates.get(level)))
+                ),
+            )
+        except Exception:
+            logger.exception("Couldn't send %s sample clip", level)
+        finally:
+            sample_path.unlink(missing_ok=True)
+            thumb_path.unlink(missing_ok=True)
+
+
+# ============================================================
+# Smart compression: probe the source, then recommend settings
+# ============================================================
+
+# How much bitrate a codec needs for the same visual quality, relative
+# to H.264 (1.0). HEVC at 3 Mbps looks like H.264 at ~4.6 Mbps, etc.
+CODEC_EFFICIENCY = {
+    "h264": 1.0, "hevc": 0.65, "vp9": 0.7, "av1": 0.55,
+    "vp8": 1.2, "mpeg4": 1.6, "msmpeg4v3": 1.8, "mpeg2video": 2.0,
+    "wmv3": 1.6, "vc1": 1.5, "mjpeg": 3.0,
+}
+CODEC_NAMES = {
+    "h264": "H.264", "hevc": "H.265/HEVC", "vp9": "VP9", "av1": "AV1",
+    "vp8": "VP8", "mpeg4": "MPEG-4", "mpeg2video": "MPEG-2",
+}
+
+# Bits per pixel per frame (H.264-equivalent) that split the verdicts.
+SMART_PLENTY_BPP = 0.12
+SMART_MODERATE_BPP = 0.07
+SMART_COMPACT_BPP = 0.04
+
+# The gentlest level whose estimate is at most this share of the
+# original wins — so a bloated video gets a real cut, while one that is
+# already compact only gets a modest one.
+SMART_TARGET_RATIO = {"plenty": 0.35, "moderate": 0.60, "compact": 0.85, "tiny": 0.95}
+
+SMART_VERDICT_TEXT = {
+    "plenty": MSG_LOTS_OF_ROOM_TO_SHRINK,
+    "moderate": MSG_SOME_ROOM_TO_SHRINK,
+    "compact": MSG_ALREADY_FAIRLY_COMPACT_MODEST_SAVING,
+    "tiny": MSG_ALREADY_VERY_COMPACT_RECOMPRESSING_M,
+}
+
+# Above this frame rate (50/60 fps) the smart mode caps to SMART_FPS_CAP,
+# except at Low, which is the "keep everything" level.
+SMART_FPS_THRESHOLD = 45
+SMART_FPS_CAP = 30
+
+
+def parse_frame_rate(value) -> float | None:
+    try:
+        numerator, denominator = str(value).split("/")
+        numerator, denominator = float(numerator), float(denominator)
+        return numerator / denominator if denominator else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def _to_int(value) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def probe_video_info(input_path: str) -> dict | None:
+    """One ffprobe call: resolution, fps, codec, bitrates, HDR, audio details."""
+    command = [
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_streams", "-show_format", input_path,
+    ]
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("ffprobe (full) failed: %s", stderr.decode(errors="replace"))
+        return None
+
+    try:
+        data = json.loads(stdout.decode(errors="replace"))
+    except ValueError:
+        return None
+
+    streams = data.get("streams") or []
+    video = next(
+        (s for s in streams
+         if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic")),
+        None,
+    )
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+    if video is None:
+        return None
+
+    fmt = data.get("format") or {}
+    width, height = _to_int(video.get("width")), _to_int(video.get("height"))
+
+    # Phone videos are often stored sideways with a rotation flag.
+    rotation = None
+    for side in video.get("side_data_list") or []:
+        if "rotation" in side:
+            rotation = _to_int(side.get("rotation"))
+    if rotation is None:
+        rotation = _to_int((video.get("tags") or {}).get("rotate"))
+    if rotation is not None and abs(rotation) % 180 == 90 and width and height:
+        width, height = height, width
+
+    total_bps = _to_int(fmt.get("bit_rate"))
+    video_bps = _to_int(video.get("bit_rate"))
+    audio_bps = _to_int(audio.get("bit_rate")) if audio else None
+
+    if video_bps is None and total_bps:
+        video_bps = max(total_bps - (audio_bps or (128_000 if audio else 0)), int(total_bps * 0.5))
+
+    transfer = (video.get("color_transfer") or "").lower()
+
+    return {
+        "width": width,
+        "height": height,
+        "fps": parse_frame_rate(video.get("avg_frame_rate")) or parse_frame_rate(video.get("r_frame_rate")),
+        "codec": (video.get("codec_name") or "").lower(),
+        "pix_fmt": video.get("pix_fmt") or "",
+        "hdr": transfer in ("smpte2084", "arib-std-b67"),
+        "video_bps": video_bps,
+        "total_bps": total_bps,
+        "has_audio": audio is not None,
+        "audio_codec": (audio.get("codec_name") or "").lower() if audio else "",
+        "audio_bps": audio_bps,
+        "channels": _to_int(audio.get("channels")) if audio else None,
+    }
+
+
+def smart_analyze(
+    info: dict | None,
+    original_size: int | None,
+    duration: float | None,
+    estimates: dict[str, int | None],
+) -> dict:
+    """Turn the probe + the per-level size estimates into one recommendation."""
+    info = dict(info or {})
+    width, height, fps = info.get("width"), info.get("height"), info.get("fps")
+    codec = info.get("codec") or ""
+    video_bps = info.get("video_bps")
+    bitrate_estimated = False
+    probed = bool(width and height)
+
+    if probed and not video_bps and original_size and duration and duration > 0:
+        total_bps = original_size * 8 / duration
+        audio_guess = (info.get("audio_bps") or 128_000) if info.get("has_audio") else 0
+        video_bps = max(total_bps - audio_guess, total_bps * 0.5)
+        bitrate_estimated = True
+        info["video_bps"] = int(video_bps)
+
+    bpp = eq_bpp = None
+    if video_bps and width and height and fps:
+        bpp = video_bps / (width * height * fps)
+        eq_bpp = bpp / CODEC_EFFICIENCY.get(codec, 1.0)
+
+    if eq_bpp is None:
+        verdict = "moderate"
+    elif eq_bpp >= SMART_PLENTY_BPP:
+        verdict = "plenty"
+    elif eq_bpp >= SMART_MODERATE_BPP:
+        verdict = "moderate"
+    elif eq_bpp >= SMART_COMPACT_BPP:
+        verdict = "compact"
+    else:
+        verdict = "tiny"
+
+    # --- video level: the gentlest one that reaches the target saving ---
+    worthwhile = True
+    usable = {key: est for key, est in estimates.items() if est}
+
+    if usable and original_size:
+        level = next(
+            (key for key in LEVEL_ORDER
+             if usable.get(key) and usable[key] <= original_size * SMART_TARGET_RATIO[verdict]),
+            None,
+        )
+        if level is None:
+            # Nothing reaches the target: take the gentlest level that still
+            # shrinks the file at all; if none does, re-encoding isn't worth it.
+            level = next(
+                (key for key in LEVEL_ORDER
+                 if usable.get(key) and usable[key] < original_size * 0.97),
+                None,
+            )
+            if level is None:
+                level = "medium"
+                worthwhile = False
+    else:
+        level = {"plenty": "medium", "moderate": "medium", "compact": "medium", "tiny": "high"}[verdict]
+
+    # --- audio: never ask for more than the source has ---
+    source_kbps = (info.get("audio_bps") or 0) / 1000
+    if not info.get("has_audio") or not source_kbps:
+        audio_level = DEFAULT_AUDIO_LEVEL
+    elif source_kbps <= 24:
+        audio_level = "k16"
+    elif source_kbps <= 48:
+        audio_level = "k32"
+    elif source_kbps <= 80:
+        audio_level = "k64"
+    else:
+        audio_level = DEFAULT_AUDIO_LEVEL
+
+    # --- frame rate ---
+    max_fps = SMART_FPS_CAP if (fps and fps > SMART_FPS_THRESHOLD and level != "low") else None
+
+    # --- expected size ---
+    est_size = usable.get(level)
+    if est_size is not None:
+        default_audio = estimate_audio_bytes(LEVELS[level]["audio_bitrate"], duration) or 0
+        chosen_audio = estimate_audio_bytes(AUDIO_LEVELS[audio_level]["bitrate"], duration) or 0
+        est_size = max(0, est_size - default_audio + chosen_audio)
+        if max_fps:
+            est_size = int(est_size * 0.8)
+
+    saved_pct = (
+        (original_size - est_size) / original_size * 100
+        if est_size is not None and original_size else None
+    )
+
+    notes: list[str] = []
+    warnings: list[str] = []
+
+    settings = LEVELS[level]
+    if width and width > settings["max_width"] and height:
+        out_w = settings["max_width"]
+        out_h = int(round(height * out_w / width / 2) * 2)
+        notes.append(MSG_RESOLUTION.format(width=width, height=height, out_w=out_w, out_h=out_h))
+    elif width and height:
+        notes.append(f"Keeps the {width}×{height} resolution")
+
+    if max_fps:
+        notes.append(MSG_FPS_CAPPED_AT_FPS_SMALLER.format(fps=fps, SMART_FPS_CAP=SMART_FPS_CAP))
+
+    if codec in ("hevc", "av1", "vp9"):
+        notes.append(
+            f"The source already uses {CODEC_NAMES.get(codec, codec.upper())}, which is more efficient "
+            "than H.264 — so savings are smaller than the file size suggests"
+        )
+
+    if info.get("hdr"):
+        warnings.append("HDR video: the output will be standard (SDR), so colors can look flatter")
+
+    if not worthwhile:
+        warnings.append("Re-encoding likely won't make this file smaller — keep the original unless you need a different size or format")
+
+    if bitrate_estimated:
+        notes.append("Bitrate estimated from file size and length")
+
+    return {
+        "level": level, "audio_level": audio_level, "max_fps": max_fps,
+        "verdict": verdict, "worthwhile": worthwhile,
+        "bpp": bpp, "eq_bpp": eq_bpp,
+        "est_size": est_size, "saved_pct": saved_pct,
+        "info": info, "notes": notes, "warnings": warnings,
+    }
+
+
+def _bitrate_text(bps: float | None) -> str:
+    if not bps:
+        return "unknown bitrate"
+    if bps >= 1_000_000:
+        return f"{bps / 1_000_000:.1f} Mbps"
+    return f"{bps / 1000:.0f} kbps"
+
+
+def smart_analysis_text(rec: dict) -> str:
+    info = rec["info"]
+    lines = [MSG_SMART_ANALYSIS]
+
+    if info.get("width") and info.get("height"):
+        codec = info.get("codec") or "?"
+        fps_text = f"{info['fps']:.0f} fps" if info.get("fps") else "? fps"
+        lines.append(
+            MSG_SMART_ANALYSIS_TEXT.format(width=info['width'], height=info['height'], fps_text=fps_text, codec=CODEC_NAMES.get(codec, codec.upper()), bitrate_text_video_bps=_bitrate_text(info.get('video_bps')))
+        )
+    else:
+        lines.append(MSG_COULDN_T_READ_THIS_VIDEO)
+
+    if not info.get("width"):
+        pass
+    elif info.get("has_audio"):
+        channels = {1: "mono", 2: "stereo"}.get(info.get("channels"), f"{info.get('channels') or '?'} ch")
+        lines.append(
+            MSG_SMART_ANALYSIS_TEXT_5.format(audio_codec=(info.get('audio_codec') or '?').upper(), audio_bps_choice=_bitrate_text(info.get('audio_bps')) if info.get('audio_bps') else 'bitrate unknown', channels=channels)
+        )
+    else:
+        lines.append(MSG_NO_AUDIO_TRACK)
+
+    if rec.get("eq_bpp") is not None:
+        lines.append(
+            MSG_BITS_PER_PIXEL_AS_H.format(eq_bpp=rec['eq_bpp'], smart_verdict_text_verdict=SMART_VERDICT_TEXT[rec['verdict']])
+        )
+
+    level_info = LEVELS[rec["level"]]
+    audio_info = AUDIO_LEVELS[rec["audio_level"]]
+    lines.append(MSG_RECOMMENDED_AUDIO.format(level_info_label=level_info['label'], audio_info_label=audio_info['label']))
+
+    if rec.get("est_size") is not None:
+        saved = f" (−{rec['saved_pct']:.0f}%)" if rec.get("saved_pct") is not None and rec["saved_pct"] > 0 else ""
+        lines.append(MSG_SMART_ANALYSIS_TEXT_2.format(size_est_size=format_size(rec['est_size']), saved=saved))
+
+    for note in rec["notes"]:
+        lines.append(MSG_SMART_ANALYSIS_TEXT_3.format(note=note))
+    for warning in rec["warnings"]:
+        lines.append(MSG_SMART_ANALYSIS_TEXT_4.format(warning=warning))
+
+    return "\n".join(lines)
+
+
+async def analyze_and_show_level_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    status_message,
+    chat_id: int,
+    message_id: int,
+    input_path: Path,
+    duration: float | None,
+    work_dir: Path,
+    original_size: int | None,
+    pending: dict | None = None,
+) -> dict[str, int | None]:
+    """
+    Shared by "new video arrived" and "compress after PDF": encodes a
+    sample at every level, sends those samples as playable clips, then
+    posts the level menu (with size estimates) as a fresh message at the
+    bottom of the chat — so the buttons sit right under the clips
+    instead of scrolled away above them. Returns the estimates; also
+    stores them in `pending["estimates"]` if a pending dict is given.
+    """
+
+    sample_label = sample_length_text(duration)
+
+    async def on_progress(done: int, total: int) -> None:
+        await status_message.edit_text(
+            MSG_ENCODING_A_SAMPLE_AT_EACH_2.format(sample_label=sample_label, done=done, total=total)
+        )
+
+    await status_message.edit_text(
+        MSG_ENCODING_A_SAMPLE_AT_EACH.format(sample_label=sample_label, count_level_order=len(LEVEL_ORDER))
+    )
+
+    estimates, samples = await sample_all_levels(
+        str(input_path), duration, work_dir, on_progress=on_progress
+    )
+
+    if pending is not None:
+        pending["estimates"] = estimates
+
+    try:
+        await send_level_samples(context, chat_id, samples, estimates, duration)
+    finally:
+        # Anything not sent (e.g. an exception mid-way) shouldn't linger.
+        for leftover in samples.values():
+            leftover.unlink(missing_ok=True)
+
+    default_level = get_default_level(chat_id)
+
+    # Smart compression: probe the source and recommend settings.
+    smart_rec = None
+    try:
+        smart_rec = smart_analyze(
+            await probe_video_info(str(input_path)), original_size, duration, estimates
+        )
+        if pending is not None:
+            pending["smart"] = smart_rec
+    except Exception:
+        logger.exception("Smart analysis failed — showing the normal menu")
+
+    lines = [MSG_ORIGINAL_SIZE.format(size_original_size=format_size(original_size)), ""]
+    for level in LEVEL_ORDER:
+        info = LEVELS[level]
+        lines.append(MSG_ANALYZE_AND_SHOW_LEVEL_MENU.format(label=info['label'], size_estimates_level=format_size(estimates.get(level)), detail=info['detail']))
+
+    if smart_rec is not None:
+        lines.append("")
+        lines.append(smart_analysis_text(smart_rec))
+
+    lines.append("")
+    lines.append(MSG_ESTIMATES_ARE_BASED_ON_THE.format(sample_label=sample_label))
+    lines.append(MSG_PICK_A_LEVEL_TO_COMPRESS)
+
+    menu_text = "\n".join(lines)
+
+    if pending is not None:
+        # Kept so the "Go back" button can bring this exact menu back.
+        pending["menu_text"] = menu_text
+        pending["default_level"] = default_level
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=menu_text,
+            reply_markup=estimate_keyboard(
+                message_id, estimates, default_level, smart_rec, original_size
             ),
         )
-    elif data.startswith("city_") and data[5:].isdigit() and int(data[5:]) < len(CITIES):
-        name, lat, lon, tz = CITIES[int(data[5:])]
-        update_user(chat_id, tz=tz, city=name, lat=lat, lon=lon)
-        sync_catchup_marker(u)
-        schedule_reminder(context.application, u)
-        await edit_or_send(
-            q, bot, f"✅ اتحدد مكانك: {name}\n\n" + settings_text(u), settings_menu()
+    except BadRequest:
+        # Maybe this Bot API server doesn't know button colours: send it plain.
+        logger.warning("Styled level menu failed — sending a plain one", exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=menu_text,
+            reply_markup=estimate_keyboard(
+                message_id, estimates, default_level, smart_rec, original_size, styled=False
+            ),
         )
-    elif data.startswith("zone_") and data[5:].isdigit() and int(data[5:]) < len(ZONES):
-        name, tz = ZONES[int(data[5:])]
-        update_user(chat_id, tz=tz, city=None, lat=None, lon=None)
-        sync_catchup_marker(u)
-        schedule_reminder(context.application, u)
-        note = (
-            "\n⚠️ تنبيهات الصلاة محتاجة مدينة أو موقع."
-            if u["prayer_on"]
-            else ""
-        )
-        await edit_or_send(
-            q, bot, f"✅ اتظبطت المنطقة: {name}{note}\n\n" + settings_text(u), settings_menu()
-        )
-    elif data == "pray_toggle":
-        update_user(chat_id, prayer_on=not u["prayer_on"])
-        if u["prayer_on"] and u["lat"] is None:
-            await edit_or_send(
-                q, bot,
-                "🕌 اتفعّلت التنبيهات. اختار مدينتك الأول عشان أحسب مواعيد الصلاة 👇",
-                tz_keyboard(),
-            )
-        else:
-            await edit_or_send(q, bot, prayer_text(u), prayer_keyboard(u))
-    elif data.startswith("pray_") and data[5:] in PRAYERS:
-        u["prayers"][data[5:]] = not u["prayers"].get(data[5:], True)
-        mark_dirty()
-        await edit_or_send(q, bot, prayer_text(u), prayer_keyboard(u))
-    elif data.startswith("prayed_"):
-        parts = data.split("_", 2)
-        if len(parts) == 3 and parts[1] in PRAYERS and DATE_RE.match(parts[2]):
-            prayer_prayed.add((chat_id, parts[2], parts[1]))
-            await edit_or_send(q, bot, f"✅ تقبّل الله صلاتك 🤍 ({PRAYER_AR[parts[1]]})")
-    elif data == "goal_custom":
-        context.user_data["awaiting"] = "goal"
-        await bot.send_message(
-            chat_id, f"ابعت عدد الأيام (من {ar(MIN_GOAL_DAYS)} لـ {ar(MAX_GOAL_DAYS)})"
-        )
-    elif data == "goal_off":
-        update_user(chat_id, goal_days=None, goal_start=None, goal_read=0)
-        await edit_or_send(q, bot, "🚫 اتلغى الهدف.\n\n" + settings_text(u), settings_menu())
-    elif data.startswith("goal_") and data[5:].isdigit():
-        days = int(data[5:])
-        if MIN_GOAL_DAYS <= days <= MAX_GOAL_DAYS:
-            text = apply_goal(chat_id, days)
-            await edit_or_send(q, bot, text + "\n\n" + settings_text(u), settings_menu())
-    elif data == "pages_custom":
-        context.user_data["awaiting"] = "pages"
-        await bot.send_message(chat_id, "ابعت رقم من ١ لـ ١٠٠")
-    elif data.startswith("pages_") and data[6:].isdigit():
-        n = int(data[6:])
-        if 1 <= n <= 100:
-            await edit_or_send(q, bot, set_pages_per_day(chat_id, n))
-    elif data == "done":
-        await mark_done(context, chat_id, q)
+
+    # The old "encoding..." status message has done its job.
+    with contextlib.suppress(Exception):
+        await status_message.delete()
+
+    return estimates
 
 
-async def mark_done(context, chat_id: int, q):
-    u = get_user(chat_id)
-    now = user_now(u)
-    today = now.strftime("%Y-%m-%d")
-    if u["last_done"] == today:
-        await q.edit_message_text("✅ وردك النهاردة اتسجّل قبل كده 🤍")
+# ============================================================
+# Telegram
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await reject_unauthorized(update.message, user_id)
         return
-    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    streak = u["streak"] + 1 if u["last_done"] == yesterday else 1
-    done_pages = u["pages_per_day"]
-    new_page = u["current_page"] + done_pages
-    khatmas = u["khatmas"]
-    msg = "🤍 تقبّل الله منك! ورد بكرة هيوصلك إن شاء الله."
-    if new_page > TOTAL_PAGES:
-        khatmas += 1
-        new_page -= TOTAL_PAGES
-        msg = "🎉 ما شاء الله! خلّصت ختمة كاملة، تقبّل الله منك وبارك فيك 🤲"
 
-    goal_msg = ""
-    if u["goal_days"] and u["goal_start"] and today >= u["goal_start"]:
-        goal_read = u["goal_read"] + done_pages
-        if goal_read >= TOTAL_PAGES:
-            elapsed = (
-                datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(u["goal_start"], "%Y-%m-%d")
-            ).days + 1
-            goal_msg = f"\n🏆 حققت هدفك وخلّصت المصحف في {ar(elapsed)} يوم! تقبّل الله منك 🎉"
-            update_user(chat_id, goal_days=None, goal_start=None, goal_read=0)
-        else:
-            update_user(chat_id, goal_read=goal_read)
-
-    update_user(
-        chat_id, current_page=new_page, last_done=today, streak=streak, khatmas=khatmas
+    # The menu now lives in Telegram's own keyboard (it stays there until removed).
+    await with_style_fallback(
+        lambda: update.message.reply_text(home_text(update.effective_user), reply_markup=home_reply_keyboard())
     )
-    record_done(chat_id, done_pages)
-    await q.edit_message_text(f"{msg}\n🔥 {ar(streak)} يوم ورا بعض{goal_msg}")
 
 
-# ───────────────────────── الرسايل النصية ─────────────────────────
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id == BACKUP_CHAT_ID:
-        return  # ساكت في جروب النسخ الاحتياطي
-    chat_id = update.effective_chat.id
-    text = en_digits(update.message.text.strip())
-    awaiting = context.user_data.get("awaiting")
+async def setlevel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
 
-    if awaiting == "time":
-        m = re.fullmatch(r"([01]?\d|2[0-3])[:.]([0-5]\d)", text)
-        if not m:
-            await update.message.reply_text("الصيغة مش مظبوطة، جرّب كده: 05:30")
-            return
-        hhmm = f"{int(m.group(1)):02d}:{m.group(2)}"
-        update_user(chat_id, remind_time=hhmm, reminders_on=True)
-        u = get_user(chat_id)
-        sync_catchup_marker(u)
-        schedule_reminder(context.application, u)
-        context.user_data.pop("awaiting")
-        extra = (
-            "\n(ميعاد النهاردة عدّى، فأول تذكير هيوصلك بكرة)"
-            if reminder_passed_today(u)
-            else ""
-        )
-        await update.message.reply_text(
-            f"⏰ تمام، هفكّرك كل يوم الساعة {ar(hhmm)}{extra}"
-        )
-    elif awaiting == "pages":
-        if not text.isdigit() or not 1 <= int(text) <= 100:
-            await update.message.reply_text("ابعت رقم بين ١ و ١٠٠")
-            return
-        msg = set_pages_per_day(chat_id, int(text))
-        context.user_data.pop("awaiting")
-        await update.message.reply_text(msg)
-    elif awaiting == "goal":
-        if not text.isdigit() or not MIN_GOAL_DAYS <= int(text) <= MAX_GOAL_DAYS:
-            await update.message.reply_text(
-                f"ابعت رقم بين {ar(MIN_GOAL_DAYS)} و {ar(MAX_GOAL_DAYS)}"
+    if message is None:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await reject_unauthorized(message, user_id)
+        return
+
+    current = get_default_level(message.chat_id)
+
+    await message.reply_text(
+        MSG_PICK_THE_LEVEL_THAT_SHOULD,
+        reply_markup=setlevel_keyboard(current),
+    )
+
+
+async def handle_incoming(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str,
+    original_size: int | None,
+    filename: str,
+    media_type: str = "video",
+) -> None:
+    message = update.effective_message
+
+    if message is None:
+        return
+
+    chat_id = message.chat_id
+
+    # Merge mode: every video this chat sends is added to the merge list
+    # instead of being compressed.
+    if chat_id in merge_sessions:
+        if media_type == merge_sessions[chat_id].get("kind", "video"):
+            await merge_add_video(update, context, file_id, original_size, filename)
+        else:
+            await message.reply_text(merge_busy_text(chat_id))
+        return
+
+    # The user tapped "Replace audio" and this chat is now waiting for
+    # the recording: an audio file / voice message IS that recording.
+    waiting_for_message_id = awaiting_audio_replacement.get(chat_id)
+    if waiting_for_message_id is not None:
+        if media_type == "audio":
+            await process_audio_replacement(
+                update, context, file_id, waiting_for_message_id
             )
             return
-        context.user_data.pop("awaiting")
-        await update.message.reply_text(apply_goal(chat_id, int(text)))
-    elif awaiting == "tz":
+
+        # A video arrived instead — they've moved on, so forget the
+        # pending replacement and handle this as a normal new video.
+        awaiting_audio_replacement.pop(chat_id, None)
+
+    # /update mode: no NEW files (the admin is exempt).
+    if update_mode["on"] and not is_admin(update.effective_user.id if update.effective_user else None):
+        await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
+    # Daily data limit: the size of every file they send counts. Refuse up front
+    # (before downloading anything) if it doesn't fit in what's left of today's allowance.
+    sender_id = update.effective_user.id if update.effective_user else None
+    charged_bytes = int(original_size or 0)
+
+    if file_too_large(sender_id, charged_bytes):
+        await message.reply_text(file_too_large_text(sender_id, charged_bytes))
+        return
+
+    if not quota_allows(sender_id, charged_bytes):
+        await message.reply_text(quota_refusal_text(sender_id, charged_bytes))
+        return
+
+    quota_consume(sender_id, charged_bytes)
+
+    # Sending a new file means they moved on from any half-finished
+    # "send me the name / album / cover" prompt.
+    awaiting_input.pop(chat_id, None)
+
+    # A new video replaces whatever we were holding open for a
+    # previous PDF session in this chat — that's the only other
+    # trigger (besides "Finish session") that deletes a stored video.
+    open_session_message_id = open_pdf_sessions.get(chat_id)
+    if open_session_message_id is not None:
+        clear_pending(open_session_message_id)
+
+    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+
+    work_dir = Path(
+        tempfile.mkdtemp(prefix=f"{media_type}_{message.message_id}_", dir=TEMP_DIR)
+    )
+
+    input_path = work_dir / "input"
+    is_audio = media_type == "audio"
+    kind_label = "audio" if is_audio else "video"
+
+    slot_held = False
+    status_message = None
+
+    async def post_status(text: str) -> None:
+        nonlocal status_message
+        if status_message is None:
+            status_message = await message.reply_text(text)
+        else:
+            await status_message.edit_text(text)
+
+    active_job_ids.add(message.message_id)
+
+    try:
+        size_text = format_size(original_size)
+
+        # Wait in line if other files are being downloaded/analyzed right now.
+        await acquire_work_slot(post_status, user_priority(sender_id), user_plan_label(sender_id))
+        slot_held = True
+
+        await post_status(MSG_DOWNLOADING.format(kind_label=kind_label, size_text=size_text))
+
+        await context.bot.send_chat_action(
+            chat_id=chat_id,
+            action=ChatAction.UPLOAD_VOICE if is_audio else ChatAction.UPLOAD_VIDEO,
+        )
+
+        telegram_file = await with_retries(context.bot.get_file, file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(input_path))
+        delete_server_copy(telegram_file)
+
+        downloaded_size = input_path.stat().st_size
+
+        if charged_bytes == 0 and downloaded_size > 0:
+            # Telegram didn't tell us the size up front: charge the real size now.
+            if file_too_large(sender_id, downloaded_size):
+                cleanup_work_dir(work_dir)
+                await message.reply_text(file_too_large_text(sender_id, downloaded_size))
+                return
+
+            if not quota_allows(sender_id, downloaded_size):
+                cleanup_work_dir(work_dir)
+                await message.reply_text(quota_refusal_text(sender_id, downloaded_size))
+                return
+
+            quota_consume(sender_id, downloaded_size)
+            charged_bytes = downloaded_size
+
+        duration = await get_duration(str(input_path))
+        record_received(media_type)
+
+        if is_audio:
+            # No video stream to compress — audio-only files skip
+            # straight to the audio quality menu (same one the video
+            # flow shows after a video level is picked).
+            audio_estimates = {
+                audio_key: estimate_audio_bytes(AUDIO_LEVELS[audio_key]["bitrate"], duration)
+                for audio_key in AUDIO_LEVEL_ORDER
+            }
+
+            evicted = remember_pending(
+                message.message_id,
+                {
+                    "input_path": input_path,
+                    "work_dir": work_dir,
+                    "original_size": downloaded_size,
+                    "filename": filename,
+                    "chat_id": chat_id,
+                    "duration": duration,
+                    "media_type": "audio",
+                    "file_id": file_id,              # lets "Merge with other audios" reuse this file
+                    "owner_id": sender_id,           # who was charged ...
+                    "charged_bytes": charged_bytes,  # ... and how much (for refunds)
+                },
+            )
+            await notify_evicted(context.bot, evicted)
+
+            await status_message.edit_text(
+                MSG_ORIGINAL_SIZE_PICK_AUDIO_QUALITY.format(size_downloaded_size=format_size(downloaded_size)),
+                reply_markup=audio_keyboard(
+                    message.message_id, AUDIO_ONLY_LEVEL, audio_estimates, DEFAULT_AUDIO_LEVEL
+                ),
+            )
+            return
+
+        # Registered BEFORE the samples are encoded/sent so the menu
+        # buttons that appear afterwards always find their pending entry.
+        pending_entry = {
+            "input_path": input_path,
+            "work_dir": work_dir,
+            "original_size": downloaded_size,
+            "filename": filename,
+            "chat_id": chat_id,
+            "duration": duration,
+            "estimates": {},
+            "media_type": "video",
+            "file_id": file_id,              # lets "Merge with other videos" reuse this file
+            "owner_id": sender_id,           # who was charged ...
+            "charged_bytes": charged_bytes,  # ... and how much (for refunds)
+        }
+        await notify_evicted(context.bot, remember_pending(message.message_id, pending_entry))
+
+        await analyze_and_show_level_menu(
+            context,
+            status_message=status_message,
+            chat_id=chat_id,
+            message_id=message.message_id,
+            input_path=input_path,
+            duration=duration,
+            work_dir=work_dir,
+            original_size=downloaded_size,
+            pending=pending_entry,
+        )
+
+    except Exception as error:
+        logger.exception("Error analyzing %s:", "audio" if is_audio else "video")
+        quota_refund(sender_id, charged_bytes)   # nothing came of it: give the bytes back
+        cleanup_work_dir(work_dir)
+        pending_compressions.pop(message.message_id, None)
+        await message.reply_text(
+            MSG_SOMETHING_WENT_WRONG_WHILE_ANALYZING.format(kind_label=kind_label, error=error)
+        )
+
+    finally:
+        if slot_held:
+            release_work_slot()
+        active_job_ids.discard(message.message_id)
+        await maybe_notify_update_ready(context.bot)
+
+
+async def run_compression(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    input_path: Path,
+    work_dir: Path,
+    original_size: int | None,
+    level: str | None,
+    chat_id: int,
+    source_message_id: int,
+    status_message=None,
+    duration: float | None = None,
+    audio_level: str = DEFAULT_AUDIO_LEVEL,
+    volume_boost_percent: int = 0,
+    noise_reduction: bool = False,
+    voice_enhancement: bool = False,
+    replacement_audio_path: Path | None = None,
+    extra_caption: str = "",
+    max_fps: int | None = None,
+    smart: bool = False,
+) -> None:
+    """
+    level=None means "audio-only" — no video stream to compress, just
+    re-encode the audio at the chosen quality/boost and send it back
+    as an audio file instead of a video.
+
+    level=AUDIO_EDIT_LEVEL means "just edit the audio of a video" — the
+    video stream is copied untouched, only the audio is re-encoded, and
+    the result is sent back as a video.
+
+    level=AUDIO_REPLACE_LEVEL means "swap the video's audio for the
+    recording at replacement_audio_path" — video copied untouched.
+    extra_caption (optional) is appended to the final video caption.
+    """
+
+    global active_compressions
+
+    # Optional extras the user attached through the menus (rename /
+    # album / cover). Read now — clear_pending() wipes them at the end.
+    extras = pending_compressions.get(source_message_id) or {}
+    custom_name = sanitize_filename(extras.get("out_name"))
+    custom_album = extras.get("album")
+    custom_artist = extras.get("artist")
+    cover_path = extras.get("cover_path")
+    cover_thumb_path = extras.get("cover_thumb_path")
+    cover_embedded = False
+
+    is_audio_copy = level == AUDIO_COPY_LEVEL
+    is_audio_only = level is None
+    is_video_audio_edit = level == AUDIO_EDIT_LEVEL
+    is_video_audio_replace = level == AUDIO_REPLACE_LEVEL
+    is_cover_only = level == COVER_ONLY_LEVEL
+    level_info = (
+        None
+        if (is_audio_only or is_audio_copy or is_video_audio_edit or is_video_audio_replace or is_cover_only)
+        else LEVELS[level]
+    )
+    copy_audio = False
+    if audio_level == ORIGINAL_AUDIO:
+        if level_info is None:
+            # Audio-only / audio edit / replace: there is nothing to "keep".
+            audio_level = DEFAULT_AUDIO_LEVEL
+        else:
+            source_info = (extras.get("smart") or {}).get("info") or await probe_video_info(str(input_path))
+
+            if source_info and (
+                source_info.get("has_audio") is False
+                or source_info.get("audio_codec") in MP4_COPY_SAFE_AUDIO
+            ):
+                copy_audio = True
+            else:
+                # The audio format can't go into an MP4 as is (or the probe failed):
+                # re-encode at the best audio quality instead of failing.
+                audio_level = "k128"
+                extra_caption = (
+                    (extra_caption + "\n" if extra_caption else "")
+                    + MSG_THAT_AUDIO_FORMAT_CAN_T
+                )
+
+    audio_info = AUDIO_LEVELS[audio_level]
+    audio_bitrate = audio_info["bitrate"]
+    if is_audio_copy:
+        audio_info = AUDIO_LEVELS[ORIGINAL_AUDIO]   # the sound is copied, not re-encoded
+        audio_bitrate = None
+    # Local-mode uploads use the file's own name on disk, so a rename
+    # has to be the real output file name.
+    output_path = work_dir / (
+        f"{custom_name or 'compressed'}.m4a" if is_audio_only else "compressed.mp4"
+    )
+    if is_cover_only:
+        # Nothing is encoded: the original file itself is what gets uploaded.
+        output_path = Path(input_path)
+    if is_audio_copy:
+        # Keep the real container (and so the real extension); the file keeps
+        # its original name unless the user renamed it.
+        copy_extension = extras.get("extract_copy_ext") if extras.get("extract_audio") else None
+        if not copy_extension:
+            copy_extension = await detect_audio_extension(str(input_path), extras.get("filename"))
+        copy_base = custom_name or sanitize_filename(Path(extras.get("filename") or "").stem) or "audio"
+        output_path = work_dir / f"{copy_base}{copy_extension}"
+
+    job_token = object()
+    queue_refresh_task = None
+
+    stats_user = update.effective_user if update is not None else None
+
+    # Who gets the bytes back if this job is cancelled / fails: the person who was
+    # charged when the file arrived (not necessarily whoever pressed the button).
+    refund_user_id = extras.get("owner_id") or (stats_user.id if stats_user is not None else None)
+    refund_bytes = int(extras.get("charged_bytes") or original_size or 0)
+
+    def give_bytes_back() -> str:
+        """Refund the daily-limit bytes. Returns the size text, or "" if nothing was refunded."""
+        if quota_applies(refund_user_id) and refund_bytes > 0:
+            quota_refund(refund_user_id, refund_bytes)
+            return format_size(refund_bytes)
+        return ""
+
+    # Live "who is compressing what" message for the admin.
+    admin_watch = AdminJobWatcher(
+        context.bot,
+        stats_user,
+        "audio" if is_audio_only
+        else "audio (tags only, no compression)" if is_audio_copy
+        else "audio (video edit)" if is_video_audio_edit
+        else "audio (replacement)" if is_video_audio_replace
+        else "cover (video unchanged)" if is_cover_only
+        else "video",
+    )
+    admin_outcome: tuple[str, str] | None = None
+
+    work_slot_held = False
+    active_job_ids.add(source_message_id)
+    job_started = time.monotonic()
+    encode_seconds: float | None = None
+    queue_wait_seconds: float | None = None
+
+    def admin_summary() -> str:
+        """The few lines the admin sees when a job is done: size saved, time spent, tools used."""
+        lines: list[str] = []
+        is_real_compression = not (is_audio_copy or is_video_audio_edit or is_video_audio_replace or is_cover_only)
+
+        if is_real_compression and original_size and compressed_size is not None:
+            difference = original_size - compressed_size
+            if difference >= 0:
+                lines.append(
+                    f"📉 {format_size(original_size)} → {format_size(compressed_size)} · "
+                    f"saved {format_size(difference)} ({difference / original_size * 100:.0f}%)"
+                )
+            else:
+                lines.append(
+                    f"📈 {format_size(original_size)} → {format_size(compressed_size)} · "
+                    f"{format_size(-difference)} bigger"
+                )
+
+        times = [f"total {format_duration(time.monotonic() - job_started)}"]
+        if queue_wait_seconds and queue_wait_seconds >= 1:
+            times.append(f"waited {format_duration(queue_wait_seconds)}")
+        if encode_seconds:
+            times.append(f"encoding {format_duration(encode_seconds)}")
+        if duration:
+            times.append(f"media length {format_duration(duration)}")
+        lines.append("⏱ " + " · ".join(times))
+
+        tools: list[str] = []
+        if is_cover_only:
+            tools.append("no encoding — cover only")
+        else:
+            tools.append("FFmpeg")
+            if level_info is not None:
+                tools.append(
+                    f"libx264 {level_info['label']} (CRF {level_info['crf']}, {level_info['preset']}, "
+                    f"max {level_info['max_width']}px)"
+                )
+            elif is_video_audio_edit or is_video_audio_replace:
+                tools.append("video copied, not re-encoded")
+
+            if is_audio_copy or copy_audio:
+                tools.append("audio copied as is")
+            elif audio_bitrate:
+                tools.append(f"AAC {audio_bitrate.rstrip('k')} kbps")
+
+            if max_fps:
+                tools.append(f"{max_fps} fps cap")
+            if noise_reduction:
+                tools.append("noise reduction")
+            if voice_enhancement:
+                tools.append("voice enhancement")
+            if volume_boost_percent:
+                tools.append(f"+{volume_boost_percent}% volume")
+            if smart:
+                tools.append("🧠 smart compression")
+
+        lines.append("🛠 " + " · ".join(tools))
+        return "\n".join(lines)
+
+    def log_success() -> None:
+        nonlocal admin_outcome
+        admin_outcome = ("done", "")
         try:
-            ZoneInfo(text)
+            admin_outcome = ("done", "", admin_summary())
         except Exception:
-            await update.message.reply_text(
-                "المنطقة دي مش معروفة، جرّب مثلاً: Africa/Cairo"
+            logger.exception("Couldn't build the admin summary")
+        try:
+            record_job(
+                user=stats_user,
+                kind=(
+                    "audio" if is_audio_only
+                    else "audio_copy" if is_audio_copy
+                    else "audio_edit" if is_video_audio_edit
+                    else "audio_replace" if is_video_audio_replace
+                    else "cover_only" if is_cover_only
+                    else "video"
+                ),
+                level_label=level_info["label"] if level_info else None,
+                original_size=original_size,
+                compressed_size=compressed_size,
+                media_seconds=duration,
+                encode_seconds=encode_seconds,
+                wait_seconds=queue_wait_seconds,
+                total_seconds=time.monotonic() - job_started,
+                audio_label=audio_info["label"],
+                boost=volume_boost_percent,
+                noise_reduction=noise_reduction,
+                voice_enhancement=voice_enhancement,
+                smart=smart,
+            )
+        except Exception:
+            logger.exception("Couldn't record the job in the statistics")
+
+    try:
+        # One heavy job at a time (shared with downloads/analysis): wait here,
+        # with a status message, while another job holds the slot. The slot is
+        # kept until this job has sent its result AND cleaned up (see `finally`).
+        async def post_queue_status(text: str) -> None:
+            nonlocal status_message
+            if status_message is not None:
+                await status_message.edit_text(text)
+            else:
+                status_message = await context.bot.send_message(chat_id=chat_id, text=text)
+
+        queue_user_id = stats_user.id if stats_user is not None else None
+        await acquire_work_slot(post_queue_status, user_priority(queue_user_id), user_plan_label(queue_user_id))
+        work_slot_held = True
+
+        async with contextlib.nullcontext():
+            if queue_refresh_task is not None:
+                queue_refresh_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await queue_refresh_task
+
+            compression_queue[:] = [entry for entry in compression_queue if entry["job_id"] is not job_token]
+
+            active_compressions += 1
+            active_job_progress[job_token] = {
+                "start_time": time.monotonic(),
+                "duration": duration,
+                "percent": 0.0,
+            }
+
+            # Make this job cancellable (the Cancel button under the progress bar).
+            job_handle = {
+                "user_id": stats_user.id if stats_user is not None else None,
+                "cancelled": False,
+                "process": None,
+                "done": False,
+            }
+            running_jobs[source_message_id] = job_handle
+            job_context_token = CURRENT_JOB.set(job_handle)
+
+            try:
+                boost_suffix = MSG_RUN_COMPRESSION.format(volume_boost_percent=volume_boost_percent) if volume_boost_percent else ""
+                enhancement_bits = []
+                if noise_reduction:
+                    enhancement_bits.append(MSG_NOISE_REDUCTION_3)
+                if voice_enhancement:
+                    enhancement_bits.append(MSG_VOICE_ENHANCEMENT_3)
+                enhancement_suffix = f" · {' + '.join(enhancement_bits)}" if enhancement_bits else ""
+                fps_note = f" · {max_fps} fps cap" if max_fps else ""
+
+                if is_audio_only:
+                    compressing_label = (
+                        MSG_COMPRESSING_AUDIO.format(audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
+                    )
+                elif is_audio_copy:
+                    compressing_label = MSG_SENDING_AUDIO_AS_IS
+                elif is_cover_only:
+                    compressing_label = MSG_COVER_ONLY_UPLOADING
+                elif is_video_audio_edit:
+                    compressing_label = (
+                        MSG_EDITING_AUDIO_VIDEO_UNTOUCHED.format(audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
+                    )
+                elif is_video_audio_replace:
+                    compressing_label = (
+                        MSG_REPLACING_THE_AUDIO_VIDEO_UNTOUCHED.format(audio_info_label=audio_info['label'])
+                    )
+                else:
+                    compressing_label = (
+                        MSG_AT_AUDIO.format(smart_choice='🧠 Smart compression' if smart else 'Compressing', level_info_label=level_info['label'], fps_note=fps_note, audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
+                    )
+                text = f"{compressing_label}\n{render_progress_bar(0)}"
+
+                if status_message is not None:
+                    await with_retries(status_message.edit_text, text, reply_markup=cancel_job_keyboard(source_message_id))
+                else:
+                    status_message = await with_retries(
+                        context.bot.send_message, chat_id=chat_id, text=text,
+                        reply_markup=cancel_job_keyboard(source_message_id),
+                    )
+
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=ChatAction.UPLOAD_VOICE if (is_audio_only or is_audio_copy) else ChatAction.UPLOAD_VIDEO,
+                )
+
+                await admin_watch.start()
+
+                progress_state = {
+                    "last_percent": -10.0,
+                    "last_edit": 0.0,
+                    "start_time": time.monotonic(),
+                }
+
+                async def on_progress(percent: float) -> None:
+                    active_job_progress[job_token]["percent"] = percent
+
+                    await admin_watch.progress(percent)
+
+                    now = time.monotonic()
+
+                    # Throttle edits so we don't hammer Telegram's rate limit —
+                    # only push an update on a meaningful jump or after a
+                    # few seconds, whichever comes first.
+                    if (
+                        percent - progress_state["last_percent"] < 4
+                        and now - progress_state["last_edit"] < 3
+                        and percent < 100
+                    ):
+                        return
+
+                    progress_state["last_percent"] = percent
+                    progress_state["last_edit"] = now
+
+                    elapsed = now - progress_state["start_time"]
+                    eta_text = ""
+                    # Need a little progress before the elapsed/percent
+                    # ratio means anything — otherwise early jitter
+                    # produces a wildly wrong estimate.
+                    if 1 <= percent < 100 and elapsed > 2:
+                        remaining_seconds = elapsed * (100 - percent) / percent
+                        eta_text = f" · ~{format_duration(remaining_seconds)} left"
+
+                    bar_text = (
+                        f"{compressing_label}\n"
+                        f"{render_progress_bar(percent)}{eta_text}"
+                    )
+
+                    try:
+                        await status_message.edit_text(bar_text, reply_markup=cancel_job_keyboard(source_message_id))
+                    except Exception:
+                        # A rate-limit hiccup or "message not modified" here
+                        # shouldn't abort the actual compression.
+                        pass
+
+                if is_audio_only:
+                    await compress_audio_only(
+                        str(input_path),
+                        str(output_path),
+                        audio_bitrate,
+                        total_duration=duration,
+                        progress_callback=on_progress if duration else None,
+                        volume_boost_percent=volume_boost_percent,
+                        noise_reduction=noise_reduction,
+                        voice_enhancement=voice_enhancement,
+                        title=custom_name,
+                        album=custom_album,
+                        cover_path=cover_path,
+                        artist=custom_artist,
+                    )
+                elif is_audio_copy:
+                    cover_embedded = await tag_audio_without_compression(
+                        str(input_path),
+                        str(output_path),
+                        total_duration=duration,
+                        progress_callback=on_progress if duration else None,
+                        title=custom_name,
+                        artist=custom_artist,
+                        album=custom_album,
+                        cover_path=cover_path,
+                        source_is_video=bool(extras.get("extract_audio")),
+                    )
+                elif is_cover_only:
+                    pass   # nothing to encode: the original file is uploaded as it is
+                elif is_video_audio_replace:
+                    await replace_video_audio(
+                        str(input_path),
+                        str(replacement_audio_path),
+                        str(output_path),
+                        audio_bitrate,
+                        total_duration=duration,
+                        progress_callback=on_progress if duration else None,
+                    )
+                elif is_video_audio_edit:
+                    await edit_video_audio(
+                        str(input_path),
+                        str(output_path),
+                        audio_bitrate,
+                        total_duration=duration,
+                        progress_callback=on_progress if duration else None,
+                        volume_boost_percent=volume_boost_percent,
+                        noise_reduction=noise_reduction,
+                        voice_enhancement=voice_enhancement,
+                    )
+                else:
+                    await compress_video(
+                        str(input_path),
+                        str(output_path),
+                        level,
+                        max_fps=max_fps,
+                        copy_audio=copy_audio,
+                        total_duration=duration,
+                        progress_callback=on_progress if duration else None,
+                        audio_bitrate=audio_bitrate,
+                        volume_boost_percent=volume_boost_percent,
+                        noise_reduction=noise_reduction,
+                        voice_enhancement=voice_enhancement,
+                    )
+                encode_seconds = time.monotonic() - progress_state["start_time"]
+                queue_wait_seconds = max(0.0, progress_state["start_time"] - job_started)
+            finally:
+                job_handle["done"] = True
+                running_jobs.pop(source_message_id, None)
+                CURRENT_JOB.reset(job_context_token)
+                active_compressions -= 1
+                active_job_progress.pop(job_token, None)
+
+        compressed_size = output_path.stat().st_size
+
+        if original_size:
+            saved = original_size - compressed_size
+            percentage = (saved / original_size) * 100
+        else:
+            percentage = 0
+
+        if is_audio_copy:
+            output_duration = await get_duration(str(output_path))
+
+            await status_message.edit_text(MSG_UPLOADING_AUDIO_AS_IS)
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+
+            audio_thumbnail = (
+                str(cover_thumb_path)
+                if cover_thumb_path and Path(cover_thumb_path).exists()
+                else None
+            )
+
+            caption = MSG_AUDIO_SENT_AS_IS + "\n\n"
+            if custom_artist:
+                caption += MSG_ARTIST.format(custom_artist=custom_artist)
+            if custom_album:
+                caption += MSG_ALBUM.format(custom_album=custom_album).rstrip("\n") + "\n"
+            caption += f"Size: {format_size(compressed_size)}"
+
+            if cover_path and not cover_embedded:
+                caption += "\n\n" + MSG_COVER_NOT_EMBEDDED
+
+            if output_path.suffix.lower() in AUDIO_PLAYABLE_EXTENSIONS:
+                await with_retries(
+                    context.bot.send_audio,
+                    chat_id=chat_id,
+                    audio=str(output_path),
+                    duration=round(output_duration) if output_duration else None,
+                    title=custom_name,
+                    performer=custom_artist,
+                    thumbnail=audio_thumbnail,
+                    caption=caption,
+                )
+            else:
+                # Telegram only plays MP3 / M4A as music: other formats go out as a file, still untouched.
+                await with_retries(
+                    context.bot.send_document,
+                    chat_id=chat_id,
+                    document=str(output_path),
+                    thumbnail=audio_thumbnail,
+                    caption=caption + "\n\n" + MSG_SENT_AS_FILE_NOT_MP3_M4A,
+                )
+            log_success()
+            return
+
+        if is_audio_only:
+            output_duration = await get_duration(str(output_path))
+
+            await status_message.edit_text(MSG_SENDING_COMPRESSED_AUDIO)
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+
+            audio_thumbnail = (
+                str(cover_thumb_path)
+                if cover_thumb_path and Path(cover_thumb_path).exists()
+                else None
+            )
+
+            await with_retries(
+                context.bot.send_audio,
+                chat_id=chat_id,
+                audio=str(output_path),
+                duration=round(output_duration) if output_duration else None,
+                title=custom_name,
+                thumbnail=audio_thumbnail,
+                caption=(
+                    MSG_COMPRESSION_COMPLETE_AUDIO.format(audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
+                    + (MSG_ALBUM.format(custom_album=custom_album) if custom_album else "")
+                    + f"Original: {format_size(original_size)}\n"
+                    f"Compressed: {format_size(compressed_size)}\n"
+                    f"Saved: {percentage:.1f}%"
+                ),
+            )
+            log_success()
+            return
+
+        # Probe the actual compressed file for duration/dimensions
+        # (rather than reusing the source video's numbers) and grab
+        # a thumbnail frame — without these, Telegram clients show
+        # a blank 00:00 preview even though the video plays fine.
+        output_duration = await get_duration(str(output_path))
+        output_width, output_height = await get_video_dimensions(str(output_path))
+
+        if cover_thumb_path and Path(cover_thumb_path).exists():
+            # The user sent their own cover image — use it instead of
+            # a frame grabbed from the video.
+            thumbnail_path = Path(cover_thumb_path)
+            has_thumbnail = True
+        else:
+            thumbnail_path = work_dir / "thumb.jpg"
+            has_thumbnail = await generate_thumbnail(str(output_path), str(thumbnail_path), output_duration)
+
+        await status_message.edit_text(
+            MSG_SENDING_EDITED_VIDEO
+            if (is_video_audio_edit or is_video_audio_replace or is_cover_only)
+            else MSG_SENDING_COMPRESSED_VIDEO
+        )
+
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+        if is_cover_only:
+            result_heading = MSG_COVER_CHANGED_VIDEO_UNCHANGED
+        elif is_video_audio_edit:
+            result_heading = MSG_AUDIO_EDITED_VIDEO_UNTOUCHED_AUDIO.format(audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
+        elif is_video_audio_replace:
+            result_heading = MSG_AUDIO_REPLACED_VIDEO_UNTOUCHED_AUDIO.format(audio_info_label=audio_info['label'])
+        else:
+            result_heading = (
+                MSG_COMPLETE_AUDIO.format(smart_choice='Smart compression' if smart else 'Compression', level_info_label=level_info['label'], fps_note=fps_note, audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
+            )
+
+        await send_video_with_cover(
+            context.bot,
+            cover_path,
+            chat_id=chat_id,
+            video=str(output_path),
+            supports_streaming=True,
+            width=output_width,
+            height=output_height,
+            duration=round(output_duration) if output_duration else None,
+            thumbnail=str(thumbnail_path) if has_thumbnail else None,
+            caption=(
+                (
+                    f"{result_heading}\n\nSize: {format_size(compressed_size)}"
+                    if is_cover_only
+                    else (
+                        f"{result_heading}\n\n"
+                        f"Original: {format_size(original_size)}\n"
+                        f"Compressed: {format_size(compressed_size)}\n"
+                        f"Saved: {percentage:.1f}%"
+                    )
+                )
+                + (f"\n\n{extra_caption}" if extra_caption else "")
+            ),
+        )
+        log_success()
+
+    except JobCancelled:
+        logger.info("Cancelled by the user (message %s)", source_message_id)
+        record_cancel()
+        refunded_text = give_bytes_back()   # they cancelled: nothing was sent, so the bytes go back
+        admin_outcome = ("cancelled", refunded_text)
+        if status_message is not None:
+            with contextlib.suppress(Exception):
+                await status_message.edit_text(   # also removes the button
+                    MSG_COMPRESSION_CANCELLED_REFUNDED.format(size=refunded_text)
+                    if refunded_text
+                    else MSG_COMPRESSION_CANCELLED
+                )
+
+    except Exception as error:
+        logger.exception("Error compressing %s:", "audio" if (is_audio_only or is_audio_copy) else "video")
+        record_failure(stats_user)
+        admin_outcome = ("failed", give_bytes_back())   # no result: give the bytes back
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=MSG_SOMETHING_WENT_WRONG_WHILE_COMPRESSI.format(error=error),
+        )
+
+    finally:
+        await admin_watch.finish(admin_outcome)
+
+        if queue_refresh_task is not None and not queue_refresh_task.done():
+            queue_refresh_task.cancel()
+        compression_queue[:] = [entry for entry in compression_queue if entry["job_id"] is not job_token]
+        active_job_progress.pop(job_token, None)
+
+        try:
+            if source_message_id in pending_compressions:
+                clear_pending(source_message_id)
+            else:
+                # No pending entry (e.g. it was already cleared): just clean the folder up.
+                cleanup_work_dir(work_dir)
+        finally:
+            # Only now (result sent, temp files gone) may the next job start.
+            if work_slot_held:
+                release_work_slot()
+
+        active_job_ids.discard(source_message_id)
+        await maybe_notify_update_ready(context.bot)
+
+
+# Newer python-telegram-bot versions (Bot API 8.3+) have a real `cover`
+# argument on send_video; older ones don't, so fall back to passing it
+# straight through api_kwargs as a file:// URI (the Local Bot API
+# server reads it from disk, same as every other local file here).
+SEND_VIDEO_HAS_COVER = "cover" in inspect.signature(Bot.send_video).parameters
+
+
+class _CoverRejected(Exception):
+    """Telegram refused the cover — the video itself is fine to send without it."""
+
+
+async def send_video_with_cover(bot, cover_path, **kwargs):
+    if cover_path and Path(cover_path).exists():
+        if SEND_VIDEO_HAS_COVER:
+            extra = {"cover": str(cover_path)}
+        else:
+            extra = {"api_kwargs": {"cover": Path(cover_path).resolve().as_uri()}}
+
+        async def attempt():
+            try:
+                return await bot.send_video(**kwargs, **extra)
+            except BadRequest as error:
+                # Not a network problem, so don't let with_retries repeat it.
+                raise _CoverRejected(str(error)) from error
+
+        try:
+            return await with_retries(attempt)
+        except _CoverRejected as error:
+            logger.warning("Telegram rejected the video cover (%s) — sending without it.", error)
+
+    return await with_retries(bot.send_video, **kwargs)
+
+
+async def process_audio_replacement(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str,
+    target_message_id: int,
+) -> None:
+    """
+    The recording for a "Replace audio" request has arrived: download
+    it, sanity-check it has audio, and run the swap through the normal
+    compression pipeline (queue, progress bar, sending, cleanup).
+    """
+
+    message = update.effective_message
+    chat_id = message.chat_id
+
+    pending = pending_compressions.get(target_message_id)
+
+    if pending is None:
+        awaiting_audio_replacement.pop(chat_id, None)
+        await message.reply_text(
+            MSG_THAT_VIDEO_ISN_T_IN
+        )
+        return
+
+    work_dir = pending["work_dir"]
+    audio_path = work_dir / f"replacement_{message.message_id}"
+
+    status_message = await message.reply_text(MSG_DOWNLOADING_THE_NEW_AUDIO)
+
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+
+        telegram_file = await with_retries(context.bot.get_file, file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(audio_path))
+        delete_server_copy(telegram_file)
+
+        has_audio, _ = await probe_audio_stream(str(audio_path))
+
+        if not has_audio:
+            audio_path.unlink(missing_ok=True)
+            # Still waiting — they can just send a different file.
+            await status_message.edit_text(
+                MSG_I_COULDN_T_FIND_ANY
             )
             return
-        update_user(chat_id, tz=text, city=None, lat=None, lon=None)
-        u = get_user(chat_id)
-        sync_catchup_marker(u)
-        schedule_reminder(context.application, u)
-        context.user_data.pop("awaiting")
-        note = (
-            "\n⚠️ تنبيهات الصلاة محتاجة مدينة أو موقع، اختارهم من الإعدادات."
-            if u["prayer_on"]
-            else ""
+
+        replacement_duration = await get_duration(str(audio_path))
+    except Exception as error:
+        logger.exception("Error downloading replacement audio:")
+        audio_path.unlink(missing_ok=True)
+        await status_message.edit_text(
+            MSG_COULDN_T_DOWNLOAD_THAT_AUDIO.format(error=error)
         )
-        await update.message.reply_text(f"🌍 اتظبطت المنطقة الزمنية: {text}{note}")
-    else:
-        await update.message.reply_text("القائمة", reply_markup=main_menu())
-
-
-async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat is None or chat.type != "private":
         return
-    loc = update.message.location
-    lat, lon = round(loc.latitude, 2), round(loc.longitude, 2)  # تقريب ~١ كم للخصوصية
-    u = get_user(chat.id)
-    i, dist = nearest_city(lat, lon)
-    tz = CITIES[i][3] if dist <= NEAREST_CITY_KM else u["tz"]
-    update_user(chat.id, lat=lat, lon=lon, city="موقعك", tz=tz)
-    sync_catchup_marker(u)
-    schedule_reminder(context.application, u)
-    await update.message.reply_text(
-        f"📍 اتحفظ موقعك. المنطقة الزمنية: {tz_label(tz)}\n"
-        "لو مش مظبوطة غيّرها من الإعدادات.",
-        reply_markup=ReplyKeyboardRemove(),
+
+    # The recording counts toward the daily data limit like every other file they send.
+    sender_id = update.effective_user.id if update.effective_user else None
+    replacement_size = audio_path.stat().st_size if audio_path.exists() else 0
+
+    if file_too_large(sender_id, replacement_size):
+        audio_path.unlink(missing_ok=True)
+        await status_message.edit_text(file_too_large_text(sender_id, replacement_size))
+        return
+
+    if not quota_allows(sender_id, replacement_size):
+        audio_path.unlink(missing_ok=True)
+        await status_message.edit_text(quota_refusal_text(sender_id, replacement_size))
+        return
+
+    quota_consume(sender_id, replacement_size)
+    # If this job fails or is cancelled, the bytes of BOTH files go back.
+    pending["charged_bytes"] = int(pending.get("charged_bytes") or pending.get("original_size") or 0) + replacement_size
+
+    # Got a usable recording — no longer waiting.
+    awaiting_audio_replacement.pop(chat_id, None)
+
+    video_duration = pending.get("duration")
+    extra_caption = ""
+
+    if replacement_duration and video_duration:
+        difference = replacement_duration - video_duration
+
+        if difference > 1:
+            extra_caption = (
+                MSG_YOUR_RECORDING_IS_LONGER_THAN.format(time_replacement_duration=format_duration(replacement_duration), time_video_duration=format_duration(video_duration), time_difference=format_duration(difference))
+            )
+        elif difference < -1:
+            extra_caption = (
+                MSG_YOUR_RECORDING_IS_SHORTER_THAN.format(time_replacement_duration=format_duration(replacement_duration), time_video_duration=format_duration(video_duration), time_difference=format_duration(-difference))
+            )
+
+    await run_compression(
+        update,
+        context,
+        pending["input_path"],
+        work_dir,
+        pending["original_size"],
+        AUDIO_REPLACE_LEVEL,
+        chat_id,
+        target_message_id,
+        status_message=status_message,
+        duration=video_duration,
+        audio_level=REPLACE_AUDIO_LEVEL,
+        replacement_audio_path=audio_path,
+        extra_caption=extra_caption,
     )
 
 
-async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """بيسجّل إن المستخدم نشط النهاردة (في الخاص بس)، وبيرجّع اللي كان حاظر البوت."""
-    chat = update.effective_chat
-    if chat is None or chat.type != "private":
+# ============================================================
+# Merge videos
+# ============================================================
+#
+# Flow: the person taps "🎞 Merge videos" (or sends /merge). From then on every
+# video that chat sends is ADDED to a list instead of being compressed. Nothing
+# is downloaded yet. When they tap "Merge", the job waits for the shared work
+# slot like every other heavy job, downloads the videos, and joins them in the
+# order they were sent:
+#   • if every video has identical codec/size/frame-rate/audio settings the
+#     streams are simply joined (very fast, no quality loss);
+#   • otherwise everything is re-encoded to the first video's size and frame
+#     rate (smaller videos get black bars, videos without sound get silence).
+
+MERGE_MAX_VIDEOS = int(os.getenv("MERGE_MAX_VIDEOS", "0"))   # 0 = no limit
+MERGE_CRF = os.getenv("MERGE_CRF", "23")
+MERGE_PRESET = os.getenv("MERGE_PRESET", "veryfast")
+MERGE_MAX_WIDTH = int(os.getenv("MERGE_MAX_WIDTH", "1920"))
+MERGE_AUDIO_BITRATE = os.getenv("MERGE_AUDIO_BITRATE", "128k")
+# A merge session left alone this long is dropped (and the daily-limit bytes refunded).
+MERGE_IDLE_MINUTES = int(os.getenv("MERGE_IDLE_MINUTES", "15"))
+MERGE_COPY_VIDEO_CODECS = {"h264", "hevc"}
+TELEGRAM_UPLOAD_LIMIT_BYTES = int(1.95 * 1024 * 1024 * 1024)
+
+BTN_MERGE_VIDEOS = "🎞 Merge videos"
+BTN_MERGE_VIDEO_WITH_OTHERS = "🔗 Merge with other videos"
+MSG_MERGE_VIDEO_ADDED = "🔗 Added to your video merge list — send the other videos now."
+MSG_MERGE_VIDEO_EXPIRED = "⚠️ That video isn't available anymore — please send it again."
+BTN_MERGE_NOW = "✅ Merge {count} videos"
+BTN_MERGE_UNDO = "↩️ Remove last"
+
+MSG_MERGE_INTRO = (
+    "🎞 Merge videos\n\n"
+    "Send me the videos you want to join, in the order you want them "
+    "(at least 2 videos{up_to}). You can send them one by one or forward several at once.\n\n"
+    "While merge mode is on, videos you send are added here instead of being compressed. "
+    "Tap Cancel to leave merge mode."
+)
+MSG_MERGE_LIST_HEADER = "🎞 Merge videos — {count} added{max_note}"
+MSG_MERGE_LIST_FOOTER = "Send the next video, or tap Merge when you're done. They're joined in the order you sent them."
+MSG_MERGE_NEED_TWO = "Add at least 2 videos first, then tap Merge."
+MSG_MERGE_FULL = "That's the maximum of {max} videos for one merge. Tap Merge to join them."
+MSG_MERGE_VIDEOS_ONLY = "🎞 Merge mode is on — please send videos only, or tap Cancel to leave merge mode."
+MSG_MERGE_NO_SESSION = "There's no merge in progress. Send a video and tap “🔗 Merge with other videos” under it (or send /merge) to start one."
+MSG_MERGE_ALREADY_RUNNING = "⏳ Your merge is already running — please wait for it to finish."
+MSG_MERGE_CANCELLED = "❌ Merge cancelled. Videos you send now will be compressed as usual."
+MSG_MERGE_CANCELLED_REFUNDED = "❌ Merge cancelled — {size} was given back to your daily limit."
+MSG_MERGE_CANCEL_WHILE_RUNNING = "Your merge is already running — use the Cancel button under its progress bar."
+MSG_MERGE_DOWNLOADING = "⬇️ Downloading video {index} of {total} ({size})…"
+MSG_MERGE_CHECKING = "🔍 Checking your videos…"
+MSG_MERGE_JOINING = "🔗 Merging {count} videos — joining them without re-encoding (original quality)"
+MSG_MERGE_REENCODING = "🔗 Merging {count} videos — re-encoding so they match"
+MSG_MERGE_SENDING = "📤 Sending the merged video…"
+MSG_MERGE_NOT_A_VIDEO = "Video {index} couldn't be read — it may be damaged or not a real video. Nothing was merged."
+MSG_MERGE_TOO_BIG = "The merged video would be bigger than Telegram's 2 GB upload limit. Try merging fewer or shorter videos."
+MSG_MERGE_NO_LENGTH = "I couldn't read the length of video {index}, so I can't merge it."
+MSG_MERGE_FAILED = "😕 Something went wrong while merging: {error}"
+MSG_MERGE_CANCELLED_JOB = "❌ Merge cancelled."
+MSG_MERGE_REFUND_NOTE = "\n{size} was given back to your daily limit."
+MSG_MERGE_DONE_CAPTION = (
+    "✅ Merged {count} videos ({mode})\n\n"
+    "Length: {length}\n"
+    "Size: {size}"
+)
+MSG_MERGE_MODE_COPY = "joined without re-encoding"
+MSG_MERGE_MODE_REENCODE = "re-encoded to match"
+MSG_MERGE_IDLE_EXPIRED = "🎞 I closed your merge after {minutes} minutes without activity."
+MSG_MERGE_IDLE_EXPIRED_REFUNDED = (
+    "🎞 I closed your merge after {minutes} minutes without activity, "
+    "and gave {size} back to your daily limit."
+)
+
+# ---- audio merge: same flow as the video merge, with its own wording ----
+MERGE_MAX_AUDIOS = int(os.getenv("MERGE_MAX_AUDIOS", "0"))   # 0 = no limit
+MERGE_AUDIO_ONLY_BITRATE = os.getenv("MERGE_AUDIO_ONLY_BITRATE", "128k")
+MERGE_AUDIO_COPY_CODECS = {"aac", "mp3"}
+
+BTN_MERGE_AUDIOS = "🎧 Merge audios"
+BTN_MERGE_AUDIO_WITH_OTHERS = "🔗 Merge with other audios"
+MSG_MERGE_AUDIO_ADDED = "🔗 Added to your audio merge list — send the other audios now."
+MSG_MERGE_AUDIO_EXPIRED = "⚠️ That audio isn't available anymore — please send it again."
+MSG_MERGE_AUDIO_TITLE = "Merged audio"
+
+# Wording that differs for audio (looked up by the name of the video text it replaces).
+AUDIO_MERGE_TEXT = {
+    "MSG_MERGE_INTRO": (
+        "🎧 Merge audios\n\n"
+        "Send me the audio files you want to join, in the order you want them "
+        "(at least 2 audios{up_to}). You can send them one by one or forward several at once.\n\n"
+        "While merge mode is on, audios you send are added here instead of being compressed. "
+        "Tap Cancel to leave merge mode."
+    ),
+    "MSG_MERGE_LIST_HEADER": "🎧 Merge audios — {count} added{max_note}",
+    "MSG_MERGE_LIST_FOOTER": "Send the next audio, or tap Merge when you're done. They're joined in the order you sent them.",
+    "MSG_MERGE_NEED_TWO": "Add at least 2 audios first, then tap Merge.",
+    "MSG_MERGE_FULL": "That's the maximum of {max} audios for one merge. Tap Merge to join them.",
+    "MSG_MERGE_VIDEOS_ONLY": "🎧 Audio merge mode is on — please send audio files only, or tap Cancel to leave merge mode.",
+    "MSG_MERGE_CANCELLED": "❌ Merge cancelled. Audios you send now will be handled as usual.",
+    "MSG_MERGE_DOWNLOADING": "⬇️ Downloading audio {index} of {total} ({size})…",
+    "MSG_MERGE_CHECKING": "🔍 Checking your audios…",
+    "MSG_MERGE_JOINING": "🔗 Merging {count} audios — joining them without re-encoding (original quality)",
+    "MSG_MERGE_REENCODING": "🔗 Merging {count} audios — re-encoding so they match",
+    "MSG_MERGE_SENDING": "📤 Sending the merged audio…",
+    "MSG_MERGE_NOT_A_VIDEO": "Audio {index} couldn't be read — it may be damaged or not a real audio file. Nothing was merged.",
+    "MSG_MERGE_TOO_BIG": "The merged audio would be bigger than Telegram's 2 GB upload limit. Try merging fewer or shorter audios.",
+    "MSG_MERGE_DONE_CAPTION": "✅ Merged {count} audios ({mode})\n\nLength: {length}\nSize: {size}",
+}
+
+
+def mm(kind: str, name: str) -> str:
+    """A merge message in the wording for this kind of merge ("video" or "audio")."""
+    if kind == "audio" and name in AUDIO_MERGE_TEXT:
+        return AUDIO_MERGE_TEXT[name]
+    return globals()[name]
+
+
+def merge_max_items(kind: str) -> int:
+    """How many files one merge may hold. 0 = no limit."""
+    return max(0, MERGE_MAX_AUDIOS if kind == "audio" else MERGE_MAX_VIDEOS)
+
+
+def merge_is_full(session: dict) -> bool:
+    limit = merge_max_items(session.get("kind", "video"))
+    return bool(limit) and len(session["items"]) >= limit
+
+
+def merge_busy_text(chat_id: int) -> str:
+    """What to say when a file of the wrong kind arrives while this chat is in merge mode."""
+    session = merge_sessions.get(chat_id)
+    return mm(session.get("kind", "video") if session else "video", "MSG_MERGE_VIDEOS_ONLY")
+
+
+# chat_id -> the merge list that chat is building (or merging right now).
+merge_sessions: dict[int, dict] = {}
+_merge_job_keys = itertools.count(1)
+
+
+class MergeRefused(Exception):
+    """The merge can't go ahead; the message is shown to the person as is."""
+
+
+MERGE_PANEL_SHOWN = 15   # how many of the latest files the panel lists (the rest are only counted)
+
+
+def merge_panel_text(session: dict) -> str:
+    items = session["items"]
+    kind = session.get("kind", "video")
+    max_items = merge_max_items(kind)
+    notes = {
+        "max": max_items,
+        "max_note": f" (max {max_items})" if max_items else "",
+        "up_to": f", up to {max_items}" if max_items else "",
+    }
+
+    if not items:
+        return mm(kind, "MSG_MERGE_INTRO").format(**notes)
+
+    lines = [mm(kind, "MSG_MERGE_LIST_HEADER").format(count=len(items), **notes), ""]
+    first_shown = max(0, len(items) - MERGE_PANEL_SHOWN)
+
+    if first_shown:
+        lines.append(f"… {first_shown} earlier file(s) not shown")
+
+    for number, item in enumerate(items[first_shown:], start=first_shown + 1):
+        name = item["filename"]
+        if len(name) > 32:
+            name = name[:29] + "..."
+
+        bits = [format_size(item["size"])] if item.get("size") else []
+        if item.get("duration"):
+            bits.append(format_duration(item["duration"]))
+
+        lines.append(f"{number}. {name}" + (f" · {' · '.join(bits)}" if bits else ""))
+
+    total = sum(int(item.get("size") or 0) for item in items)
+    if total:
+        lines += ["", f"Total: {format_size(total)}"]
+
+    lines += ["", mm(kind, "MSG_MERGE_LIST_FOOTER")]
+    return "\n".join(lines)
+
+
+def merge_keyboard(count: int, kind: str = "video") -> InlineKeyboardMarkup:
+    rows = []
+
+    if count >= 2:
+        button = BTN_MERGE_NOW.format(count=count)
+        if kind == "audio":
+            button = button.replace("videos", "audios")
+        rows.append([InlineKeyboardButton(button, callback_data="merge:go:0")])
+
+    last_row = []
+    if count >= 1:
+        last_row.append(InlineKeyboardButton(BTN_MERGE_UNDO, callback_data="merge:undo:0"))
+    last_row.append(InlineKeyboardButton(BTN_CANCEL, callback_data="merge:cancel:0"))
+    rows.append(last_row)
+
+    return InlineKeyboardMarkup(rows)
+
+
+def merge_refund_all(session: dict) -> str:
+    """Give the daily-limit bytes of every added video back. Returns the size text, or ""."""
+    owner_id = session.get("owner_id")
+    total = sum(int(item.get("charged") or 0) for item in session["items"])
+
+    if quota_applies(owner_id) and total > 0:
+        quota_refund(owner_id, total)
+        for item in session["items"]:
+            item["charged"] = 0
+        return format_size(total)
+
+    return ""
+
+
+MERGE_PANEL_DELAY = 0.7   # seconds: files that arrive together are shown with a single edit
+
+
+async def render_merge_panel(bot, session: dict, fresh: bool = False) -> None:
+    """
+    Show the list on ONE message: edit it in place. Only the first time (or when
+    fresh=True, e.g. the person asked for the merge screen again) a new message is sent.
+    """
+    async with session["lock"]:
+        if merge_sessions.get(session["chat_id"]) is not session or session.get("running"):
+            return
+
+        text = merge_panel_text(session)
+        markup = merge_keyboard(len(session["items"]), session.get("kind", "video"))
+        panel_id = session.get("panel_id")
+
+        if panel_id is not None and not fresh:
+            try:
+                await bot.edit_message_text(
+                    chat_id=session["chat_id"], message_id=panel_id, text=text, reply_markup=markup
+                )
+                session["last_active"] = time.time()
+                return
+            except RetryAfter as error:
+                await asyncio.sleep(float(error.retry_after) + 0.5)
+                with contextlib.suppress(Exception):
+                    await bot.edit_message_text(
+                        chat_id=session["chat_id"], message_id=panel_id, text=text, reply_markup=markup
+                    )
+                return
+            except BadRequest as error:
+                if "not modified" in str(error).lower():
+                    return
+                # The message was deleted or can't be edited: send a fresh one below.
+            except Exception as error:
+                logger.warning("Couldn't edit the merge list (%s) — sending a new one.", error)
+
+        if panel_id is not None:
+            with contextlib.suppress(Exception):   # take the buttons off the old one
+                await bot.edit_message_reply_markup(
+                    chat_id=session["chat_id"], message_id=panel_id, reply_markup=None
+                )
+
+        sent = await bot.send_message(chat_id=session["chat_id"], text=text, reply_markup=markup)
+        session["panel_id"] = sent.message_id
+        session["last_active"] = time.time()
+
+
+async def _merge_panel_later(bot, session: dict) -> None:
+    await asyncio.sleep(MERGE_PANEL_DELAY)
+    await render_merge_panel(bot, session)
+
+
+async def send_merge_panel(bot, session: dict, fresh: bool = False) -> None:
+    """
+    Refresh the list. Several files arriving at once (forwarded together) are merged into one
+    edit: every call restarts a short timer and only the last one draws.
+    fresh=True shows it right away as a new message at the bottom of the chat.
+    """
+    task = session.get("refresh_task")
+
+    if task is not None and not task.done():
+        task.cancel()
+
+    if fresh:
+        session["refresh_task"] = None
+        await render_merge_panel(bot, session, fresh=True)
         return
-    # تحديثات حالة الشات (زي بلوك البوت) مش نشاط من المستخدم.
-    if update.message is None and update.callback_query is None:
+
+    session["refresh_task"] = asyncio.create_task(_merge_panel_later(bot, session))
+
+
+def merge_stop_refresh(session: dict) -> None:
+    task = session.get("refresh_task")
+
+    if task is not None and not task.done():
+        task.cancel()
+
+    session["refresh_task"] = None
+
+
+def new_merge_session(chat_id: int, owner_id: int | None, kind: str) -> dict:
+    return {
+        "chat_id": chat_id,
+        "owner_id": owner_id,
+        "kind": kind,
+        "items": [],
+        "panel_id": None,
+        "last_active": time.time(),
+        "running": False,
+        "refresh_task": None,
+        "lock": asyncio.Lock(),
+    }
+
+
+async def begin_merge(bot, chat_id: int, user, kind: str = "video") -> None:
+    """Start merge mode for a chat (home button or /merge, /mergeaudio)."""
+    user_id = user.id if user is not None else None
+
+    if update_mode["on"] and not is_admin(user_id):
+        await bot.send_message(chat_id=chat_id, text=UPDATE_BUSY_TEXT)
         return
-    record_active(chat.id)
-    unblock(context.application, chat.id)
+
+    existing = merge_sessions.get(chat_id)
+
+    if existing is not None:
+        if existing.get("running"):
+            await bot.send_message(chat_id=chat_id, text=MSG_MERGE_ALREADY_RUNNING)
+            return
+
+        if existing.get("kind", "video") == kind:
+            await send_merge_panel(bot, existing, fresh=True)
+            return
+
+        # They asked for the OTHER kind of merge: drop the old list (bytes are given back).
+        merge_stop_refresh(existing)
+        merge_refund_all(existing)
+        merge_sessions.pop(chat_id, None)
+
+    # Merge mode takes over: forget any half-finished "send me the audio/name/cover" prompt.
+    awaiting_audio_replacement.pop(chat_id, None)
+    awaiting_input.pop(chat_id, None)
+
+    session = new_merge_session(chat_id, user_id, kind)
+    merge_sessions[chat_id] = session
+    await send_merge_panel(bot, session, fresh=True)
 
 
-async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تليجرام بيبلّغنا فوراً لما مستخدم يعمل بلوك للبوت أو يفكّه."""
-    cm = update.my_chat_member
-    if cm is None or cm.chat.type != "private":
+async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
         return
-    status = cm.new_chat_member.status
-    if status == "kicked":
-        mark_blocked(cm.chat.id)
-    elif status == "member":
-        unblock(context.application, cm.chat.id)
+
+    if not is_allowed(user.id):
+        await reject_unauthorized(message, user.id)
+        return
+
+    await begin_merge(context.bot, message.chat_id, user)
 
 
-# ───────────────────────── تشغيل وإيقاف ─────────────────────────
-async def post_init(app: Application):
-    global save_lock, outbox, outbox_task, APP
-    APP = app
-    save_lock = asyncio.Lock()
-    outbox = Outbox()
-    await restore_state(app.bot)
-    for u in state["users"].values():
-        schedule_reminder(app, u)
-    outbox_task = asyncio.create_task(outbox.run(app.bot))
-    app.job_queue.run_repeating(autosave_job, interval=SAVE_INTERVAL, first=SAVE_INTERVAL)
-    app.job_queue.run_repeating(prayer_tick, interval=60, first=15)
-    await flush(app.bot)  # بيرفع النسخة الأولى أو النسخة المحلية الأحدث لو لزم
-    app.job_queue.run_once(catchup_job, when=3)  # تعويض التذكيرات اللي فاتت
-    log.info("Tarteel started with %d users.", len(state["users"]))
+async def mergeaudio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    if not is_allowed(user.id):
+        await reject_unauthorized(message, user.id)
+        return
+
+    await begin_merge(context.bot, message.chat_id, user, "audio")
 
 
-async def post_stop(app: Application):
-    if outbox_task is not None:
-        outbox_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await outbox_task
-    await flush(app.bot)  # آخر حفظ قبل ما البوت يقفل
+async def merge_add_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id: str,
+    size: int | None,
+    filename: str,
+) -> None:
+    """A video arrived while the chat is in merge mode: add it to the list."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    session = merge_sessions.get(chat_id)
+
+    if session is None:
+        return
+
+    sender_id = update.effective_user.id if update.effective_user else None
+
+    if session.get("running"):
+        await message.reply_text(MSG_MERGE_ALREADY_RUNNING)
+        return
+
+    if update_mode["on"] and not is_admin(sender_id):
+        await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
+    kind = session.get("kind", "video")
+
+    if merge_is_full(session):
+        await message.reply_text(mm(kind, "MSG_MERGE_FULL").format(max=merge_max_items(kind)))
+        return
+
+    charged = int(size or 0)
+
+    if file_too_large(sender_id, charged):
+        await message.reply_text(file_too_large_text(sender_id, charged))
+        return
+
+    if not quota_allows(sender_id, charged):
+        await message.reply_text(quota_refusal_text(sender_id, charged))
+        return
+
+    quota_consume(sender_id, charged)
+
+    media = message.video or message.audio or message.voice
+    session["items"].append({
+        "file_id": file_id,
+        "size": size,
+        "filename": filename,
+        "duration": getattr(media, "duration", None) if media is not None else None,
+        "message_id": message.message_id,
+        "charged": charged,
+        "sender_id": sender_id,
+    })
+    # Several videos forwarded at once can be handled out of order: Telegram's
+    # message ids always grow in the order they were sent, so sort by them.
+    session["items"].sort(key=lambda item: item["message_id"])
+    session["last_active"] = time.time()
+
+    await send_merge_panel(context.bot, session)
 
 
-def main():
-    if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        raise SystemExit("حط توكن البوت في BOT_TOKEN جوه bot.py (أو في ملف .env) الأول.")
-    app = (
+async def merge_seed_from_pending(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, kind: str) -> None:
+    """The \"🔗 Merge with other videos / audios\" button under a file the person just sent."""
+    pending = pending_compressions.get(message_id)
+    expired_text = MSG_MERGE_AUDIO_EXPIRED if kind == "audio" else MSG_MERGE_VIDEO_EXPIRED
+    added_text = MSG_MERGE_AUDIO_ADDED if kind == "audio" else MSG_MERGE_VIDEO_ADDED
+
+    if pending is None or not pending.get("file_id") or pending.get("media_type", "video") != kind:
+        await query.message.reply_text(expired_text)
+        return
+
+    user_id = query.from_user.id if query.from_user else None
+    existing = merge_sessions.get(chat_id)
+
+    if existing is not None and existing.get("running"):
+        await query.message.reply_text(MSG_MERGE_ALREADY_RUNNING)
+        return
+
+    if existing is not None and existing.get("kind", "video") != kind:
+        # They were building the OTHER kind of merge: drop that list (its bytes are given back).
+        merge_stop_refresh(existing)
+        merge_refund_all(existing)
+        merge_sessions.pop(chat_id, None)
+        existing = None
+
+    session = existing or new_merge_session(chat_id, user_id, kind)
+
+    if merge_is_full(session):
+        await query.message.reply_text(mm(kind, "MSG_MERGE_FULL").format(max=merge_max_items(kind)))
+        return
+
+    # The file was already counted against the daily limit when it arrived: that charge moves
+    # to the merge list (so cancelling the merge gives it back), and the stored copy is deleted
+    # because the merge downloads its files again when it starts.
+    session["items"].append({
+        "file_id": pending["file_id"],
+        "size": pending.get("original_size"),
+        "filename": pending.get("filename") or f"{kind}_{message_id}.{'m4a' if kind == 'audio' else 'mp4'}",
+        "duration": pending.get("duration"),
+        "message_id": message_id,
+        "charged": int(pending.get("charged_bytes") or 0),
+        "sender_id": pending.get("owner_id", user_id),
+    })
+    session["items"].sort(key=lambda item: item["message_id"])
+    session["last_active"] = time.time()
+    merge_sessions[chat_id] = session
+    awaiting_audio_replacement.pop(chat_id, None)
+    awaiting_input.pop(chat_id, None)
+    clear_pending(message_id)
+
+    with contextlib.suppress(Exception):
+        await query.edit_message_text(added_text)
+
+    await send_merge_panel(context.bot, session)
+
+
+async def handle_merge_callback(query, context: ContextTypes.DEFAULT_TYPE, command: str, message_id: int = 0) -> None:
+    chat_id = query.message.chat_id if query.message else None
+
+    if chat_id is None:
+        return
+
+    if command == "start":
+        await begin_merge(context.bot, chat_id, query.from_user)
+        return
+
+    if command == "starta":
+        await begin_merge(context.bot, chat_id, query.from_user, "audio")
+        return
+
+    if command in ("audio", "video"):
+        await merge_seed_from_pending(query, context, chat_id, message_id, command)
+        return
+
+    session = merge_sessions.get(chat_id)
+
+    if session is None:
+        await query.message.reply_text(MSG_MERGE_NO_SESSION)
+        return
+
+    if command == "cancel":
+        if session.get("running"):
+            await query.message.reply_text(MSG_MERGE_CANCEL_WHILE_RUNNING)
+            return
+
+        merge_stop_refresh(session)
+        refunded = merge_refund_all(session)
+        merge_sessions.pop(chat_id, None)
+        text = (
+            MSG_MERGE_CANCELLED_REFUNDED.format(size=refunded)
+            if refunded
+            else mm(session.get("kind", "video"), "MSG_MERGE_CANCELLED")
+        )
+
+        try:
+            await query.edit_message_text(text)
+        except Exception:
+            await query.message.reply_text(text)
+        return
+
+    if session.get("running"):
+        await query.message.reply_text(MSG_MERGE_ALREADY_RUNNING)
+        return
+
+    session["last_active"] = time.time()
+
+    if command == "undo":
+        if session["items"]:
+            removed = session["items"].pop()
+            if quota_applies(removed.get("sender_id")) and removed.get("charged"):
+                quota_refund(removed["sender_id"], int(removed["charged"]))
+
+        try:
+            await query.edit_message_text(
+                merge_panel_text(session),
+                reply_markup=merge_keyboard(len(session["items"]), session.get("kind", "video")),
+            )
+        except Exception as error:
+            if "not modified" not in str(error).lower():
+                logger.warning("Couldn't refresh the merge list: %s", error)
+        return
+
+    if command == "go":
+        if len(session["items"]) < 2:
+            await query.message.reply_text(mm(session.get("kind", "video"), "MSG_MERGE_NEED_TWO"))
+            return
+
+        # Set BEFORE any await so a double tap can't start two merges.
+        session["running"] = True
+        merge_stop_refresh(session)
+
+        with contextlib.suppress(Exception):
+            await query.edit_message_reply_markup(reply_markup=None)
+
+        await run_merge(context, session, query.from_user)
+
+
+async def expire_idle_merge_sessions(bot) -> int:
+    """Drop merge lists nobody has touched for MERGE_IDLE_MINUTES (nothing was downloaded yet)."""
+    if IDLE_FILE_TTL_MINUTES <= 0 or MERGE_IDLE_MINUTES <= 0:
+        return 0
+
+    now = time.time()
+    removed = 0
+
+    for chat_id, session in list(merge_sessions.items()):
+        if session.get("running"):
+            continue
+
+        if now - session.get("last_active", now) < MERGE_IDLE_MINUTES * 60:
+            continue
+
+        merge_stop_refresh(session)
+        refunded = merge_refund_all(session)
+        merge_sessions.pop(chat_id, None)
+        removed += 1
+
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    MSG_MERGE_IDLE_EXPIRED_REFUNDED.format(minutes=MERGE_IDLE_MINUTES, size=refunded)
+                    if refunded
+                    else MSG_MERGE_IDLE_EXPIRED.format(minutes=MERGE_IDLE_MINUTES)
+                ),
+            )
+
+    return removed
+
+
+async def probe_merge_signature(path: str) -> dict | None:
+    """What has to match between videos for them to be joined without re-encoding."""
+    command = [
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_streams", path,
+    ]
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("ffprobe (merge) failed: %s", stderr.decode(errors="replace"))
+        return None
+
+    try:
+        data = json.loads(stdout.decode(errors="replace"))
+    except ValueError:
+        return None
+
+    streams = data.get("streams") or []
+    video = next(
+        (s for s in streams
+         if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic")),
+        None,
+    )
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+    if video is None:
+        return None
+
+    width, height = _to_int(video.get("width")), _to_int(video.get("height"))
+
+    rotation = None
+    for side in video.get("side_data_list") or []:
+        if "rotation" in side:
+            rotation = _to_int(side.get("rotation"))
+    if rotation is None:
+        rotation = _to_int((video.get("tags") or {}).get("rotate"))
+    rotation = rotation or 0
+
+    display_width, display_height = width, height
+    if abs(rotation) % 180 == 90 and width and height:
+        display_width, display_height = height, width
+
+    return {
+        "display_width": display_width,
+        "display_height": display_height,
+        "fps": parse_frame_rate(video.get("avg_frame_rate")) or parse_frame_rate(video.get("r_frame_rate")),
+        "has_audio": audio is not None,
+        # Everything below must be identical for a lossless join:
+        "match": (
+            (video.get("codec_name") or "").lower(),
+            video.get("profile"),
+            video.get("pix_fmt"),
+            width, height, rotation,
+            video.get("r_frame_rate"),
+            video.get("sample_aspect_ratio"),
+            (audio.get("codec_name") or "").lower() if audio else None,
+            audio.get("profile") if audio else None,
+            audio.get("sample_rate") if audio else None,
+            audio.get("channels") if audio else None,
+        ),
+        "video_codec": (video.get("codec_name") or "").lower(),
+        "audio_codec": (audio.get("codec_name") or "").lower() if audio else "",
+    }
+
+
+async def probe_audio_merge_signature(path: str) -> dict | None:
+    """What has to match between audio files for them to be joined without re-encoding."""
+    command = ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", path]
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("ffprobe (audio merge) failed: %s", stderr.decode(errors="replace"))
+        return None
+
+    try:
+        data = json.loads(stdout.decode(errors="replace"))
+    except ValueError:
+        return None
+
+    audio = next((s for s in (data.get("streams") or []) if s.get("codec_type") == "audio"), None)
+
+    if audio is None:
+        return None
+
+    codec = (audio.get("codec_name") or "").lower()
+    sample_rate = _to_int(audio.get("sample_rate"))
+    channels = _to_int(audio.get("channels"))
+
+    return {
+        "has_audio": True,
+        "audio_codec": codec,
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "match": (codec, audio.get("profile"), sample_rate, channels),
+    }
+
+
+def merge_audio_can_copy(signatures: list[dict]) -> bool:
+    """True when every audio is the same AAC / MP3 kind, so they can simply be joined."""
+    first = signatures[0]
+
+    if first["audio_codec"] not in MERGE_AUDIO_COPY_CODECS:
+        return False
+
+    return all(sig["match"] == first["match"] for sig in signatures)
+
+
+def build_merge_audio_copy_command(paths: list[Path], list_path: Path, output_path: Path) -> list[str]:
+    list_path.write_text(
+        "".join(f"file '{path.resolve().as_posix()}'\n" for path in paths),
+        encoding="utf-8",
+    )
+
+    command = [
+        "ffmpeg", "-y",
+        "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", str(list_path),
+        "-map", "0:a:0", "-vn", "-c", "copy",
+    ]
+
+    if output_path.suffix.lower() == ".m4a":
+        command += ["-movflags", "+faststart"]
+
+    return command + ["-max_muxing_queue_size", "1024", str(output_path)]
+
+
+def build_merge_audio_reencode_command(
+    paths: list[Path],
+    signatures: list[dict],
+    output_path: Path,
+) -> list[str]:
+    all_mono = all((sig.get("channels") or 2) == 1 for sig in signatures)
+    first_rate = signatures[0].get("sample_rate")
+    rate = first_rate if first_rate in (32000, 44100, 48000) else 44100
+    layout = "mono" if all_mono else "stereo"
+
+    command = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    for path in paths:
+        command += ["-threads", DECODER_THREADS, "-i", str(path)]
+
+    parts = [
+        f"[{index}:a:0]aformat=sample_rates={rate}:channel_layouts={layout},asetpts=PTS-STARTPTS[a{index}]"
+        for index in range(len(paths))
+    ]
+    parts.append("".join(f"[a{index}]" for index in range(len(paths))) + f"concat=n={len(paths)}:v=0:a=1[a]")
+
+    command += [
+        "-filter_complex", ";".join(parts),
+        "-map", "[a]", "-vn",
+        "-c:a", "aac", "-b:a", MERGE_AUDIO_ONLY_BITRATE,
+        "-threads", FFMPEG_THREADS,
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        str(output_path),
+    ]
+    return command
+
+
+def merge_can_stream_copy(signatures: list[dict]) -> bool:
+    """True when every video is built the same way, so they can simply be joined."""
+    first = signatures[0]
+
+    if first["video_codec"] not in MERGE_COPY_VIDEO_CODECS:
+        return False
+
+    if first["has_audio"] and first["audio_codec"] not in MP4_COPY_SAFE_AUDIO:
+        return False
+
+    return all(sig["match"] == first["match"] for sig in signatures)
+
+
+def build_merge_copy_command(paths: list[Path], list_path: Path, output_path: Path) -> list[str]:
+    list_path.write_text(
+        "".join(f"file '{path.resolve().as_posix()}'\n" for path in paths),
+        encoding="utf-8",
+    )
+
+    return [
+        "ffmpeg", "-y",
+        "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+        "-f", "concat", "-safe", "0", "-i", str(list_path),
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        str(output_path),
+    ]
+
+
+def build_merge_reencode_command(
+    paths: list[Path],
+    signatures: list[dict],
+    durations: list[float | None],
+    output_path: Path,
+) -> list[str]:
+    first = signatures[0]
+    width = first["display_width"] or 1280
+    height = first["display_height"] or 720
+
+    if width > MERGE_MAX_WIDTH:
+        height = round(height * MERGE_MAX_WIDTH / width)
+        width = MERGE_MAX_WIDTH
+
+    width = max(2, width - width % 2)    # x264 needs even sizes
+    height = max(2, height - height % 2)
+
+    fps = min(max(first["fps"] or 30.0, 1.0), 60.0)
+    any_audio = any(sig["has_audio"] for sig in signatures)
+
+    command = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    for path in paths:
+        command += ["-threads", DECODER_THREADS, "-i", str(path)]
+
+    parts: list[str] = []
+    labels: list[str] = []
+
+    for index, sig in enumerate(signatures):
+        parts.append(
+            f"[{index}:v:0]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,"
+            f"fps={fps:.3f},format=yuv420p,setpts=PTS-STARTPTS[v{index}]"
+        )
+        labels.append(f"[v{index}]")
+
+        if any_audio:
+            if sig["has_audio"]:
+                parts.append(
+                    f"[{index}:a:0]aformat=sample_rates=44100:channel_layouts=stereo,"
+                    f"asetpts=PTS-STARTPTS[a{index}]"
+                )
+            else:
+                # This video has no sound: fill its part with silence of the same length.
+                if not durations[index]:
+                    raise MergeRefused(MSG_MERGE_NO_LENGTH.format(index=index + 1))
+                parts.append(
+                    f"anullsrc=r=44100:cl=stereo,atrim=duration={durations[index]:.3f},"
+                    f"asetpts=PTS-STARTPTS[a{index}]"
+                )
+            labels.append(f"[a{index}]")
+
+    parts.append(
+        "".join(labels)
+        + f"concat=n={len(paths)}:v=1:a={1 if any_audio else 0}[v]"
+        + ("[a]" if any_audio else "")
+    )
+
+    command += ["-filter_complex", ";".join(parts), "-map", "[v]"]
+
+    if any_audio:
+        command += ["-map", "[a]"]
+
+    medium = LEVELS["medium"]   # reuse its low-RAM x264 buffering settings
+    command += [
+        "-c:v", "libx264",
+        "-preset", MERGE_PRESET,
+        "-crf", MERGE_CRF,
+        "-x264-params",
+        f"rc-lookahead={medium['lookahead']}:ref={medium['refs']}:bframes={medium['bframes']}",
+        "-threads", FFMPEG_THREADS,
+    ]
+
+    if any_audio:
+        command += ["-c:a", "aac", "-b:a", MERGE_AUDIO_BITRATE]
+
+    command += [
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        str(output_path),
+    ]
+
+    return command
+
+
+async def run_merge(context: ContextTypes.DEFAULT_TYPE, session: dict, user) -> None:
+    """Download the added videos, join them, send the result. Holds the shared work slot."""
+    global active_compressions
+
+    chat_id = session["chat_id"]
+    owner_id = session.get("owner_id")
+    kind = session.get("kind", "video")
+    is_audio_merge = kind == "audio"
+    items = sorted(session["items"], key=lambda item: item["message_id"])   # the order they were sent
+    count = len(items)
+    key = -next(_merge_job_keys)   # negative: can never clash with a real message id
+
+    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix=f"merge_{abs(key)}_", dir=TEMP_DIR))
+    output_path = work_dir / "merged.mp4"
+
+    status_message = None
+    work_slot_held = False
+    admin_watch = AdminJobWatcher(context.bot, user, "merge")
+    admin_outcome: tuple[str, str] | None = None
+    job_token = object()
+    job_started = time.monotonic()
+    queue_wait_seconds: float | None = None
+    encode_seconds: float | None = None
+    total_duration: float | None = None
+    total_input_bytes = 0
+    merged_size: int | None = None
+
+    def give_bytes_back() -> str:
+        return merge_refund_all({"owner_id": owner_id, "items": items})
+
+    async def post_status(text: str, markup=None) -> None:
+        nonlocal status_message
+        if status_message is None:
+            status_message = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        else:
+            await status_message.edit_text(text, reply_markup=markup)
+
+    active_job_ids.add(key)
+
+    try:
+        queued_at = time.monotonic()
+        await acquire_work_slot(post_status, user_priority(owner_id), user_plan_label(owner_id))
+        work_slot_held = True
+        queue_wait_seconds = time.monotonic() - queued_at
+
+        # ---- download ----
+        paths: list[Path] = []
+
+        for index, item in enumerate(items, start=1):
+            await post_status(mm(kind, "MSG_MERGE_DOWNLOADING").format(
+                index=index, total=count, size=format_size(item.get("size"))
+            ))
+            await context.bot.send_chat_action(
+                chat_id=chat_id, action=ChatAction.UPLOAD_VOICE if is_audio_merge else ChatAction.UPLOAD_VIDEO
+            )
+
+            path = work_dir / f"part_{index}"
+            telegram_file = await with_retries(context.bot.get_file, item["file_id"])
+            await with_retries(telegram_file.download_to_drive, custom_path=str(path))
+            delete_server_copy(telegram_file)
+
+            real_size = path.stat().st_size
+            total_input_bytes += real_size
+
+            if not item.get("charged") and real_size > 0:
+                # Telegram didn't tell us the size up front: charge the real size now.
+                sender_id = item.get("sender_id")
+
+                if file_too_large(sender_id, real_size):
+                    raise MergeRefused(file_too_large_text(sender_id, real_size))
+                if not quota_allows(sender_id, real_size):
+                    raise MergeRefused(quota_refusal_text(sender_id, real_size))
+
+                quota_consume(sender_id, real_size)
+                item["charged"] = real_size
+
+            paths.append(path)
+
+        # ---- look at every video ----
+        await post_status(mm(kind, "MSG_MERGE_CHECKING"))
+
+        signatures: list[dict] = []
+        durations: list[float | None] = []
+
+        for index, path in enumerate(paths, start=1):
+            if is_audio_merge:
+                signature = await probe_audio_merge_signature(str(path))
+            else:
+                signature = await probe_merge_signature(str(path))
+
+            if signature is None:
+                raise MergeRefused(mm(kind, "MSG_MERGE_NOT_A_VIDEO").format(index=index))
+
+            signatures.append(signature)
+            durations.append(await get_duration(str(path)))
+
+        known = [d for d in durations if d]
+        total_duration = sum(known) if known else None
+
+        # ---- encode ----
+        job_handle = {"user_id": owner_id, "cancelled": False, "process": None, "done": False}
+        running_jobs[key] = job_handle
+        job_context_token = CURRENT_JOB.set(job_handle)
+        active_compressions += 1
+        active_job_progress[job_token] = {
+            "start_time": time.monotonic(),
+            "duration": total_duration,
+            "percent": 0.0,
+        }
+
+        try:
+            progress_state = {"last_percent": -10.0, "last_edit": 0.0, "start_time": time.monotonic(), "label": ""}
+
+            async def show_bar(label: str) -> None:
+                progress_state.update(
+                    last_percent=-10.0, last_edit=0.0, start_time=time.monotonic(), label=label
+                )
+                active_job_progress[job_token].update(start_time=time.monotonic(), percent=0.0)
+                await post_status(f"{label}\n{render_progress_bar(0)}", cancel_job_keyboard(key))
+
+            async def on_progress(percent: float) -> None:
+                active_job_progress[job_token]["percent"] = percent
+                await admin_watch.progress(percent)
+
+                now = time.monotonic()
+
+                if (
+                    percent - progress_state["last_percent"] < 4
+                    and now - progress_state["last_edit"] < 3
+                    and percent < 100
+                ):
+                    return
+
+                progress_state["last_percent"] = percent
+                progress_state["last_edit"] = now
+
+                elapsed = now - progress_state["start_time"]
+                eta_text = ""
+                if 1 <= percent < 100 and elapsed > 2:
+                    eta_text = f" · ~{format_duration(elapsed * (100 - percent) / percent)} left"
+
+                try:
+                    await status_message.edit_text(
+                        f"{progress_state['label']}\n{render_progress_bar(percent)}{eta_text}",
+                        reply_markup=cancel_job_keyboard(key),
+                    )
+                except Exception:
+                    pass   # rate-limit hiccup / "message not modified": never abort the merge for it
+
+            progress_callback = on_progress if total_duration else None
+            used_copy = False
+            encode_started = time.monotonic()
+
+            await admin_watch.start()
+
+            if is_audio_merge and merge_audio_can_copy(signatures):
+                copy_output = work_dir / ("merged.mp3" if signatures[0]["audio_codec"] == "mp3" else "merged.m4a")
+                await show_bar(mm(kind, "MSG_MERGE_JOINING").format(count=count))
+
+                try:
+                    await run_ffmpeg_with_progress(
+                        build_merge_audio_copy_command(paths, work_dir / "list.txt", copy_output),
+                        total_duration,
+                        progress_callback,
+                    )
+                    used_copy = copy_output.exists() and copy_output.stat().st_size > 0
+                except JobCancelled:
+                    raise
+                except Exception:
+                    logger.warning("Joining audios without re-encoding failed — re-encoding instead.", exc_info=True)
+
+                if used_copy:
+                    output_path = copy_output
+                else:
+                    copy_output.unlink(missing_ok=True)
+
+            if not is_audio_merge and merge_can_stream_copy(signatures):
+                await show_bar(mm(kind, "MSG_MERGE_JOINING").format(count=count))
+
+                try:
+                    await run_ffmpeg_with_progress(
+                        build_merge_copy_command(paths, work_dir / "list.txt", output_path),
+                        total_duration,
+                        progress_callback,
+                    )
+                    used_copy = output_path.exists() and output_path.stat().st_size > 0
+                except JobCancelled:
+                    raise
+                except Exception:
+                    logger.warning("Joining without re-encoding failed — re-encoding instead.", exc_info=True)
+
+                if not used_copy:
+                    output_path.unlink(missing_ok=True)
+
+            if not used_copy:
+                await show_bar(mm(kind, "MSG_MERGE_REENCODING").format(count=count))
+
+                if is_audio_merge:
+                    output_path = work_dir / "merged.m4a"
+                    reencode_command = build_merge_audio_reencode_command(paths, signatures, output_path)
+                else:
+                    reencode_command = build_merge_reencode_command(paths, signatures, durations, output_path)
+
+                await run_ffmpeg_with_progress(reencode_command, total_duration, progress_callback)
+
+            encode_seconds = time.monotonic() - encode_started
+        finally:
+            job_handle["done"] = True
+            running_jobs.pop(key, None)
+            CURRENT_JOB.reset(job_context_token)
+            active_compressions -= 1
+            active_job_progress.pop(job_token, None)
+
+        # ---- send ----
+        merged_size = output_path.stat().st_size
+
+        if merged_size > TELEGRAM_UPLOAD_LIMIT_BYTES:
+            raise MergeRefused(mm(kind, "MSG_MERGE_TOO_BIG"))
+
+        output_duration = await get_duration(str(output_path))
+        done_caption = mm(kind, "MSG_MERGE_DONE_CAPTION").format(
+            count=count,
+            mode=MSG_MERGE_MODE_COPY if used_copy else MSG_MERGE_MODE_REENCODE,
+            length=format_duration(output_duration) if output_duration else "unknown",
+            size=format_size(merged_size),
+        )
+
+        await status_message.edit_text(mm(kind, "MSG_MERGE_SENDING"))
+
+        if is_audio_merge:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+
+            with named_for_upload(output_path, f"{MSG_MERGE_AUDIO_TITLE}{output_path.suffix}") as send_path:
+                await with_retries(
+                    context.bot.send_audio,
+                    chat_id=chat_id,
+                    audio=str(send_path),
+                    duration=round(output_duration) if output_duration else None,
+                    title=MSG_MERGE_AUDIO_TITLE,
+                    caption=done_caption,
+                )
+        else:
+            output_width, output_height = await get_video_dimensions(str(output_path))
+            thumbnail_path = work_dir / "thumb.jpg"
+            has_thumbnail = await generate_thumbnail(str(output_path), str(thumbnail_path), output_duration)
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+            await send_video_with_cover(
+                context.bot,
+                None,
+                chat_id=chat_id,
+                video=str(output_path),
+                supports_streaming=True,
+                width=output_width,
+                height=output_height,
+                duration=round(output_duration) if output_duration else None,
+                thumbnail=str(thumbnail_path) if has_thumbnail else None,
+                caption=done_caption,
+            )
+
+        admin_outcome = ("done", "")
+        with contextlib.suppress(Exception):
+            await status_message.delete()
+
+        try:
+            record_job(
+                user=user,
+                kind="merge",
+                level_label="Merge",
+                original_size=total_input_bytes,
+                compressed_size=merged_size,
+                media_seconds=total_duration,
+                encode_seconds=encode_seconds,
+                wait_seconds=queue_wait_seconds,
+                total_seconds=time.monotonic() - job_started,
+                audio_label="Merged audio",
+                boost=0,
+                noise_reduction=False,
+                voice_enhancement=False,
+            )
+        except Exception:
+            logger.exception("Couldn't record the merge in the statistics")
+
+    except JobCancelled:
+        logger.info("Merge cancelled by the user")
+        record_cancel()
+        refunded = give_bytes_back()
+        admin_outcome = ("cancelled", refunded)
+
+        if status_message is not None:
+            with contextlib.suppress(Exception):
+                await status_message.edit_text(
+                    MSG_MERGE_CANCELLED_JOB + (MSG_MERGE_REFUND_NOTE.format(size=refunded) if refunded else "")
+                )
+
+    except MergeRefused as problem:
+        record_failure(user)
+        refunded = give_bytes_back()
+        admin_outcome = ("failed", refunded)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=str(problem) + (MSG_MERGE_REFUND_NOTE.format(size=refunded) if refunded else ""),
+        )
+
+    except Exception as error:
+        logger.exception("Error merging videos:")
+        record_failure(user)
+        refunded = give_bytes_back()
+        admin_outcome = ("failed", refunded)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=MSG_MERGE_FAILED.format(error=error) + (MSG_MERGE_REFUND_NOTE.format(size=refunded) if refunded else ""),
+        )
+
+    finally:
+        await admin_watch.finish(admin_outcome)
+        active_job_progress.pop(job_token, None)
+
+        if merge_sessions.get(chat_id) is session:
+            merge_sessions.pop(chat_id, None)
+
+        try:
+            cleanup_work_dir(work_dir)
+        finally:
+            # Only now (result sent, temp files gone) may the next job start.
+            if work_slot_held:
+                release_work_slot()
+
+        active_job_ids.discard(key)
+        await maybe_notify_update_ready(context.bot)
+
+
+
+# ============================================================
+# Split a video in two
+# ============================================================
+#
+# "✂️ Split video" asks for the time of the cut (H:MM:SS), then cuts the stored
+# video into two videos: start → cut, and cut → end. Both parts are re-encoded
+# (near-original quality) so the cut lands exactly where it was asked, not on the
+# nearest keyframe. The original stays in the menu afterwards.
+
+SPLIT_CRF = os.getenv("SPLIT_CRF", "20")
+SPLIT_PRESET = os.getenv("SPLIT_PRESET", "veryfast")
+SPLIT_AUDIO_BITRATE = os.getenv("SPLIT_AUDIO_BITRATE", "160k")
+
+
+def parse_split_time(text: str) -> float | None:
+    """'0:05:30' -> 330.0   ('5:30' and '330' work too). None when it isn't a time."""
+    cleaned = (text or "").strip().replace(",", ".")
+
+    if not cleaned or not re.fullmatch(r"[0-9]+(:[0-9]+){0,2}(\.[0-9]+)?", cleaned):
+        return None
+
+    parts = cleaned.split(":")
+    numbers = [float(part) for part in parts]
+
+    if any(number >= 60 for number in numbers[1:]):   # minutes / seconds after the first part: 0-59
+        return None
+
+    total = 0.0
+    for number in numbers:
+        total = total * 60 + number
+
+    return total
+
+
+def format_clock(seconds: float) -> str:
+    """Seconds -> H:MM:SS (the same way people type it)."""
+    seconds = max(0, int(round(seconds)))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}"
+
+
+def build_split_command(input_path, output_path, start: float, length: float | None) -> list[str]:
+    command = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+    if start > 0:
+        command += ["-ss", f"{start:.3f}"]   # before -i: fast, and still frame-accurate when re-encoding
+
+    command += ["-threads", DECODER_THREADS, "-i", str(input_path)]
+
+    if length is not None:
+        command += ["-t", f"{length:.3f}"]
+
+    medium = LEVELS["medium"]   # its low-RAM x264 buffering settings
+    command += [
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-c:v", "libx264", "-preset", SPLIT_PRESET, "-crf", SPLIT_CRF,
+        "-x264-params", f"rc-lookahead={medium['lookahead']}:ref={medium['refs']}:bframes={medium['bframes']}",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",   # even size + a pixel format every player shows
+        "-threads", FFMPEG_THREADS,
+        "-c:a", "aac", "-b:a", SPLIT_AUDIO_BITRATE,
+        "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
+        str(output_path),
+    ]
+    return command
+
+
+async def start_split_prompt(query, context: ContextTypes.DEFAULT_TYPE, message_id: int) -> None:
+    """The "✂️ Split video" button: ask where to cut."""
+    pending = pending_compressions.get(message_id)
+
+    if pending is None or pending.get("media_type") != "video":
+        await query.message.reply_text(MSG_THAT_VIDEO_ISN_T_IN_2)
+        return
+
+    if message_id in active_job_ids or message_id in running_jobs:
+        await query.message.reply_text(MSG_SPLIT_BUSY)
+        return
+
+    duration = pending.get("duration")
+
+    if not duration or duration < 2:
+        await query.message.reply_text(MSG_SPLIT_NO_LENGTH)
+        return
+
+    chat_id = pending["chat_id"]
+    awaiting_input[chat_id] = {"mid": message_id, "field": "splittime"}
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=MSG_SPLIT_ASK.format(length=format_duration(duration), clock=format_clock(duration)),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(BTN_CANCEL, callback_data=f"ameta:stop:{message_id}")
+        ]]),
+    )
+
+
+async def handle_split_time(update: Update, context: ContextTypes.DEFAULT_TYPE, message_id: int, pending: dict, text: str) -> None:
+    """The person answered with the time of the cut."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    duration = pending.get("duration") or 0
+    split_at = parse_split_time(text)
+
+    if split_at is None:
+        await message.reply_text(MSG_SPLIT_BAD_TIME)
+        return
+
+    if split_at < 1 or split_at > duration - 1:
+        await message.reply_text(MSG_SPLIT_OUT_OF_RANGE.format(clock=format_clock(duration)))
+        return
+
+    awaiting_input.pop(chat_id, None)
+    await run_split(context, chat_id, message_id, pending, split_at, update.effective_user)
+
+
+async def run_split(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, pending: dict, split_at: float, user) -> None:
+    """Cut the stored video at split_at and send the two parts. Holds the shared work slot."""
+    global active_compressions
+
+    if message_id in active_job_ids or message_id in running_jobs:
+        await context.bot.send_message(chat_id=chat_id, text=MSG_SPLIT_BUSY)
+        return
+
+    owner_id = pending.get("owner_id")
+    input_path = pending["input_path"]
+    work_dir = Path(pending["work_dir"])
+    duration = float(pending.get("duration") or 0)
+    parts = [(1, 0.0, split_at), (2, split_at, duration)]
+
+    status_message = None
+    work_slot_held = False
+    admin_watch = AdminJobWatcher(context.bot, user, "split")
+    admin_outcome: tuple[str, str] | None = None
+    job_token = object()
+
+    async def post_status(text: str, markup=None) -> None:
+        nonlocal status_message
+        if status_message is None:
+            status_message = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        else:
+            await status_message.edit_text(text, reply_markup=markup)
+
+    active_job_ids.add(message_id)
+
+    try:
+        await acquire_work_slot(post_status, user_priority(owner_id), user_plan_label(owner_id))
+        work_slot_held = True
+
+        job_handle = {"user_id": owner_id, "cancelled": False, "process": None, "done": False}
+        running_jobs[message_id] = job_handle
+        job_context_token = CURRENT_JOB.set(job_handle)
+        active_compressions += 1
+        active_job_progress[job_token] = {"start_time": time.monotonic(), "duration": duration, "percent": 0.0}
+
+        try:
+            await admin_watch.start()
+
+            for part, start, end in parts:
+                length = end - start
+                label = MSG_SPLIT_CUTTING.format(part=part, start=format_clock(start), end=format_clock(end))
+                output_path = work_dir / f"split_{part}.mp4"
+                state = {"last_percent": -10.0, "last_edit": 0.0, "start": time.monotonic()}
+                active_job_progress[job_token].update(start_time=time.monotonic(), percent=0.0, duration=length)
+                await post_status(f"{label}\n{render_progress_bar(0)}", cancel_job_keyboard(message_id))
+
+                async def on_progress(percent: float, label=label, state=state) -> None:
+                    active_job_progress[job_token]["percent"] = percent
+                    await admin_watch.progress(percent)
+                    now = time.monotonic()
+
+                    if percent - state["last_percent"] < 4 and now - state["last_edit"] < 3 and percent < 100:
+                        return
+
+                    state["last_percent"], state["last_edit"] = percent, now
+                    elapsed = now - state["start"]
+                    eta = f" · ~{format_duration(elapsed * (100 - percent) / percent)} left" if 1 <= percent < 100 and elapsed > 2 else ""
+
+                    try:
+                        await status_message.edit_text(
+                            f"{label}\n{render_progress_bar(percent)}{eta}",
+                            reply_markup=cancel_job_keyboard(message_id),
+                        )
+                    except Exception:
+                        pass   # rate-limit hiccup / "message not modified": never abort the split for it
+
+                await run_ffmpeg_with_progress(
+                    build_split_command(input_path, output_path, start, length if part == 1 else None),
+                    length,
+                    on_progress,
+                )
+
+                size = output_path.stat().st_size
+
+                if size > TELEGRAM_UPLOAD_LIMIT_BYTES:
+                    raise MergeRefused(MSG_SPLIT_TOO_BIG.format(part=part))
+
+                part_duration = await get_duration(str(output_path))
+                width, height = await get_video_dimensions(str(output_path))
+                thumb_path = work_dir / f"split_{part}.jpg"
+                has_thumb = await generate_thumbnail(str(output_path), str(thumb_path), part_duration)
+
+                await status_message.edit_text(MSG_SPLIT_SENDING.format(part=part))
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+                await send_video_with_cover(
+                    context.bot,
+                    pending.get("cover_path"),
+                    chat_id=chat_id,
+                    video=str(output_path),
+                    supports_streaming=True,
+                    width=width,
+                    height=height,
+                    duration=round(part_duration) if part_duration else None,
+                    thumbnail=str(thumb_path) if has_thumb else None,
+                    caption=MSG_SPLIT_CAPTION.format(
+                        part=part, start=format_clock(start), end=format_clock(end),
+                        length=format_duration(part_duration) if part_duration else "?", size=format_size(size),
+                    ),
+                )
+
+                # Free the disk before the next part is made.
+                output_path.unlink(missing_ok=True)
+                thumb_path.unlink(missing_ok=True)
+        finally:
+            job_handle["done"] = True
+            running_jobs.pop(message_id, None)
+            CURRENT_JOB.reset(job_context_token)
+            active_compressions -= 1
+            active_job_progress.pop(job_token, None)
+
+        admin_outcome = ("done", "")
+        with contextlib.suppress(Exception):
+            await status_message.delete()
+        await context.bot.send_message(chat_id=chat_id, text=MSG_SPLIT_DONE.format(clock=format_clock(split_at)))
+
+    except JobCancelled:
+        logger.info("Split cancelled by the user")
+        record_cancel()
+        admin_outcome = ("cancelled", "")
+        if status_message is not None:
+            with contextlib.suppress(Exception):
+                await status_message.edit_text(MSG_SPLIT_CANCELLED)
+
+    except MergeRefused as problem:
+        record_failure(user)
+        admin_outcome = ("failed", "")
+        await context.bot.send_message(chat_id=chat_id, text=str(problem))
+
+    except Exception as error:
+        logger.exception("Error splitting the video:")
+        record_failure(user)
+        admin_outcome = ("failed", "")
+        await context.bot.send_message(chat_id=chat_id, text=MSG_SPLIT_FAILED.format(error=error))
+
+    finally:
+        await admin_watch.finish(admin_outcome)
+        active_job_progress.pop(job_token, None)
+
+        for part, _start, _end in parts:   # whatever a failed / cancelled run left behind
+            (work_dir / f"split_{part}.mp4").unlink(missing_ok=True)
+            (work_dir / f"split_{part}.jpg").unlink(missing_ok=True)
+
+        if work_slot_held:
+            release_work_slot()
+
+        active_job_ids.discard(message_id)
+
+        if pending_compressions.get(message_id) is pending:
+            pending["last_active"] = time.time()   # the original's idle timer restarts
+
+        await maybe_notify_update_ready(context.bot)
+
+
+# ============================================================
+# Video / document handlers
+# ============================================================
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+
+    if message is None or message.video is None:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await reject_unauthorized(message, user_id)
+        return
+
+    video = message.video
+
+    await handle_incoming(
+        update, context,
+        file_id=video.file_id,
+        original_size=video.file_size,
+        filename=f"video_{message.message_id}.mp4",
+    )
+
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+
+    if message is None or (message.audio is None and message.voice is None):
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await reject_unauthorized(message, user_id)
+        return
+
+    audio = message.audio or message.voice
+    filename = getattr(audio, "file_name", None) or f"audio_{message.message_id}.m4a"
+
+    await handle_incoming(
+        update, context,
+        file_id=audio.file_id,
+        original_size=audio.file_size,
+        filename=filename,
+        media_type="audio",
+    )
+
+
+async def show_audio_meta_panel(context, chat_id: int, message_id: int, resend: bool = False) -> None:
+    """
+    Show (or refresh) the rename / album / cover panel for an audio file.
+    resend=True sends it as a NEW message at the bottom of the chat (and removes the old panel),
+    so after setting something the buttons are right under the confirmation.
+    """
+    pending = pending_compressions.get(message_id)
+
+    if pending is None:
+        return
+
+    text = audio_meta_text(pending)
+    markup = audio_meta_keyboard(message_id)
+    panel_id = pending.get("meta_panel_id")
+
+    if panel_id and not resend:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=panel_id, text=text, reply_markup=markup
+            )
+            return
+        except BadRequest as error:
+            if "not modified" in str(error).lower():
+                return
+        except Exception:
+            pass
+
+    sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+    pending["meta_panel_id"] = sent.message_id
+
+    if resend and panel_id:
+        with contextlib.suppress(Exception):
+            await context.bot.delete_message(chat_id=chat_id, message_id=panel_id)
+
+
+async def resend_level_menu(
+    context, chat_id: int, message_id: int, header: str = "", extra_row: list | None = None
+) -> bool:
+    """Send the video's level menu again as a new message at the bottom. False if it isn't available any more."""
+    pending = pending_compressions.get(message_id)
+    menu_text = pending.get("menu_text") if pending else None
+
+    if not menu_text:
+        return False
+
+    args = (
+        message_id,
+        pending.get("estimates", {}),
+        pending.get("default_level"),
+        pending.get("smart"),
+        pending.get("original_size"),
+    )
+
+    for styled in (True, False):
+        markup = estimate_keyboard(*args, styled=styled)
+
+        if extra_row:
+            markup = InlineKeyboardMarkup([*markup.inline_keyboard, extra_row])
+
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=header + menu_text, reply_markup=markup)
+            return True
+        except BadRequest:
+            if not styled:
+                raise
+
+    return False
+
+
+async def apply_cover_image(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
+    """An image arrived while we were waiting for a cover — process and attach it."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    waiting = awaiting_input.get(chat_id)
+
+    if waiting is None or waiting["field"] not in ("cover", "videocover"):
+        return
+
+    target_message_id = waiting["mid"]
+    pending = pending_compressions.get(target_message_id)
+
+    if pending is None:
+        awaiting_input.pop(chat_id, None)
+        await message.reply_text(MSG_THAT_FILE_ISN_T_IN)
+        return
+
+    work_dir = pending["work_dir"]
+    source_path = work_dir / f"cover_src_{message.message_id}"
+    cover_path = work_dir / "cover.jpg"
+    thumb_path = work_dir / "cover_thumb.jpg"
+
+    status_message = await message.reply_text(MSG_PROCESSING_THE_IMAGE)
+
+    try:
+        telegram_file = await with_retries(context.bot.get_file, file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(source_path))
+        delete_server_copy(telegram_file)
+
+        full_ok = await prepare_cover_image(str(source_path), str(cover_path), 1000, "3")
+        thumb_ok = full_ok and await prepare_cover_image(str(source_path), str(thumb_path), 320, "5")
+    except Exception as error:
+        logger.exception("Error preparing cover image:")
+        await status_message.edit_text(MSG_COULDN_T_DOWNLOAD_THAT_IMAGE.format(error=error))
+        return
+    finally:
+        source_path.unlink(missing_ok=True)
+
+    if not full_ok or not thumb_ok:
+        await status_message.edit_text(
+            MSG_I_COULDN_T_READ_THAT
+        )
+        return
+
+    pending["cover_path"] = cover_path
+    pending["cover_thumb_path"] = thumb_path
+    awaiting_input.pop(chat_id, None)
+
+    if waiting["field"] == "cover":
+        await status_message.edit_text(MSG_ALBUM_COVER_SET)
+        await show_audio_meta_panel(context, chat_id, target_message_id, resend=True)
+    else:
+        # Video cover: confirm, then bring the level menu back as a new message, so the buttons are right here.
+        menu_shown = await resend_level_menu(
+            context, chat_id, target_message_id,
+            header="✅ Video cover set — it will be used on the result.\n\n",
+            extra_row=[InlineKeyboardButton(
+                BTN_UPLOAD_VIDEO_UNCHANGED, callback_data=f"coveronly:_:{target_message_id}"
+            )],
+        )
+
+        if menu_shown:
+            await status_message.edit_text(MSG_VIDEO_COVER_SET)
+        else:
+            await status_message.edit_text(
+                MSG_VIDEO_COVER_SET_NOW_PICK,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        BTN_UPLOAD_VIDEO_UNCHANGED,
+                        callback_data=f"coveronly:_:{target_message_id}",
+                    )
+                ]]),
+            )
+
+
+SLIDE_NUMBERS_RE = re.compile(r"^[\d\s,;\-\u2013]+$")
+
+
+def parse_slide_numbers(text: str) -> list[int] | None:
+    """
+    "2 5 11 16" / "2,5,11" / "3-6 9" -> sorted unique page numbers.
+    Returns None if the text isn't purely numbers/ranges (so ordinary
+    chat text is ignored).
+    """
+    text = text.strip()
+    if not text or not SLIDE_NUMBERS_RE.match(text):
+        return None
+
+    numbers: set[int] = set()
+    for token in re.split(r"[\s,;]+", text):
+        if not token:
+            continue
+        match = re.fullmatch(r"(\d+)[\-\u2013](\d+)", token)
+        if match:
+            start, end = int(match.group(1)), int(match.group(2))
+            if start > end or end - start > 5000:
+                return None
+            numbers.update(range(start, end + 1))
+        elif token.isdigit():
+            numbers.add(int(token))
+        else:
+            return None
+
+    return sorted(numbers) if numbers else None
+
+
+async def delete_pdf_slides(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, message_id: int, numbers: list[int]
+) -> None:
+    """Remove the given 1-based pages from the open PDF session and send the rebuilt PDF."""
+    message = update.effective_message
+    pending = pending_compressions.get(message_id)
+
+    if pending is None or not pending.get("frames_dir"):
+        await message.reply_text(MSG_NO_EXTRACTED_FRAMES_TO_COMPARE)
+        return
+
+    frame_paths = sorted(Path(pending["frames_dir"]).glob("frame_*.jpg"))
+    total = len(frame_paths)
+
+    bad = [n for n in numbers if n < 1 or n > total]
+    if bad:
+        await message.reply_text(
+            MSG_DELETE_SLIDES_OUT_OF_RANGE.format(total=total, bad=" ".join(map(str, bad)))
+        )
+        return
+
+    if len(numbers) >= total:
+        await message.reply_text(MSG_DELETE_SLIDES_WOULD_EMPTY)
+        return
+
+    status = await message.reply_text(MSG_DELETE_SLIDES_WORKING.format(count=len(numbers)))
+
+    try:
+        doomed = {frame_paths[n - 1] for n in numbers}
+        kept_paths = [path for path in frame_paths if path not in doomed]
+
+        for path in doomed:
+            path.unlink(missing_ok=True)
+
+        pdf_path = Path(pending["work_dir"]) / "frames.pdf"
+        pdf_bytes = await asyncio.to_thread(img2pdf.convert, [str(path) for path in kept_paths])
+        pdf_path.write_bytes(pdf_bytes)
+
+        with named_for_upload(pdf_path, "frames_edited.pdf") as send_path:
+            await with_retries(
+                context.bot.send_document,
+                chat_id=pending["chat_id"],
+                document=str(send_path),
+                filename="frames_edited.pdf",
+                caption=MSG_DELETE_SLIDES_DONE.format(
+                    deleted=" ".join(map(str, numbers)), remaining=len(kept_paths)
+                ),
+                reply_markup=post_pdf_keyboard(message_id, dedup_available=len(kept_paths) > 1),
+            )
+        with contextlib.suppress(Exception):
+            await status.delete()
+
+    except Exception as error:
+        logger.exception("Error deleting slides:")
+        await status.edit_text(MSG_DELETE_SLIDES_FAILED.format(error=error))
+
+
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Plain text: only meaningful while we're waiting for a name / album."""
+    message = update.effective_message
+
+    if message is None or not message.text:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        return
+
+    chat_id = message.chat_id
+    waiting = awaiting_input.get(chat_id)
+
+    if waiting is None:
+        # No name/album prompt pending: if a PDF session is open, numbers
+        # like "2 5 11 16" mean "delete these pages from the PDF".
+        session_mid = open_pdf_sessions.get(chat_id)
+        if session_mid is not None:
+            numbers = parse_slide_numbers(message.text)
+            if numbers:
+                await delete_pdf_slides(update, context, session_mid, numbers)
+        return
+
+    if waiting["field"] in ("pdfname", "pdfthumb"):
+        await handle_pdf_text(update, context, waiting)
+        return
+
+    pending = pending_compressions.get(waiting["mid"])
+
+    if pending is None:
+        awaiting_input.pop(chat_id, None)
+        await message.reply_text(MSG_THAT_FILE_ISN_T_IN)
+        return
+
+    field = waiting["field"]
+    text = message.text.strip()
+
+    if field == "splittime":
+        await handle_split_time(update, context, waiting["mid"], pending, text)
+        return
+
+    if field == "name":
+        cleaned = sanitize_filename(text)
+
+        if not cleaned:
+            await message.reply_text(MSG_THAT_NAME_HAS_NO_USABLE)
+            return
+
+        pending["out_name"] = cleaned
+    elif field == "album":
+        if text == "-":
+            pending.pop("album", None)
+        else:
+            pending["album"] = text[:200]
+    elif field == "artist":
+        if text == "-":
+            pending.pop("artist", None)
+        else:
+            pending["artist"] = text[:200]
+    else:
+        await message.reply_text(MSG_I_M_WAITING_FOR_AN)
+        return
+
+    awaiting_input.pop(chat_id, None)
+    await show_audio_meta_panel(context, chat_id, waiting["mid"], resend=True)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A photo: used as a cover only while we're waiting for one."""
+    message = update.effective_message
+
+    if message is None or not message.photo:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        return
+
+    if await maybe_handle_payment_proof(update, context, message.photo[-1].file_id, "photo"):
+        return
+
+    waiting = awaiting_input.get(message.chat_id)
+
+    if waiting is None:
+        return
+
+    if waiting["field"] == "pdfthumb":
+        await apply_pdf_thumbnail(update, context, message.photo[-1].file_id)
+        return
+
+    if waiting["field"] not in ("cover", "videocover"):
+        await message.reply_text(MSG_I_M_WAITING_FOR_TEXT)
+        return
+
+    await apply_cover_image(update, context, message.photo[-1].file_id)
+
+
+# ============================================================
+# PDF files: merge / compress / rename + thumbnail
+# ============================================================
+#
+# Send the bot a PDF and it shows a small menu. Every PDF the chat sends while
+# that menu is open is added to the same list (kept in the order it was sent).
+# Nothing is downloaded until a button that needs the files is tapped, so an
+# open menu costs no disk space.
+#
+# Needs two programs inside the container (see the Dockerfile line):
+#   qpdf        -> merging (fast, lossless, very light on RAM)
+#   ghostscript -> compressing (the program is called "gs")
+
+PDF_IDLE_MINUTES = int(os.getenv("PDF_IDLE_MINUTES", "15"))
+PDF_JOB_TIMEOUT = int(os.getenv("PDF_JOB_TIMEOUT", "900"))   # seconds per merge / per compressed file
+PDF_MAX_LISTED = 15
+
+# key -> (button label, ghostscript preset, short description)
+PDF_COMPRESS_LEVELS: dict[str, tuple[str, str, str]] = {
+    "light": ("🟢 Light", "/printer", "best quality, a little smaller"),
+    "balanced": ("🟡 Balanced", "/ebook", "good quality, much smaller"),
+    "strong": ("🔴 Strong", "/screen", "smallest file, images get soft"),
+}
+
+# ---- "Delete duplicate pages" ----
+# Pages are rendered to small pictures (ghostscript), compared the same way as the
+# video frames (pixels + OCR words), and the PDF is rebuilt with only the kept pages
+# (qpdf — lossless: text, links and quality are untouched).
+PDF_DEDUP_MAX_PAGES = int(os.getenv("PDF_DEDUP_MAX_PAGES", "500"))
+PDF_DEDUP_DPI = int(os.getenv("PDF_DEDUP_DPI", "150"))
+# The bottom strip of every page is ignored when comparing, so a changing page
+# number / footer doesn't make two identical pages look different. 0 = compare everything.
+PDF_DEDUP_IGNORE_FOOTER_PERCENT = float(os.getenv("PDF_DEDUP_IGNORE_FOOTER_PERCENT", "6"))
+PDFX_NEED_DEDUP_TOOLS = "Deleting duplicates isn't set up on this server yet (ghostscript and qpdf are both needed)."
+PDFX_DEDUP_NONE = "ℹ️ {name}: no duplicate pages found — nothing was changed. It's still in your list."
+PDFX_DEDUP_NO_OCR_NOTE = "\n⚠️ Text reading (OCR) isn't installed on this server, so pages were compared by how they look only."
+
+PDFX_EXPIRED = "⚠️ That PDF list isn't active anymore — please send the PDF(s) again."
+PDFX_BUSY = "⏳ I'm still working on your PDFs — one moment."
+PDFX_NOT_YOURS = "⛔ That list belongs to someone else."
+PDFX_NEED_TWO = "Send at least one more PDF first — every PDF you send gets added to the list, in order."
+PDFX_NEED_QPDF = "Merging isn't set up on this server yet (qpdf is missing)."
+PDFX_NEED_GS = "Compressing isn't set up on this server yet (ghostscript is missing)."
+PDFX_CANCELLED = "❌ Cancelled — the list was cleared."
+PDFX_CANCELLED_REFUNDED = "❌ Cancelled — the list was cleared and {size} was given back to your daily limit."
+PDFX_IDLE = "🧹 I cleared your PDF list because nothing happened for {minutes} minutes."
+PDFX_IDLE_REFUNDED = "🧹 I cleared your PDF list after {minutes} minutes of nothing happening, and gave {size} back to your daily limit."
+PDFX_ASK_NAME = "✏️ Send me the new file name (just the name, no .pdf needed).\nSend - to go back to the original name."
+PDFX_ASK_THUMB = "🖼 Send me the picture to use as the file's thumbnail (as a photo or as an image file)."
+PDFX_NAME_HAS_NO_USABLE = "⚠️ That name has no usable characters — please send a different one."
+PDFX_SEND_AN_IMAGE = "I'm waiting for an image — send a photo, or tap Back."
+PDFX_THUMB_FAILED = "⚠️ I couldn't read that image. Please send a normal JPG/PNG picture."
+
+pdf_file_sessions: dict[int, dict] = {}   # chat_id -> the open PDF list
+
+
+@contextlib.contextmanager
+def named_for_upload(path, filename: str | None):
+    """
+    The bot talks to a LOCAL Bot API server, which uploads a file by its path on disk and
+    ignores the `filename=` argument — so the name people see is whatever the temp file is
+    called (in_1.pdf, out_1.pdf, frames.pdf...). This gives the file its intended name just
+    for the upload: a hard link (free, no extra disk) in a throw-away folder, removed after.
+    Use:  with named_for_upload(path, "My name.pdf") as send_path: ... document=str(send_path)
+    """
+    path = Path(path)
+    name = (filename or path.name).replace("/", "-").replace("\\", "-").strip() or path.name
+
+    if len(name) > 150:   # keep well under the 255-byte file-name limit, extension intact
+        suffix = Path(name).suffix[:15]
+        name = name[: 150 - len(suffix)] + suffix
+
+    folder = Path(tempfile.mkdtemp(prefix="send_", dir=path.parent))
+    target = folder / name
+
+    try:
+        try:
+            os.link(path, target)
+        except OSError:
+            shutil.copy2(path, target)   # different filesystem / links not allowed
+        yield target
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def is_pdf_document(document) -> bool:
+    mime = (document.mime_type or "").lower()
+    name = (document.file_name or "").lower()
+    return mime == "application/pdf" or name.endswith(".pdf")
+
+
+def pdf_session_dir(session: dict) -> Path:
+    """The folder this list's files live in (created the first time it's needed)."""
+    folder = session.get("dir")
+    if folder is None or not Path(folder).is_dir():
+        Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+        folder = Path(tempfile.mkdtemp(prefix=f"pdf_{session['sid']}_", dir=TEMP_DIR))
+        session["dir"] = folder
+    return Path(folder)
+
+
+def pdf_forget_session(chat_id: int, session: dict) -> None:
+    """Delete everything this list stored and drop it (nothing else is touched)."""
+    if session.get("dir"):
+        cleanup_work_dir(Path(session["dir"]))
+
+    if pdf_file_sessions.get(chat_id) is session:
+        pdf_file_sessions.pop(chat_id, None)
+
+    waiting = awaiting_input.get(chat_id)
+    if waiting and waiting.get("field") in ("pdfname", "pdfthumb") and waiting.get("mid") == session["sid"]:
+        awaiting_input.pop(chat_id, None)
+
+
+def pdf_refund_all(session: dict) -> str:
+    """Give back the daily-limit bytes charged for the files still in the list."""
+    total = sum(int(f.get("charged") or 0) for f in session["files"])
+    if total > 0 and quota_applies(session["user_id"]):
+        quota_refund(session["user_id"], total)
+        return format_size(total)
+    return ""
+
+
+def pdf_list_text(session: dict) -> str:
+    files = sorted(session["files"], key=lambda f: f["mid"])
+    lines = []
+
+    for number, entry in enumerate(files[:PDF_MAX_LISTED], 1):
+        lines.append(f"{number}. {entry['name']} — {format_size(entry['size'])}")
+
+    if len(files) > PDF_MAX_LISTED:
+        lines.append(f"… and {len(files) - PDF_MAX_LISTED} more")
+
+    total = sum(int(entry["size"] or 0) for entry in files)
+    lines.append(f"Total: {format_size(total)}")
+    return "\n".join(lines)
+
+
+def pdf_meta_text(session: dict) -> str:
+    name = session.get("out_name")
+    thumb = session.get("thumb_path")
+    return (
+        f"Name: {name + '.pdf' if name else '— (keeps the original)'}\n"
+        f"Thumbnail: {'✅ set' if thumb else '—'}"
+    )
+
+
+def pdf_screen(session: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """The text + buttons for whichever screen this list is currently on."""
+    sid = session["sid"]
+    mode = session.get("mode", "menu")
+    count = len(session["files"])
+    plural = "file" if count == 1 else "files"
+
+    if mode == "merge":
+        text = (
+            f"🔗 Merge mode — send the other PDFs now.\n"
+            f"They are merged in the order you sent them.\n\n"
+            f"{pdf_list_text(session)}"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Start merging ({count} {plural})", callback_data=f"pdfx:gomerge:{sid}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"pdfx:menu:{sid}")],
+        ])
+        return text, keyboard
+
+    if mode == "compress":
+        lines = [f"🗜 How strongly should I compress {'it' if count == 1 else 'each of them'}?", ""]
+        for label, _preset, detail in PDF_COMPRESS_LEVELS.values():
+            lines.append(f"{label} — {detail}")
+        text = "\n".join(lines) + "\n\n" + pdf_list_text(session)
+        rows = [
+            [InlineKeyboardButton(label, callback_data=f"pdfx:c_{key}:{sid}")]
+            for key, (label, _preset, _detail) in PDF_COMPRESS_LEVELS.items()
+        ]
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"pdfx:menu:{sid}")])
+        return text, InlineKeyboardMarkup(rows)
+
+    if mode == "name":
+        text = (
+            "✏️ Name & thumbnail — used for the file I send back "
+            "(merged, compressed, or sent as is).\n\n"
+            f"{pdf_meta_text(session)}"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Set name", callback_data=f"pdfx:setname:{sid}")],
+            [InlineKeyboardButton("🖼 Set thumbnail", callback_data=f"pdfx:setthumb:{sid}")],
+            [InlineKeyboardButton("🧹 Clear name & thumbnail", callback_data=f"pdfx:clearmeta:{sid}")],
+            [InlineKeyboardButton("📤 Send now (no compression)", callback_data=f"pdfx:sendnow:{sid}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"pdfx:menu:{sid}")],
+        ])
+        return text, keyboard
+
+    if mode in ("askname", "askthumb"):
+        text = PDFX_ASK_NAME if mode == "askname" else PDFX_ASK_THUMB
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"pdfx:name:{sid}")],
+        ])
+        return text, keyboard
+
+    text = (
+        f"📄 {count} PDF {plural}\n\n{pdf_list_text(session)}\n\n"
+        "Send more PDFs to add them — they stay in the order you sent them."
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Merge files", callback_data=f"pdfx:merge:{sid}")],
+        [InlineKeyboardButton("🗜 Compress", callback_data=f"pdfx:compress:{sid}")],
+        [InlineKeyboardButton("🧹 Delete duplicate pages", callback_data=f"pdfx:dedup:{sid}")],
+        [InlineKeyboardButton("✏️ Change name / thumbnail", callback_data=f"pdfx:name:{sid}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"pdfx:cancel:{sid}")],
+    ])
+    return text, keyboard
+
+
+async def pdf_edit(bot, chat_id: int, session: dict, text: str, keyboard=None, fresh: bool = False) -> None:
+    """
+    Show text on this list's one menu message (edit it, or send it the first time).
+    fresh=True sends it as a NEW message at the bottom instead (and removes the old one).
+    """
+    async with session["lock"]:
+        menu_mid = session.get("menu_mid")
+
+        if menu_mid is not None and not fresh:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=menu_mid, text=text, reply_markup=keyboard
+                )
+                return
+            except Exception as error:
+                if "not modified" in str(error).lower():
+                    return
+                # The message is gone or can't be edited: fall through and send a fresh one.
+
+        sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+        session["menu_mid"] = sent.message_id
+
+        if fresh and menu_mid is not None:
+            with contextlib.suppress(Exception):
+                await bot.delete_message(chat_id=chat_id, message_id=menu_mid)
+
+
+async def pdf_render(bot, chat_id: int, session: dict, mode: str | None = None, fresh: bool = False) -> None:
+    if mode:
+        session["mode"] = mode
+
+    text, keyboard = pdf_screen(session)
+    await pdf_edit(bot, chat_id, session, text, keyboard, fresh=fresh)
+
+
+async def handle_pdf_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE, document) -> None:
+    """A PDF arrived: add it to this chat's list (starting one if needed) and show the menu."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if chat_id in merge_sessions:
+        await message.reply_text(merge_busy_text(chat_id))
+        return
+
+    if update_mode["on"] and not is_admin(user_id):
+        await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
+    session = pdf_file_sessions.get(chat_id)
+
+    if session is not None and session.get("running"):
+        await message.reply_text(PDFX_BUSY)
+        return
+
+    size = int(document.file_size or 0)
+
+    if file_too_large(user_id, size):
+        await message.reply_text(file_too_large_text(user_id, size))
+        return
+
+    if not quota_allows(user_id, size):
+        await message.reply_text(quota_refusal_text(user_id, size))
+        return
+
+    quota_consume(user_id, size)
+
+    # (No await between the lookup above and the append below, so two PDFs that
+    # arrive together can't start two separate lists.)
+    session = pdf_file_sessions.get(chat_id)
+    if session is None:
+        session = {
+            "sid": message.message_id,
+            "user_id": user_id,
+            "files": [],
+            "mode": "menu",
+            "menu_mid": None,
+            "lock": asyncio.Lock(),
+            "last_active": time.time(),
+        }
+        pdf_file_sessions[chat_id] = session
+
+    session["files"].append({
+        "file_id": document.file_id,
+        "name": document.file_name or f"file_{message.message_id}.pdf",
+        "size": size,
+        "charged": size,
+        "mid": message.message_id,
+    })
+    session["last_active"] = time.time()
+
+    if session.get("mode") in ("askname", "askthumb"):
+        session["mode"] = "menu"
+        awaiting_input.pop(chat_id, None)
+
+    await pdf_render(context.bot, chat_id, session)
+
+
+async def run_tool(command: list[str], timeout: float) -> tuple[int, str]:
+    """Run an external program (low priority, with a time limit). Returns (exit code, stderr)."""
+    if FFMPEG_NICE > 0 and shutil.which("nice"):
+        command = ["nice", "-n", str(FFMPEG_NICE), *command]
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        _stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await process.wait()
+        raise RuntimeError("it took too long and was stopped")
+
+    return process.returncode, stderr.decode(errors="replace")
+
+
+def pdf_short_error(stderr: str) -> str:
+    lowered = stderr.lower()
+    if "password" in lowered or "encrypt" in lowered:
+        return "the PDF is password-protected"
+    lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
+    return (lines[-1][:200] if lines else "unknown error")
+
+
+def pdf_output_name(session: dict, entry: dict | None, suffix: str, index: int, total: int) -> str:
+    """The file name to send: the chosen name (numbered if several), else the original."""
+    chosen = session.get("out_name")
+
+    if chosen:
+        base = f"{chosen} {index}" if total > 1 else chosen
+    elif entry is not None:
+        base = Path(entry["name"]).stem + suffix
+    else:
+        base = "merged"
+
+    return (sanitize_filename(base) or "file") + ".pdf"
+
+
+def pdf_page_ranges(numbers: list[int]) -> str:
+    """[1, 2, 3, 5, 8, 9] -> '1-3,5,8-9' (the page syntax qpdf understands)."""
+    ranges: list[str] = []
+    start = previous = numbers[0]
+
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append(f"{start}-{previous}" if previous > start else str(start))
+        start = previous = number
+
+    ranges.append(f"{start}-{previous}" if previous > start else str(start))
+    return ",".join(ranges)
+
+
+async def dedup_pdf_pages(
+    source: Path,
+    output: Path,
+    work_dir: Path,
+    progress_callback=None,
+) -> tuple[int, int]:
+    """
+    Remove pages that repeat the previous kept page (same look AND same words).
+    Writes `output` only when something was removed. Returns (total_pages, removed_pages).
+    Raises RuntimeError with a short, user-readable reason.
+    """
+    pages_dir = work_dir / "pages"
+    compare_dir = work_dir / "compare"
+
+    try:
+        for folder in (pages_dir, compare_dir):
+            shutil.rmtree(folder, ignore_errors=True)
+        pages_dir.mkdir(parents=True)
+
+        returncode, stderr = await run_tool(
+            [
+                "gs", "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dSAFER",
+                "-sDEVICE=jpeg", "-dJPEGQ=85", f"-r{PDF_DEDUP_DPI}",
+                "-dTextAlphaBits=4", "-dGraphicsAlphaBits=4",
+                f"-dLastPage={PDF_DEDUP_MAX_PAGES + 1}",
+                f"-sOutputFile={pages_dir}/page_%04d.jpg", str(source),
+            ],
+            PDF_JOB_TIMEOUT,
+        )
+        pages = sorted(pages_dir.glob("page_*.jpg"))
+
+        if returncode != 0 or not pages:
+            raise RuntimeError(f"couldn't read the pages ({pdf_short_error(stderr)})")
+
+        if len(pages) > PDF_DEDUP_MAX_PAGES:
+            raise RuntimeError(f"it has more than {PDF_DEDUP_MAX_PAGES} pages, which is too many to compare")
+
+        total = len(pages)
+        if total < 2:
+            return total, 0
+
+        # Compare everything except the footer strip (page numbers change on every page).
+        compare_paths = pages
+        if PDF_DEDUP_IGNORE_FOOTER_PERCENT > 0:
+            keep = max(0.5, 1 - PDF_DEDUP_IGNORE_FOOTER_PERCENT / 100)
+            compare_dir.mkdir(parents=True)
+            returncode, _stderr = await run_tool(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-start_number", "1", "-i", f"{pages_dir}/page_%04d.jpg",
+                    "-vf", f"crop=iw:trunc(ih*{keep:.3f}/2)*2:0:0",
+                    "-q:v", "3", "-start_number", "1", f"{compare_dir}/page_%04d.jpg",
+                ],
+                PDF_JOB_TIMEOUT,
+            )
+            cropped = sorted(compare_dir.glob("page_*.jpg"))
+            if returncode == 0 and len(cropped) == total:
+                compare_paths = cropped
+
+        # ocr_merge=False: in a document, "same words but the picture changed" is a
+        # different page (a new diagram under the same caption), so only exact
+        # look-alikes are ever removed.
+        kept, removed, _threshold = await dedup_frames(
+            compare_paths, progress_callback=progress_callback, ocr_merge=False
+        )
+
+        if not removed:
+            return total, 0
+
+        numbers = sorted(int(path.stem.split("_")[1]) for path in kept)
+        returncode, stderr = await run_tool(
+            ["qpdf", str(source), "--pages", ".", pdf_page_ranges(numbers), "--", str(output)],
+            PDF_JOB_TIMEOUT,
+        )
+
+        # qpdf exits with 3 when it finished but had warnings: the output is fine.
+        if returncode not in (0, 3) or not output.exists():
+            raise RuntimeError(f"couldn't rebuild the PDF ({pdf_short_error(stderr)})")
+
+        return total, len(removed)
+    finally:
+        for folder in (pages_dir, compare_dir):
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+async def pdf_download(context, entry: dict, path: Path) -> None:
+    telegram_file = await with_retries(context.bot.get_file, entry["file_id"])
+    await with_retries(telegram_file.download_to_drive, custom_path=str(path))
+    delete_server_copy(telegram_file)
+
+
+async def pdf_send(context, chat_id: int, session: dict, path: Path, filename: str, caption: str) -> None:
+    thumb = session.get("thumb_path")
+    with named_for_upload(path, filename) as send_path:
+        await with_retries(
+            context.bot.send_document,
+            chat_id=chat_id,
+            document=str(send_path),
+            filename=filename,
+            caption=caption,
+            thumbnail=str(thumb) if thumb and Path(thumb).exists() else None,
+        )
+
+
+async def run_pdf_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    session: dict,
+    action: str,
+    level: str | None = None,
+) -> None:
+    """action: 'merge' | 'compress' | 'dedup' | 'send'. Runs in the shared work slot, one file at a time."""
+    bot = context.bot
+    owner_id = session["user_id"]
+    session["running"] = True
+    slot_held = False
+    failed: list[dict] = []
+    unchanged: list[dict] = []   # (dedup) nothing to remove: stays in the list, keeps its charge
+    succeeded: list[dict] = []
+    problem = ""
+
+    async def status(text: str) -> None:
+        await pdf_edit(bot, chat_id, session, text, None)
+
+    try:
+        await acquire_work_slot(status, user_priority(owner_id), user_plan_label(owner_id))
+        slot_held = True
+
+        work_dir = pdf_session_dir(session)
+        files = sorted(session["files"], key=lambda f: f["mid"])
+        total = len(files)
+
+        if action == "merge":
+            if not shutil.which("qpdf"):
+                raise RuntimeError(PDFX_NEED_QPDF)
+
+            paths = []
+            for number, entry in enumerate(files, 1):
+                await status(f"⬇️ Downloading {number}/{total}…")
+                path = work_dir / f"in_{number}.pdf"
+                await pdf_download(context, entry, path)
+                paths.append(path)
+
+            await status(f"🔗 Merging {total} PDFs…")
+            output = work_dir / "merged.pdf"
+            returncode, stderr = await run_tool(
+                ["qpdf", "--empty", "--pages", *[str(p) for p in paths], "--", str(output)],
+                PDF_JOB_TIMEOUT,
+            )
+
+            # qpdf exits with 3 when it finished but had warnings: the output is fine.
+            if returncode not in (0, 3) or not output.exists():
+                raise RuntimeError(f"couldn't merge ({pdf_short_error(stderr)})")
+
+            for path in paths:
+                path.unlink(missing_ok=True)
+
+            await status("⬆️ Sending…")
+            await pdf_send(
+                context, chat_id, session, output,
+                pdf_output_name(session, None, "", 1, 1),
+                f"🔗 Merged {total} PDFs · {format_size(output.stat().st_size)}",
+            )
+            output.unlink(missing_ok=True)
+            succeeded = files
+
+        else:
+            if action == "compress" and not shutil.which("gs"):
+                raise RuntimeError(PDFX_NEED_GS)
+
+            if action == "dedup" and not (shutil.which("gs") and shutil.which("qpdf")):
+                raise RuntimeError(PDFX_NEED_DEDUP_TOOLS)
+
+            for number, entry in enumerate(files, 1):
+                source = work_dir / f"in_{number}.pdf"
+                output = work_dir / f"out_{number}.pdf"
+
+                try:
+                    await status(f"⬇️ Downloading {number}/{total}…")
+                    await pdf_download(context, entry, source)
+                    original_size = source.stat().st_size
+
+                    if action == "dedup":
+                        last_update = {"time": 0.0, "percent": -10.0}
+                        scan_label = f"🧹 Comparing the pages of {number}/{total}…"
+
+                        async def page_progress(percent: float) -> None:
+                            now = time.monotonic()
+                            if (
+                                percent - last_update["percent"] < 4
+                                and now - last_update["time"] < 3
+                                and percent < 100
+                            ):
+                                return
+                            last_update["time"], last_update["percent"] = now, percent
+                            with contextlib.suppress(Exception):
+                                await status(f"{scan_label}\n{render_progress_bar(percent)}")
+
+                        await status(f"📖 Reading the pages of {number}/{total}…")
+                        page_count, removed_count = await dedup_pdf_pages(
+                            source, output, work_dir, progress_callback=page_progress
+                        )
+
+                        if removed_count == 0:
+                            unchanged.append(entry)
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=PDFX_DEDUP_NONE.format(name=entry["name"]),
+                            )
+                            continue
+
+                        new_size = output.stat().st_size
+                        caption = (
+                            f"🧹 Removed {removed_count} duplicate page{'s' if removed_count != 1 else ''} — "
+                            f"{page_count - removed_count} of {page_count} pages left · "
+                            f"{format_size(original_size)} → {format_size(new_size)}"
+                        )
+                        if not (OCR_ENABLED and shutil.which("tesseract")):
+                            caption += PDFX_DEDUP_NO_OCR_NOTE
+                        send_path = output
+                        filename = pdf_output_name(session, entry, " (no duplicates)", number, total)
+                    elif action == "compress":
+                        label, preset, _detail = PDF_COMPRESS_LEVELS[level]
+                        await status(f"🗜 Compressing {number}/{total} ({label.split(' ', 1)[1]})… this can take a minute")
+                        returncode, stderr = await run_tool(
+                            [
+                                "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.5",
+                                f"-dPDFSETTINGS={preset}",
+                                "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dSAFER",
+                                f"-sOutputFile={output}", str(source),
+                            ],
+                            PDF_JOB_TIMEOUT,
+                        )
+
+                        if returncode != 0 or not output.exists():
+                            raise RuntimeError(f"couldn't compress ({pdf_short_error(stderr)})")
+
+                        new_size = output.stat().st_size
+
+                        if new_size >= original_size:
+                            # Never hand back a bigger file.
+                            send_path = source
+                            caption = f"ℹ️ This PDF is already well optimized — I couldn't make it smaller ({format_size(original_size)})."
+                        else:
+                            send_path = output
+                            saved = (1 - new_size / original_size) * 100
+                            caption = f"🗜 {format_size(original_size)} → {format_size(new_size)} (−{saved:.0f}%)"
+
+                        filename = pdf_output_name(session, entry, " (compressed)", number, total)
+                    else:
+                        send_path = source
+                        caption = f"📄 {format_size(original_size)}"
+                        filename = pdf_output_name(session, entry, "", number, total)
+
+                    await status(f"⬆️ Sending {number}/{total}…")
+                    await pdf_send(context, chat_id, session, send_path, filename, caption)
+                    succeeded.append(entry)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.exception("PDF job failed for %s", entry.get("name"))
+                    failed.append(entry)
+                    problem = str(error)
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ {entry['name']}: {error}",
+                    )
+                finally:
+                    # Free the space before the next file starts.
+                    source.unlink(missing_ok=True)
+                    output.unlink(missing_ok=True)
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.exception("PDF job failed")
+        failed = list(session["files"])
+        unchanged = []
+        succeeded = []
+        problem = str(error)
+        with contextlib.suppress(Exception):
+            await bot.send_message(chat_id=chat_id, text=f"❌ {error}")
+    finally:
+        session["running"] = False
+        if slot_held:
+            release_work_slot()
+
+    if failed or unchanged:
+        # Keep only the files that didn't work (or had nothing to remove) so they can try
+        # again; give back what was charged for the ones that failed.
+        session["files"] = failed + unchanged
+        refund = sum(int(f.get("charged") or 0) for f in failed)
+        if refund > 0 and quota_applies(owner_id):
+            quota_refund(owner_id, refund)
+        for entry in failed:
+            entry["charged"] = 0
+
+        session["last_active"] = time.time()
+        with contextlib.suppress(Exception):
+            await pdf_render(bot, chat_id, session, "menu")
+        return
+
+    pdf_forget_session(chat_id, session)
+    with contextlib.suppress(Exception):
+        await bot.send_message(chat_id=chat_id, text="✅ Done. Send another PDF whenever you like.")
+        # The old menu message is just clutter now.
+        if session.get("menu_mid") is not None:
+            await bot.delete_message(chat_id=chat_id, message_id=session["menu_mid"])
+
+
+async def handle_pdf_callback(query, context: ContextTypes.DEFAULT_TYPE, user_id: int | None) -> None:
+    """Every button of the PDF menu (callback data: pdfx:<command>:<list id>)."""
+    try:
+        _prefix, command, sid_text = query.data.split(":", 2)
+        sid = int(sid_text)
+    except ValueError:
+        await query.answer()
+        return
+
+    chat_id = query.message.chat_id if query.message else None
+    session = pdf_file_sessions.get(chat_id) if chat_id is not None else None
+
+    if session is None or session["sid"] != sid:
+        await query.answer(PDFX_EXPIRED, show_alert=True)
+        return
+
+    if session["user_id"] != user_id and not is_admin(user_id):
+        await query.answer(PDFX_NOT_YOURS, show_alert=True)
+        return
+
+    if session.get("running"):
+        await query.answer(PDFX_BUSY, show_alert=True)
+        return
+
+    session["last_active"] = time.time()
+    bot = context.bot
+
+    if command == "gomerge" and len(session["files"]) < 2:
+        await query.answer(PDFX_NEED_TWO, show_alert=True)
+        return
+
+    await query.answer()
+
+    # Leaving a "send me the name / picture" screen cancels the wait.
+    waiting = awaiting_input.get(chat_id)
+    if waiting and waiting.get("field") in ("pdfname", "pdfthumb"):
+        awaiting_input.pop(chat_id, None)
+
+    if command == "menu":
+        await pdf_render(bot, chat_id, session, "menu")
+    elif command == "merge":
+        await pdf_render(bot, chat_id, session, "merge")
+    elif command == "compress":
+        await pdf_render(bot, chat_id, session, "compress")
+    elif command == "name":
+        await pdf_render(bot, chat_id, session, "name")
+    elif command == "setname":
+        awaiting_input[chat_id] = {"mid": sid, "field": "pdfname"}
+        await pdf_render(bot, chat_id, session, "askname")
+    elif command == "setthumb":
+        awaiting_input[chat_id] = {"mid": sid, "field": "pdfthumb"}
+        await pdf_render(bot, chat_id, session, "askthumb")
+    elif command == "clearmeta":
+        session.pop("out_name", None)
+        thumb = session.pop("thumb_path", None)
+        if thumb:
+            Path(thumb).unlink(missing_ok=True)
+        await pdf_render(bot, chat_id, session, "name")
+    elif command == "gomerge":
+        await run_pdf_job(context, chat_id, session, "merge")
+    elif command == "dedup":
+        await run_pdf_job(context, chat_id, session, "dedup")
+    elif command == "sendnow":
+        await run_pdf_job(context, chat_id, session, "send")
+    elif command.startswith("c_") and command[2:] in PDF_COMPRESS_LEVELS:
+        await run_pdf_job(context, chat_id, session, "compress", command[2:])
+    elif command == "cancel":
+        refunded = pdf_refund_all(session)
+        pdf_forget_session(chat_id, session)
+        await pdf_edit_final(query, PDFX_CANCELLED_REFUNDED.format(size=refunded) if refunded else PDFX_CANCELLED)
+
+
+async def pdf_edit_final(query, text: str) -> None:
+    with contextlib.suppress(Exception):
+        await query.edit_message_text(text)
+
+
+async def handle_pdf_text(update: Update, context: ContextTypes.DEFAULT_TYPE, waiting: dict) -> None:
+    """The text message the PDF menu asked for (the new file name)."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    session = pdf_file_sessions.get(chat_id)
+
+    if session is None or session["sid"] != waiting["mid"]:
+        awaiting_input.pop(chat_id, None)
+        await message.reply_text(PDFX_EXPIRED)
+        return
+
+    if waiting["field"] != "pdfname":
+        await message.reply_text(PDFX_SEND_AN_IMAGE)
+        return
+
+    text = (message.text or "").strip()
+
+    if text == "-":
+        session.pop("out_name", None)
+    else:
+        if text.lower().endswith(".pdf"):
+            text = text[:-4]
+        cleaned = sanitize_filename(text)
+
+        if not cleaned:
+            await message.reply_text(PDFX_NAME_HAS_NO_USABLE)
+            return
+
+        session["out_name"] = cleaned
+
+    awaiting_input.pop(chat_id, None)
+    session["last_active"] = time.time()
+    await pdf_render(context.bot, chat_id, session, "name", fresh=True)
+
+
+async def apply_pdf_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
+    """The picture the PDF menu asked for: shrink it to Telegram's thumbnail limits and keep it."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    waiting = awaiting_input.get(chat_id)
+    session = pdf_file_sessions.get(chat_id)
+
+    if waiting is None or waiting.get("field") != "pdfthumb":
+        return
+
+    if session is None or session["sid"] != waiting["mid"]:
+        awaiting_input.pop(chat_id, None)
+        await message.reply_text(PDFX_EXPIRED)
+        return
+
+    work_dir = pdf_session_dir(session)
+    source = work_dir / f"thumb_src_{message.message_id}"
+    thumb = work_dir / "thumb.jpg"
+    status_message = await message.reply_text(MSG_PROCESSING_THE_IMAGE)
+
+    try:
+        telegram_file = await with_retries(context.bot.get_file, file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(source))
+        delete_server_copy(telegram_file)
+
+        # Telegram wants a JPEG up to 320px and 200 KB; retry smaller if it comes out heavy.
+        ok = await prepare_cover_image(str(source), str(thumb), 320, "5")
+        if ok and thumb.stat().st_size > 190 * 1024:
+            ok = await prepare_cover_image(str(source), str(thumb), 320, "15")
+    except Exception as error:
+        logger.exception("Error preparing PDF thumbnail:")
+        await status_message.edit_text(MSG_COULDN_T_DOWNLOAD_THAT_IMAGE.format(error=error))
+        return
+    finally:
+        source.unlink(missing_ok=True)
+
+    if not ok:
+        await status_message.edit_text(PDFX_THUMB_FAILED)
+        return
+
+    session["thumb_path"] = thumb
+    session["last_active"] = time.time()
+    awaiting_input.pop(chat_id, None)
+
+    with contextlib.suppress(Exception):
+        await status_message.delete()
+
+    await pdf_render(context.bot, chat_id, session, "name", fresh=True)
+
+
+async def expire_idle_pdf_sessions(bot) -> int:
+    """Drop PDF lists nobody has touched for PDF_IDLE_MINUTES (refunding the daily limit)."""
+    if PDF_IDLE_MINUTES <= 0:
+        return 0
+
+    now = time.time()
+    removed = 0
+
+    for chat_id, session in list(pdf_file_sessions.items()):
+        if session.get("running"):
+            continue
+
+        if now - session.get("last_active", now) < PDF_IDLE_MINUTES * 60:
+            continue
+
+        refunded = pdf_refund_all(session)
+        pdf_forget_session(chat_id, session)
+        removed += 1
+
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    PDFX_IDLE_REFUNDED.format(minutes=PDF_IDLE_MINUTES, size=refunded)
+                    if refunded
+                    else PDFX_IDLE.format(minutes=PDF_IDLE_MINUTES)
+                ),
+            )
+
+    return removed
+
+
+# ============================================================
+# RAR archives: extract and send the contents back
+# ============================================================
+#
+# Send the bot a .rar and it unpacks it and sends every file back, one by one
+# (each file is deleted from the server right after it is sent, so the space is
+# freed as it goes). If the archive has a password, send it again with the
+# password written as the caption.
+#
+# Needs the "unrar" program inside the container (see the Dockerfile line).
+# If it is missing, "7zz" / "7z" is used instead when one is installed.
+
+RAR_MAX_EXTRACT_MB = int(os.getenv("RAR_MAX_EXTRACT_MB", "1500"))   # biggest total size we will unpack
+RAR_MAX_FILES = int(os.getenv("RAR_MAX_FILES", "100"))              # most files we will send back
+RAR_MAX_SEND_MB = int(os.getenv("RAR_MAX_SEND_MB", "1990"))         # Telegram's limit for one file
+RAR_EXTRACT_TIMEOUT = int(os.getenv("RAR_EXTRACT_TIMEOUT", "900"))  # seconds
+RAR_SEND_PAUSE = float(os.getenv("RAR_SEND_PAUSE", "1.0"))          # seconds between files (Telegram rate limit)
+
+# "name.part2.rar", "name.part03.rar" ... (the first part, part1, is fine on its own only
+# if it is a single volume; the others can never be opened alone)
+RAR_LATER_PART_RE = re.compile(r"\.part0*([2-9]|[1-9]\d+)\.rar$", re.IGNORECASE)
+
+RARX_NEED_TOOL = "Opening RAR files isn't set up on this server yet (unrar is missing)."
+RARX_MULTIPART = (
+    "⚠️ That's one piece of a multi-part archive (.part2.rar and so on). "
+    "I can only open a single .rar file — please send it as one file."
+)
+RARX_EMPTY = "the archive is empty"
+RARX_TOO_BIG = "it unpacks to more than {mb} MB, which is more than this server can hold"
+RARX_NO_ROOM = "there isn't enough free space on the server to unpack it"
+RARX_TIMEOUT = "unpacking took too long and was stopped"
+
+
+def is_rar_document(document) -> bool:
+    mime = (document.mime_type or "").lower()
+    name = (document.file_name or "").lower()
+    return name.endswith(".rar") or mime in ("application/vnd.rar", "application/x-rar-compressed", "application/x-rar")
+
+
+def find_rar_tools() -> list[str]:
+    """Every installed program that can open a RAR, best first (they are tried in this order)."""
+    tools = []
+    for candidate in ("unrar", "7zz", "7z", "bsdtar"):
+        found = shutil.which(candidate)
+        if found:
+            tools.append(found)
+    return tools
+
+
+def find_rar_tool() -> str | None:
+    tools = find_rar_tools()
+    return tools[0] if tools else None
+
+
+def directory_size(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def natural_key(text: str) -> list:
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", text.lower())]
+
+
+def collect_extracted_files(dest: Path) -> list[Path]:
+    """Every real file under dest (never a link, never anything that points outside it), in natural order."""
+    root = dest.resolve()
+    found = []
+
+    for path in dest.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        found.append(path)
+
+    # Sort folder by folder (so "sub" comes before "sub2"), with numbers in natural order (2 before 10).
+    return sorted(found, key=lambda p: [natural_key(part) for part in p.relative_to(dest).parts])
+
+
+def rar_short_error(stderr: str) -> str:
+    lowered = stderr.lower()
+
+    if "password" in lowered or "encrypted" in lowered:
+        return "it's password-protected (or the password was wrong) — send it again with the password as the caption"
+    if "volume" in lowered or "next part" in lowered:
+        return "it looks like a multi-part archive, which I can't open"
+
+    lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
+    return lines[-1][:200] if lines else "unknown error"
+
+
+def rar_command(tool: str, archive: Path, dest: Path, password: str | None) -> list[str]:
+    name = Path(tool).name
+
+    if name == "unrar":
+        return [tool, "x", "-y", "-idq", "-o+", f"-p{password}" if password else "-p-", str(archive), str(dest) + "/"]
+
+    if name == "bsdtar":
+        return [tool, "-xf", str(archive), "-C", str(dest)]
+
+    command = [tool, "x", "-y", "-bd", f"-o{dest}"]
+    if password:
+        command.append(f"-p{password}")
+    command.append(str(archive))
+    return command
+
+
+async def run_rar_tool(tool: str, archive: Path, dest: Path, password: str | None, limit: int) -> tuple[int, str, bool]:
+    """Run one unpacking program. Returns (exit code, its error text, whether it hit the size limit)."""
+    command = rar_command(tool, archive, dest, password)
+
+    if FFMPEG_NICE > 0 and shutil.which("nice"):
+        command = ["nice", "-n", str(FFMPEG_NICE), *command]
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    exceeded = False
+
+    async def watch_size() -> None:
+        nonlocal exceeded
+        while True:
+            await asyncio.sleep(1)
+            if await asyncio.to_thread(directory_size, dest) > limit:
+                exceeded = True
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                return
+
+    watcher = asyncio.create_task(watch_size())
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), RAR_EXTRACT_TIMEOUT)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await process.wait()
+        raise RuntimeError(RARX_TIMEOUT)
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await watcher
+
+    # Some programs (7z) print their errors on stdout, so keep both.
+    text = (stderr.decode(errors="replace") + "\n" + stdout.decode(errors="replace")).strip()
+    return process.returncode, text, exceeded
+
+
+async def extract_rar(archive: Path, dest: Path, password: str | None) -> None:
+    """
+    Unpack archive into dest. Tries every installed unpacking program until one works
+    (some builds of 7-Zip leave RAR support out). Raises RuntimeError with a plain-language reason.
+    """
+    tools = find_rar_tools()
+    if not tools:
+        raise RuntimeError(RARX_NEED_TOOL)
+
+    # Never let a huge archive (a "zip bomb") fill the disk: stop it at the limit.
+    free = shutil.disk_usage(dest).free
+    limit = min(RAR_MAX_EXTRACT_MB * 1024 * 1024, free - 200 * 1024 * 1024)
+    if limit <= 0:
+        raise RuntimeError(RARX_NO_ROOM)
+
+    with open(archive, "rb") as handle:
+        header = handle.read(8)
+
+    has_signature = header.startswith(b"Rar!\x1a\x07")
+    logger.info("RAR header bytes: %r (tools available: %s)", header, ", ".join(Path(t).name for t in tools))
+
+    tried: list[str] = []
+    first_problem = ""
+
+    for tool in tools:
+        tool_name = Path(tool).name
+
+        # Start every attempt from an empty folder (a failed attempt may have left pieces).
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir()
+
+        returncode, output, exceeded = await run_rar_tool(tool, archive, dest, password, limit)
+
+        if exceeded:
+            raise RuntimeError(RARX_TOO_BIG.format(mb=int(limit / 1024 / 1024)))
+
+        # 0 = fine; for unrar / 7-Zip, 1 = finished with a minor warning (files are still good).
+        ok_codes = (0,) if tool_name == "bsdtar" else (0, 1)
+
+        if returncode in ok_codes:
+            return
+
+        logger.error("%s could not unpack the RAR (exit code %s):\n%s", tool_name, returncode, output)
+        tried.append(tool_name)
+
+        lowered = output.lower()
+        if "password" in lowered or "encrypted" in lowered:
+            raise RuntimeError(rar_short_error(output))
+
+        if not first_problem:
+            first_problem = rar_short_error(output)
+
+    hint = "" if has_signature else " (the file doesn't start like a RAR archive — was it renamed or cut short?)"
+    raise RuntimeError(f"none of my unpacking tools ({', '.join(tried)}) could open it: {first_problem}{hint}")
+
+
+async def handle_rar_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE, document) -> None:
+    """A .rar arrived: unpack it and send each file back."""
+    global other_jobs_running
+
+    message = update.effective_message
+    chat_id = message.chat_id
+    user_id = update.effective_user.id if update.effective_user else None
+    archive_name = document.file_name or "archive.rar"
+
+    if chat_id in merge_sessions:
+        await message.reply_text(merge_busy_text(chat_id))
+        return
+
+    if update_mode["on"] and not is_admin(user_id):
+        await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
+    if RAR_LATER_PART_RE.search(archive_name):
+        await message.reply_text(RARX_MULTIPART)
+        return
+
+    if find_rar_tool() is None:
+        await message.reply_text(RARX_NEED_TOOL)
+        return
+
+    size = int(document.file_size or 0)
+
+    if file_too_large(user_id, size):
+        await message.reply_text(file_too_large_text(user_id, size))
+        return
+
+    if not quota_allows(user_id, size):
+        await message.reply_text(quota_refusal_text(user_id, size))
+        return
+
+    quota_consume(user_id, size)
+
+    password = (message.caption or "").strip() or None
+
+    other_jobs_running += 1
+    update_mode["notified"] = False
+
+    work_dir: Path | None = None
+    slot_held = False
+    status_message = None
+    sent_count = 0
+
+    async def post_status(text: str) -> None:
+        nonlocal status_message
+        if status_message is None:
+            status_message = await message.reply_text(text)
+        else:
+            await status_message.edit_text(text)
+
+    try:
+        await acquire_work_slot(post_status, user_priority(user_id), user_plan_label(user_id))
+        slot_held = True
+
+        Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix=f"rar_{message.message_id}_", dir=TEMP_DIR))
+        archive = work_dir / "archive.rar"
+        dest = work_dir / "out"
+        dest.mkdir()
+
+        await post_status(f"⬇️ Downloading {archive_name} ({format_size(size)})…")
+        telegram_file = await with_retries(context.bot.get_file, document.file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(archive))
+        delete_server_copy(telegram_file)
+
+        await post_status("📦 Unpacking… (big archives can take a few minutes)")
+        await extract_rar(archive, dest, password)
+        archive.unlink(missing_ok=True)   # free the space the archive was using
+
+        files = collect_extracted_files(dest)
+
+        if not files:
+            raise RuntimeError(RARX_EMPTY)
+
+        skipped_big: list[str] = []
+        skipped_empty = 0
+        sendable = []
+
+        for path in files:
+            file_size = path.stat().st_size
+            relative = str(path.relative_to(dest))
+
+            if file_size == 0:
+                skipped_empty += 1
+            elif file_size > RAR_MAX_SEND_MB * 1024 * 1024:
+                skipped_big.append(relative)
+            else:
+                sendable.append(path)
+
+        skipped_extra = max(0, len(sendable) - RAR_MAX_FILES)
+        sendable = sendable[:RAR_MAX_FILES]
+
+        # Two files with the same name in different folders: keep the folder in the name.
+        name_counts: dict[str, int] = {}
+        for path in sendable:
+            name_counts[path.name] = name_counts.get(path.name, 0) + 1
+
+        total = len(sendable)
+
+        for number, path in enumerate(sendable, 1):
+            relative = str(path.relative_to(dest))
+            file_size = path.stat().st_size
+            send_name = path.name if name_counts[path.name] == 1 else relative.replace("/", " - ")
+
+            await post_status(f"⬆️ Sending {number}/{total}: {path.name[:60]}")
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+
+            with named_for_upload(path, send_name) as send_path:
+                await with_retries(
+                    context.bot.send_document,
+                    chat_id=chat_id,
+                    document=str(send_path),
+                    filename=send_name,
+                    caption=f"📦 {relative[:300]} · {format_size(file_size)}",
+                )
+            sent_count += 1
+
+            # Free the space right away, before the next file.
+            path.unlink(missing_ok=True)
+
+            if number < total:
+                await asyncio.sleep(RAR_SEND_PAUSE)
+
+        notes = []
+        if skipped_big:
+            notes.append(f"⚠️ Too big for Telegram, not sent: {', '.join(skipped_big[:5])}" + (" …" if len(skipped_big) > 5 else ""))
+        if skipped_extra:
+            notes.append(f"⚠️ Only the first {RAR_MAX_FILES} files were sent; {skipped_extra} more were skipped.")
+        if skipped_empty:
+            notes.append(f"ℹ️ {skipped_empty} empty file(s) were skipped.")
+
+        if sent_count == 0:
+            raise RuntimeError("there was nothing I could send from it")
+
+        await post_status("\n".join([f"✅ Sent {sent_count} file(s) from {archive_name}.", *notes]))
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.exception("Error unpacking RAR:")
+
+        # Nothing came back to them: give the daily-limit bytes back.
+        if sent_count == 0 and size > 0 and quota_applies(user_id):
+            quota_refund(user_id, size)
+
+        text = f"❌ Couldn't open {archive_name}: {error}"
+        if sent_count:
+            text = f"❌ Stopped after {sent_count} file(s): {error}"
+
+        with contextlib.suppress(Exception):
+            await post_status(text)
+    finally:
+        if slot_held:
+            release_work_slot()
+        if work_dir is not None:
+            cleanup_work_dir(work_dir)
+        other_jobs_running -= 1
+        await maybe_notify_update_ready(context.bot)
+
+
+# ------------------------------------------------------------
+# PowerPoint (.pptx) with a recording on each slide  ->  PDF / audio / video
+#
+# Send the bot a .pptx and pick what you want:
+#   📄 PDF    every slide in one PDF
+#   🎧 Audio  every slide's recording joined into one audio file, in slide order
+#   🎬 Video  each slide is shown while ITS OWN recording plays
+#   📦 All three
+#
+# How it works: a .pptx is a zip file, so the recordings are read straight out of
+# it (no PowerPoint needed). LibreOffice turns the slides into a PDF, ghostscript
+# turns the PDF pages into pictures, and FFmpeg builds the audio / video.
+# Needs "libreoffice" (the program is called soffice) inside the container —
+# see the Dockerfile line in the notes. Ghostscript and FFmpeg are already used elsewhere.
+# ------------------------------------------------------------
+PPTX_SLIDE_SECONDS = float(os.getenv("PPTX_SLIDE_SECONDS", "3"))      # how long a slide WITHOUT a recording is shown in the video
+PPTX_VIDEO_WIDTH = int(os.getenv("PPTX_VIDEO_WIDTH", "1280"))         # video width in pixels (height follows the slide shape)
+PPTX_VIDEO_FPS = int(os.getenv("PPTX_VIDEO_FPS", "5"))                # still pictures need very few frames per second
+PPTX_RENDER_DPI = int(os.getenv("PPTX_RENDER_DPI", "100"))            # sharpness of the slide pictures
+PPTX_MAX_SLIDES = int(os.getenv("PPTX_MAX_SLIDES", "300"))
+PPTX_MAX_AUDIO_MB = int(os.getenv("PPTX_MAX_AUDIO_MB", "1500"))       # biggest total size of recordings we will unpack
+PPTX_STEP_TIMEOUT = int(os.getenv("PPTX_STEP_TIMEOUT", "900"))        # seconds allowed for one conversion step
+PPTX_MENU_TTL = 3600                                                  # an unanswered menu is forgotten after 1 hour
+PPTX_AUDIO_KBPS = int(os.getenv("PPTX_AUDIO_KBPS", "128"))            # 16 / 32 / 64 / 96 / 128
+if PPTX_AUDIO_KBPS not in (16, 32, 64, 96, 128):
+    PPTX_AUDIO_KBPS = 128
+PPTX_AUDIO_RATE, PPTX_AUDIO_LAYOUT = (24000, "mono") if PPTX_AUDIO_KBPS <= 32 else (44100, "stereo")
+PPTX_AUDIO_EXTENSIONS = (".wav", ".mp3", ".m4a", ".aac", ".wma", ".ogg", ".oga", ".flac", ".opus", ".aif", ".aiff")
+
+BTN_PPTX_PDF = "📄 PDF"
+BTN_PPTX_AUDIO = "🎧 Audio"
+BTN_PPTX_VIDEO = "🎬 Video"
+BTN_PPTX_ALL = "📦 All three"
+
+MSG_PPTX_MENU = (
+    "📊 {name} · {size}\n"
+    "\n"
+    "What do you want from this presentation?\n"
+    "\n"
+    "📄 PDF — every slide in one PDF\n"
+    "🎧 Audio — all the slide recordings joined in slide order\n"
+    "🎬 Video — each slide is shown while its own recording plays\n"
+    "📦 All three\n"
+    "\n"
+    "ℹ️ Slides without a recording are shown for {seconds:g} s in the video."
+)
+MSG_PPTX_OLD_FORMAT = (
+    "⚠️ That's an old .ppt file. Please open it in PowerPoint, choose Save As → PowerPoint Presentation (.pptx), "
+    "and send me that one."
+)
+MSG_PPTX_NEED_OFFICE = "Converting PowerPoint files isn't set up on this server yet (LibreOffice is missing)."
+MSG_PPTX_NEED_GS = "Making a video from slides isn't set up on this server yet (ghostscript is missing)."
+MSG_PPTX_EXPIRED = "That menu has expired — please send the file again."
+MSG_PPTX_BUSY = "⏳ I'm already working on this file."
+MSG_PPTX_CANCELLED = "❌ Cancelled — nothing was done."
+
+pptx_pending: dict[tuple[int, int], dict] = {}   # (chat id, the user's file message id) -> what was sent
+
+
+def is_pptx_document(document) -> bool:
+    mime = (document.mime_type or "").lower()
+    name = (document.file_name or "").lower()
+    return name.endswith((".pptx", ".ppsx")) or mime in (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+    )
+
+
+def is_old_ppt_document(document) -> bool:
+    name = (document.file_name or "").lower()
+    return name.endswith((".ppt", ".pps")) or (document.mime_type or "").lower() == "application/vnd.ms-powerpoint"
+
+
+def find_office_tool() -> str | None:
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def pptx_menu_keyboard(file_message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            ui_button(BTN_PPTX_PDF, callback_data=f"pptx:pdf:{file_message_id}"),
+            ui_button(BTN_PPTX_AUDIO, callback_data=f"pptx:audio:{file_message_id}"),
+        ],
+        [
+            ui_button(BTN_PPTX_VIDEO, callback_data=f"pptx:video:{file_message_id}"),
+            ui_button(BTN_PPTX_ALL, callback_data=f"pptx:all:{file_message_id}"),
+        ],
+        [ui_button(BTN_CANCEL, callback_data=f"pptx:cancel:{file_message_id}")],
+    ])
+
+
+def pptx_error_line(stderr: str) -> str:
+    lines = [line.strip() for line in (stderr or "").strip().splitlines() if line.strip()]
+    return lines[-1][:200] if lines else "unknown error"
+
+
+PPTX_NOT_AUDIO_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".jfif", ".gif", ".bmp", ".tif", ".tiff", ".emf", ".wmf", ".svg", ".webp",
+    ".wdp", ".psd", ".bin", ".xml", ".rels", ".fntdata", ".ttf", ".otf", ".txt", ".json",
+)
+
+
+def pptx_is_audio_only_file(path: Path) -> bool:
+    """For a media file with an unusual extension (.mp4, .3gp, .amr ...): does it hold sound and NO picture?"""
+    if not shutil.which("ffprobe"):
+        return False
+
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return False
+
+    kinds = {line.strip().split(",")[0] for line in result.stdout.splitlines() if line.strip()}
+    return "audio" in kinds and "video" not in kinds
+
+
+def pptx_extract_slide_audio(source: Path, media_dir: Path) -> tuple[list[list[Path]], list[str], str]:
+    """
+    Open the .pptx (a zip) and, for every slide in PRESENTATION order, pull out the audio
+    that slide plays (in the order it appears on the slide).
+
+    Returns (clips, notes, media_summary):
+      clips         one list of extracted files per slide — empty for a slide with no recording
+      notes         things worth telling the person (e.g. recordings had to be matched by order)
+      media_summary what is inside the file's media folder, for the "nothing found" message
+
+    Two ways to find the recordings:
+      1. the normal way — the slide itself links to its recording (PowerPoint does this);
+      2. if no slide links to any — look inside ppt/media like you would by hand (rename the file
+         to .zip and open the media folder) and give the recordings to the slides in order.
+    """
+    rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    p_ns = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+    r_id = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+
+    try:
+        archive = zipfile.ZipFile(source)
+    except zipfile.BadZipFile as error:
+        raise RuntimeError("that isn't a valid .pptx file") from error
+
+    with archive:
+        names = set(archive.namelist())
+        notes: list[str] = []
+
+        def resolve(base_dir: str, target: str) -> str:
+            if target.startswith("/"):
+                return target.lstrip("/")
+            return posixpath.normpath(posixpath.join(base_dir, target))
+
+        def read_rels(part: str) -> dict[str, str]:
+            rels_name = f"{posixpath.dirname(part)}/_rels/{posixpath.basename(part)}.rels"
+            if rels_name not in names:
+                return {}
+
+            result = {}
+            for rel in _ET.fromstring(archive.read(rels_name)).iter(rel_ns + "Relationship"):
+                if rel.get("TargetMode") != "External" and rel.get("Id"):
+                    result[rel.get("Id")] = rel.get("Target") or ""
+            return result
+
+        if "ppt/presentation.xml" not in names:
+            raise RuntimeError("that isn't a PowerPoint presentation")
+
+        presentation_rels = read_rels("ppt/presentation.xml")
+        presentation = _ET.fromstring(archive.read("ppt/presentation.xml"))
+        slide_parts = []
+
+        for slide_id in presentation.iter(p_ns + "sldId"):
+            target = presentation_rels.get(slide_id.get(r_id) or "")
+            if target:
+                part = resolve("ppt", target)
+                if part in names:
+                    slide_parts.append(part)
+
+        if not slide_parts:
+            raise RuntimeError("it has no slides")
+        if len(slide_parts) > PPTX_MAX_SLIDES:
+            raise RuntimeError(f"it has more than {PPTX_MAX_SLIDES} slides")
+
+        # What is in the media folder (for the message when nothing is found).
+        extension_counts: dict[str, int] = {}
+        for name in names:
+            if name.startswith("ppt/media/") and not name.endswith("/"):
+                extension = Path(name).suffix.lower() or "(none)"
+                extension_counts[extension] = extension_counts.get(extension, 0) + 1
+        media_summary = (
+            ", ".join(f"{ext} × {count}" for ext, count in sorted(extension_counts.items()))
+            if extension_counts else "no media files at all"
+        )
+
+        media_dir.mkdir(parents=True, exist_ok=True)
+        state = {"total_bytes": 0, "counter": 0}
+
+        def try_extract(member: str, label: str) -> Path | None:
+            """Copy one file out of the zip if it is a recording. Returns its path, or None if it isn't audio."""
+            extension = Path(member).suffix.lower()
+
+            if extension in PPTX_NOT_AUDIO_EXTENSIONS or not extension:
+                return None
+
+            info = archive.getinfo(member)
+            known_audio = extension in PPTX_AUDIO_EXTENSIONS
+
+            if not known_audio and info.file_size > 200 * 1024 * 1024:
+                return None   # a big unknown file is far more likely a video clip than a recording
+
+            state["total_bytes"] += info.file_size
+            if state["total_bytes"] > PPTX_MAX_AUDIO_MB * 1024 * 1024:
+                raise RuntimeError(f"the recordings add up to more than {PPTX_MAX_AUDIO_MB} MB")
+
+            state["counter"] += 1
+            dest = media_dir / f"{label}_{state['counter']:04d}{extension}"
+            with archive.open(member) as source_file, open(dest, "wb") as out_file:
+                shutil.copyfileobj(source_file, out_file)
+
+            if not known_audio and not pptx_is_audio_only_file(dest):
+                dest.unlink(missing_ok=True)
+                return None
+
+            return dest
+
+        per_slide: list[list[Path]] = []
+
+        # ---- way 1: each slide links to its own recording ----
+        for number, part in enumerate(slide_parts, 1):
+            rels = read_rels(part)
+            xml_text = archive.read(part).decode("utf-8", errors="ignore")
+            clips: list[Path] = []
+            seen: set[str] = set()
+
+            # Every r:link / r:embed on the slide, in the order it appears: the recording is one of them.
+            for rel_id in re.findall(r'[A-Za-z0-9_]+:(?:link|embed|id)="([^"]+)"', xml_text):
+                target = rels.get(rel_id)
+                if not target:
+                    continue
+
+                member = resolve(posixpath.dirname(part), target)
+                if member in seen or member not in names:
+                    continue
+                seen.add(member)
+
+                clip = try_extract(member, f"s{number:04d}")
+                if clip is not None:
+                    clips.append(clip)
+
+            per_slide.append(clips)
+
+        # ---- way 2: nothing was linked — read the media folder the way you would by hand ----
+        if not any(per_slide):
+            candidates = sorted(
+                (name for name in names if name.startswith("ppt/media/") and not name.endswith("/")),
+                key=lambda name: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name.lower())],
+            )
+            found: list[Path] = []
+
+            for member in candidates:
+                clip = try_extract(member, "media")
+                if clip is not None:
+                    found.append(clip)
+
+            if found:
+                slide_total = len(slide_parts)
+
+                if len(found) == slide_total:
+                    notes.append("ℹ️ The recordings weren't linked to their slides inside the file, so I matched them to the slides in order.")
+                else:
+                    notes.append(
+                        f"⚠️ I found {len(found)} recordings for {slide_total} slides and they weren't linked to slides, "
+                        "so I matched them in order — please check the result."
+                    )
+
+                per_slide = [[found[i]] if i < len(found) else [] for i in range(slide_total)]
+
+        return per_slide, notes, media_summary
+
+
+async def pptx_normalise_audio(clips: list[Path], output: Path) -> None:
+    """One slide's recording(s) -> one AAC file with the same settings for every slide, so they can be joined without re-encoding."""
+    command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    for clip in clips:
+        command += ["-i", str(clip)]
+
+    count = len(clips)
+    graph = "".join(
+        f"[{i}:a:0]aresample={PPTX_AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts={PPTX_AUDIO_LAYOUT}[a{i}];"
+        for i in range(count)
+    )
+    graph += "".join(f"[a{i}]" for i in range(count)) + f"concat=n={count}:v=0:a=1[out]"
+    command += ["-filter_complex", graph, "-map", "[out]", "-c:a", "aac", "-b:a", f"{PPTX_AUDIO_KBPS}k", str(output)]
+
+    code, stderr = await run_tool(command, PPTX_STEP_TIMEOUT)
+    if code != 0 or not output.exists():
+        raise RuntimeError(pptx_error_line(stderr))
+
+
+async def pptx_concat(files: list[Path], output: Path, extra: list[str] | None = None) -> None:
+    """Join files that share the same codec settings, without re-encoding (FFmpeg's concat list)."""
+    list_path = output.with_suffix(".txt")
+    list_path.write_text("".join(f"file '{path}'\n" for path in files), encoding="utf-8")
+
+    try:
+        code, stderr = await run_tool(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+             "-i", str(list_path), "-c", "copy", *(extra or []), str(output)],
+            PPTX_STEP_TIMEOUT,
+        )
+    finally:
+        list_path.unlink(missing_ok=True)
+
+    if code != 0 or not output.exists():
+        raise RuntimeError(pptx_error_line(stderr))
+
+
+async def pptx_convert_to_pdf(source: Path, out_dir: Path) -> Path:
+    """LibreOffice: slides.pptx -> slides.pdf (hidden slides included where this LibreOffice supports it)."""
+    tool = find_office_tool()
+    if tool is None:
+        raise RuntimeError(MSG_PPTX_NEED_OFFICE)
+
+    profile = (out_dir / "lo_profile").resolve().as_uri()
+    produced = out_dir / (source.stem + ".pdf")
+    last_error = ""
+
+    for target in ('pdf:impress_pdf_Export:{"ExportHiddenSlides":{"type":"boolean","value":"true"}}', "pdf"):
+        code, stderr = await run_tool(
+            [tool, f"-env:UserInstallation={profile}", "--headless", "--norestore", "--nolockcheck",
+             "--convert-to", target, "--outdir", str(out_dir), str(source)],
+            PPTX_STEP_TIMEOUT,
+        )
+        if produced.exists() and produced.stat().st_size > 0:
+            return produced
+        last_error = stderr
+
+    raise RuntimeError("LibreOffice couldn't convert it" + (f" ({pptx_error_line(last_error)})" if last_error.strip() else ""))
+
+
+async def pptx_render_pages(pdf: Path, out_dir: Path) -> list[Path]:
+    """PDF pages -> one picture per page (ghostscript)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    code, stderr = await run_tool(
+        ["gs", "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dSAFER", "-sDEVICE=png16m", f"-r{PPTX_RENDER_DPI}",
+         "-dTextAlphaBits=4", "-dGraphicsAlphaBits=4", f"-sOutputFile={out_dir}/slide-%04d.png", str(pdf)],
+        PPTX_STEP_TIMEOUT,
+    )
+    pages = sorted(out_dir.glob("slide-*.png"))
+
+    if not pages:
+        raise RuntimeError(f"couldn't draw the slides ({pptx_error_line(stderr)})")
+    return pages
+
+
+def png_dimensions(path: Path) -> tuple[int, int]:
+    with open(path, "rb") as handle:
+        header = handle.read(24)
+    return struct.unpack(">II", header[16:24])
+
+
+async def pptx_video_segment(
+    image: Path, audio: Path | None, output: Path, width: int, height: int,
+) -> None:
+    """One slide: the picture shown for as long as its recording (or a few silent seconds)."""
+    command = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-threads", str(FFMPEG_THREADS),
+        "-loop", "1", "-framerate", str(PPTX_VIDEO_FPS), "-i", str(image),
+    ]
+
+    if audio is not None:
+        command += ["-i", str(audio), "-c:a", "copy"]
+    else:
+        command += ["-f", "lavfi", "-t", f"{PPTX_SLIDE_SECONDS:g}",
+                    "-i", f"anullsrc=r={PPTX_AUDIO_RATE}:cl={PPTX_AUDIO_LAYOUT}",
+                    "-c:a", "aac", "-b:a", f"{PPTX_AUDIO_KBPS}k"]
+
+    command += [
+        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-crf", "28",
+        "-r", str(PPTX_VIDEO_FPS), "-shortest", "-movflags", "+faststart", str(output),
+    ]
+
+    code, stderr = await run_tool(command, PPTX_STEP_TIMEOUT)
+    if code != 0 or not output.exists():
+        raise RuntimeError(pptx_error_line(stderr))
+
+
+async def pptx_build_video(
+    pdf: Path, per_slide_audio: list[Path | None], work_dir: Path, post_status, notes: list[str],
+) -> tuple[Path, int, int]:
+    """Draw every slide, make one clip per slide, join the clips. Returns (video, width, height)."""
+    await post_status("🖼 Drawing the slides…")
+    pages = await pptx_render_pages(pdf, work_dir / "pages")
+
+    if per_slide_audio and len(pages) != len(per_slide_audio):
+        notes.append(
+            f"⚠️ The PDF has {len(pages)} pages but the file has {len(per_slide_audio)} slides, "
+            "so some recordings may not line up."
+        )
+
+    page_width, page_height = png_dimensions(pages[0])
+    width = max(2, PPTX_VIDEO_WIDTH // 2 * 2)
+    height = max(2, round(width * page_height / page_width) // 2 * 2)
+
+    segments_dir = work_dir / "segments"
+    segments_dir.mkdir(exist_ok=True)
+    segments: list[Path] = []
+    silent = 0
+    last_update = 0.0
+
+    for number, page in enumerate(pages, 1):
+        audio = per_slide_audio[number - 1] if number - 1 < len(per_slide_audio) else None
+        silent += audio is None
+
+        if time.monotonic() - last_update > 4:
+            last_update = time.monotonic()
+            await post_status(f"🎬 Building the video… slide {number}/{len(pages)}")
+
+        segment = segments_dir / f"seg_{number:04d}.mp4"
+        await pptx_video_segment(page, audio, segment, width, height)
+        segments.append(segment)
+        page.unlink(missing_ok=True)
+
+    if silent:
+        notes.append(f"ℹ️ {silent} slide(s) had no recording — shown for {PPTX_SLIDE_SECONDS:g} s each in the video.")
+
+    await post_status("🔗 Joining the slides into one video…")
+    video = work_dir / "video.mp4"
+    await pptx_concat(segments, video, extra=["-movflags", "+faststart"])
+
+    for segment in segments:
+        segment.unlink(missing_ok=True)
+
+    return video, width, height
+
+
+async def handle_pptx_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE, document) -> None:
+    """A .pptx arrived: ask what to make from it (nothing is downloaded until a button is tapped)."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if chat_id in merge_sessions:
+        await message.reply_text(merge_busy_text(chat_id))
+        return
+
+    if update_mode["on"] and not is_admin(user_id):
+        await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
+    size = int(document.file_size or 0)
+
+    if file_too_large(user_id, size):
+        await message.reply_text(file_too_large_text(user_id, size))
+        return
+
+    if not quota_allows(user_id, size):
+        await message.reply_text(quota_refusal_text(user_id, size))
+        return
+
+    now = time.time()
+    for key in [k for k, v in pptx_pending.items() if now - v["created"] > PPTX_MENU_TTL and not v.get("running")]:
+        pptx_pending.pop(key, None)
+
+    name = document.file_name or f"presentation_{message.message_id}.pptx"
+    pptx_pending[(chat_id, message.message_id)] = {
+        "file_id": document.file_id,
+        "name": name,
+        "size": size,
+        "user_id": user_id,
+        "created": now,
+        "running": False,
+    }
+
+    await with_style_fallback(lambda: message.reply_text(
+        MSG_PPTX_MENU.format(name=name[:120], size=format_size(size), seconds=PPTX_SLIDE_SECONDS),
+        reply_markup=pptx_menu_keyboard(message.message_id),
+    ))
+
+
+async def handle_pptx_callback(query, context: ContextTypes.DEFAULT_TYPE, user_id: int | None) -> None:
+    """A tap on the PDF / Audio / Video / All three / Cancel buttons."""
+    global other_jobs_running
+
+    try:
+        _prefix, kind, file_message_id = query.data.split(":", 2)
+        key = (query.message.chat_id, int(file_message_id))
+    except (ValueError, AttributeError):
+        await query.answer()
+        return
+
+    pending = pptx_pending.get(key)
+
+    if pending is None:
+        await query.answer(MSG_PPTX_EXPIRED, show_alert=True)
+        return
+
+    if user_id != pending["user_id"] and not is_admin(user_id):
+        await query.answer(MSG_NOT_YOUR_JOB, show_alert=True)
+        return
+
+    if pending.get("running"):
+        await query.answer(MSG_PPTX_BUSY)
+        return
+
+    if kind == "cancel":
+        pptx_pending.pop(key, None)
+        await query.answer()
+        with contextlib.suppress(Exception):
+            await query.edit_message_text(MSG_PPTX_CANCELLED)
+        return
+
+    if kind not in ("pdf", "audio", "video", "all"):
+        await query.answer()
+        return
+
+    if update_mode["on"] and not is_admin(user_id):
+        await query.answer(UPDATE_BUSY_TEXT, show_alert=True)
+        return
+
+    needs_office = kind in ("pdf", "video", "all")
+    needs_gs = kind in ("video", "all")
+
+    if needs_office and find_office_tool() is None:
+        await query.answer(MSG_PPTX_NEED_OFFICE, show_alert=True)
+        return
+
+    if needs_gs and not shutil.which("gs"):
+        await query.answer(MSG_PPTX_NEED_GS, show_alert=True)
+        return
+
+    size = pending["size"]
+
+    if not quota_allows(user_id, size):
+        await query.answer()
+        await query.message.reply_text(quota_refusal_text(user_id, size))
+        return
+
+    await query.answer()
+    quota_consume(user_id, size)
+    pending["running"] = True
+    other_jobs_running += 1
+    update_mode["notified"] = False
+
+    try:
+        await run_pptx_job(query, context, pending, kind)
+    finally:
+        pptx_pending.pop(key, None)
+        other_jobs_running -= 1
+        await maybe_notify_update_ready(context.bot)
+
+
+async def run_pptx_job(query, context: ContextTypes.DEFAULT_TYPE, pending: dict, kind: str) -> None:
+    message = query.message
+    chat_id = message.chat_id
+    user_id = pending["user_id"]
+    name = pending["name"]
+    size = pending["size"]
+    stem = Path(name).stem or "presentation"
+
+    send_pdf = kind in ("pdf", "all")
+    send_audio_file = kind in ("audio", "all")
+    send_video_file = kind in ("video", "all")
+    need_recordings = kind in ("audio", "video", "all")
+    need_pdf = send_pdf or send_video_file
+
+    work_dir: Path | None = None
+    slot_held = False
+    sent: list[str] = []
+    failed: list[str] = []
+    notes: list[str] = []
+
+    async def post_status(text: str) -> None:
+        with contextlib.suppress(Exception):
+            await message.edit_text(text)
+
+    try:
+        await acquire_work_slot(post_status, user_priority(user_id), user_plan_label(user_id))
+        slot_held = True
+
+        Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix=f"pptx_{message.message_id}_", dir=TEMP_DIR))
+        source = work_dir / "slides.pptx"
+
+        await post_status(f"⬇️ Downloading {name[:80]} ({format_size(size)})…")
+        telegram_file = await with_retries(context.bot.get_file, pending["file_id"])
+        await with_retries(telegram_file.download_to_drive, custom_path=str(source))
+        delete_server_copy(telegram_file)
+
+        # ---- 1) the recordings, one file per slide ----
+        per_slide_audio: list[Path | None] = []
+        slide_count = 0
+
+        if need_recordings:
+            await post_status("🔎 Looking for the recordings in your slides…")
+            slide_clips, found_notes, media_summary = await asyncio.to_thread(
+                pptx_extract_slide_audio, source, work_dir / "media"
+            )
+            notes.extend(found_notes)
+            slide_count = len(slide_clips)
+            slides_with_audio = sum(1 for clips in slide_clips if clips)
+
+            if slides_with_audio == 0 and kind == "audio":
+                raise RuntimeError(
+                    f"I couldn't find any recordings in this file ({slide_count} slides; media folder: {media_summary})"
+                )
+
+            if slides_with_audio == 0:
+                notes.append(
+                    f"ℹ️ I couldn't find any recordings in this file (media folder: {media_summary}), so the video has silent slides."
+                )
+
+            audio_dir = work_dir / "audio"
+            audio_dir.mkdir(exist_ok=True)
+            last_update = 0.0
+
+            for number, clips in enumerate(slide_clips, 1):
+                if not clips:
+                    per_slide_audio.append(None)
+                    continue
+
+                if time.monotonic() - last_update > 4:
+                    last_update = time.monotonic()
+                    await post_status(f"🎧 Preparing the recordings… slide {number}/{slide_count}")
+
+                slide_audio = audio_dir / f"slide_{number:04d}.m4a"
+
+                try:
+                    await pptx_normalise_audio(clips, slide_audio)
+                    per_slide_audio.append(slide_audio)
+                except RuntimeError as error:
+                    logger.warning("PPTX slide %s recording failed: %s", number, error)
+                    notes.append(f"⚠️ Slide {number}: its recording couldn't be read.")
+                    per_slide_audio.append(None)
+
+                for clip in clips:
+                    clip.unlink(missing_ok=True)
+
+            if kind == "audio" and not any(per_slide_audio):
+                raise RuntimeError("none of the recordings could be read")
+
+        # ---- 2) audio: all recordings joined, in slide order ----
+        if send_audio_file and any(per_slide_audio):
+            try:
+                await post_status("🎧 Joining the recordings…")
+                combined = work_dir / "recordings.m4a"
+                parts = [path for path in per_slide_audio if path is not None]
+                await pptx_concat(parts, combined)
+                duration = await get_duration(str(combined))
+
+                await post_status("⬆️ Sending the audio…")
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+
+                with named_for_upload(combined, f"{stem}.m4a") as send_path:
+                    await with_retries(
+                        context.bot.send_audio,
+                        chat_id=chat_id,
+                        audio=str(send_path),
+                        duration=round(duration) if duration else None,
+                        title=stem[:64],
+                        caption=f"🎧 {len(parts)} recording(s) from {slide_count} slides · {format_size(combined.stat().st_size)}",
+                    )
+
+                sent.append("audio")
+                combined.unlink(missing_ok=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception("PPTX audio failed:")
+                failed.append(f"🎧 Audio: {error}")
+
+        # ---- 3) the PDF (also needed to make the video) ----
+        pdf_path: Path | None = None
+
+        if need_pdf:
+            try:
+                await post_status("📄 Converting the slides… (this can take a minute)")
+                pdf_path = await pptx_convert_to_pdf(source, work_dir)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception("PPTX -> PDF failed:")
+                failed.append(f"📄 PDF: {error}")
+
+            source.unlink(missing_ok=True)
+
+            if pdf_path is not None and send_pdf:
+                try:
+                    await post_status("⬆️ Sending the PDF…")
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+
+                    with named_for_upload(pdf_path, f"{stem}.pdf") as send_path:
+                        await with_retries(
+                            context.bot.send_document,
+                            chat_id=chat_id,
+                            document=str(send_path),
+                            caption=f"📄 {name[:200]} · {format_size(pdf_path.stat().st_size)}",
+                        )
+                    sent.append("PDF")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.exception("PPTX PDF send failed:")
+                    failed.append(f"📄 PDF: {error}")
+
+        # ---- 4) video: every slide with its own recording ----
+        if send_video_file:
+            if pdf_path is None:
+                failed.append("🎬 Video: it needs the slides converted first, and that didn't work")
+            else:
+                try:
+                    video, width, height = await pptx_build_video(pdf_path, per_slide_audio, work_dir, post_status, notes)
+                    duration = await get_duration(str(video))
+
+                    await post_status("⬆️ Sending the video…")
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+                    with named_for_upload(video, f"{stem}.mp4") as send_path:
+                        await with_retries(
+                            context.bot.send_video,
+                            chat_id=chat_id,
+                            video=str(send_path),
+                            duration=round(duration) if duration else None,
+                            width=width,
+                            height=height,
+                            supports_streaming=True,
+                            caption=f"🎬 {name[:200]} · {format_size(video.stat().st_size)}",
+                        )
+                    sent.append("video")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.exception("PPTX video failed:")
+                    failed.append(f"🎬 Video: {error}")
+
+        if not sent:
+            raise RuntimeError("; ".join(failed) or "nothing could be made")
+
+        await post_status("\n".join([f"✅ Done — sent: {', '.join(sent)}.", *notes, *failed]))
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.exception("Error converting PPTX:")
+
+        # Nothing came back to them: give the daily-limit bytes back.
+        if not sent and size > 0 and quota_applies(user_id):
+            quota_refund(user_id, size)
+
+        with contextlib.suppress(Exception):
+            await post_status(f"❌ Couldn't convert {name[:80]}: {error}")
+    finally:
+        if slot_held:
+            release_work_slot()
+        if work_dir is not None:
+            cleanup_work_dir(work_dir)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+
+    if message is None or message.document is None:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        await reject_unauthorized(message, user_id)
+        return
+
+    document = message.document
+    mime_type = document.mime_type or ""
+    filename = document.file_name or "video"
+
+    # The admin sending back an approved_users .json restores/merges
+    # the approved list (e.g. after Railway wiped the local file).
+    if is_admin(user_id) and filename.lower().endswith((".json", ".zip")):
+        await restore_approved_users_from_document(message, context, document)
+        return
+
+    # An image file (sent as a document so Telegram doesn't compress it)
+    # while we're waiting for a cover.
+    is_image = mime_type.startswith("image/") or filename.lower().endswith(
+        (".jpg", ".jpeg", ".png", ".webp")
+    )
+    if is_image and await maybe_handle_payment_proof(update, context, document.file_id, "document"):
+        return
+
+    waiting_input = awaiting_input.get(message.chat_id)
+    if is_image and waiting_input is not None and waiting_input["field"] == "pdfthumb":
+        await apply_pdf_thumbnail(update, context, document.file_id)
+        return
+
+    if is_image and waiting_input is not None:
+        if waiting_input["field"] in ("cover", "videocover"):
+            await apply_cover_image(update, context, document.file_id)
+        else:
+            await message.reply_text(MSG_I_M_WAITING_FOR_TEXT)
+        return
+
+    if is_pdf_document(document):
+        await handle_pdf_incoming(update, context, document)
+        return
+
+    if is_rar_document(document):
+        await handle_rar_incoming(update, context, document)
+        return
+
+    if is_pptx_document(document):
+        await handle_pptx_incoming(update, context, document)
+        return
+
+    if is_old_ppt_document(document):
+        await message.reply_text(MSG_PPTX_OLD_FORMAT)
+        return
+
+    is_video = (
+        mime_type.startswith("video/")
+        or filename.lower().endswith(
+            (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpeg", ".mpg", ".3gp")
+        )
+    )
+    is_audio = (
+        mime_type.startswith("audio/")
+        or filename.lower().endswith(AUDIO_FILE_EXTENSIONS)
+    )
+
+    if not is_video and not is_audio:
+        await message.reply_text(MSG_THAT_DOESN_T_LOOK_LIKE)
+        return
+
+
+    await handle_incoming(
+        update, context,
+        file_id=document.file_id,
+        original_size=document.file_size,
+        filename=filename,
+        media_type="audio" if is_audio else "video",
+    )
+
+
+async def restore_approved_users_from_document(message, context, document) -> None:
+    """Admin sent a Database.zip (or an old .json): merge its users and save."""
+    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+    temp_path = Path(TEMP_DIR) / f"restore_{message.message_id}.bin"
+
+    try:
+        telegram_file = await with_retries(context.bot.get_file, document.file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(temp_path))
+
+        added = read_database_bytes(temp_path.read_bytes())
+        saved = save_approved_users()
+
+        await message.reply_text(
+            MSG_LOADED_THAT_FILE_NEW_USER.format(added=added, count_approved_users=len(approved_users))
+            + ("" if saved else MSG_COULDN_T_SAVE_TO_DISK)
+        )
+    except ValueError as error:
+        await message.reply_text(MSG_I_COULDN_T_USE_THAT.format(error=error))
+    except Exception as error:
+        logger.exception("Error restoring approved users:")
+        await message.reply_text(MSG_SOMETHING_WENT_WRONG_READING_THAT.format(error=error))
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+# ============================================================
+# Button handler (setlevel / compress / cancel)
+# ============================================================
+
+# ------------------------------------------------------------
+# /update — stop new files so you can deploy, and see who is left
+# ------------------------------------------------------------
+def nothing_in_progress() -> bool:
+    return work_active == 0 and not work_waiting and other_jobs_running == 0
+
+
+def open_menu_count() -> int:
+    """Analyzed videos whose owner hasn't tapped anything yet (lost on restart)."""
+    menus = sum(1 for message_id in pending_compressions if message_id not in active_job_ids)
+    menus += sum(1 for session in pdf_file_sessions.values() if not session.get("running"))
+    return menus + sum(1 for session in merge_sessions.values() if not session.get("running"))
+
+
+def update_status_text() -> str:
+    waiting = len(work_waiting)
+    people_left = work_active + waiting + other_jobs_running
+
+    lines = [MSG_UPDATE_MODE_IS_ON_NEW, ""]
+
+    if people_left == 0:
+        lines.append(MSG_NOBODY_IS_IN_THE_MIDDLE)
+    else:
+        lines += [
+            MSG_STILL_TO_FINISH.format(people_left=people_left),
+            MSG_BEING_DOWNLOADED_ANALYZED_COMPRESSED.format(work_active=work_active),
+            MSG_WAITING_IN_LINE.format(waiting=waiting),
+        ]
+        if other_jobs_running:
+            lines.append(MSG_PDF_JOB_S_RUNNING.format(other_jobs_running=other_jobs_running))
+        lines += ["", MSG_I_LL_MESSAGE_YOU_THE]
+
+    menus = open_menu_count()
+    if menus:
+        lines += [
+            "",
+            MSG_PERSON_PEOPLE_HAVE_AN_ANALYZED.format(menus=menus),
+        ]
+
+    lines += ["", MSG_UPDATE_OFF_CANCEL_AND_ACCEPT]
+    return "\n".join(lines)
+
+
+async def maybe_notify_update_ready(bot, force: bool = False) -> None:
+    """Called whenever a job ends: once everyone is done, save the backup and tell the admin."""
+    if not update_mode["on"] or (update_mode["notified"] and not force):
+        return
+
+    if not nothing_in_progress():
+        return
+
+    update_mode["notified"] = True
+
+    try:
+        await backup_database_if_changed(bot)  # latest users + stats into the pinned Database.zip
+    except Exception:
+        logger.exception("Backup before update failed")
+
+    # Someone may have tapped an old menu while the backup was uploading.
+    if not nothing_in_progress():
+        update_mode["notified"] = False
+        return
+
+    backed_up = bool(BACKUP_CHANNEL_ID) and database_fingerprint() == _last_backed_up_fingerprint
+    lines = [
+        MSG_EVERYONE_HAS_FINISHED_IT_S,
+        MSG_THE_LATEST_DATABASE_ZIP_IS
+        if backed_up else MSG_I_COULDN_T_CONFIRM_THE,
+    ]
+    menus = open_menu_count()
+    if menus:
+        lines.append(MSG_OPEN_MENU_S_WILL_BE.format(menus=menus))
+    lines.append(MSG_UPDATE_OFF_CANCELS_UPDATE_MODE)
+
+    try:
+        await bot.send_message(chat_id=ADMIN_USER_ID, text="\n".join(lines))
+    except Exception:
+        logger.warning("Couldn't send the update-ready message")
+
+
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/update (admin): stop new files + show who's left. /update off cancels."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    option = context.args[0].lower() if context.args else ""
+
+    if option in ("off", "cancel", "stop"):
+        if not update_mode["on"]:
+            await message.reply_text(MSG_UPDATE_MODE_WASN_T_ON)
+            return
+        update_mode["on"] = False
+        update_mode["notified"] = False
+        await message.reply_text(MSG_UPDATE_MODE_IS_OFF_NEW)
+        return
+
+    if not update_mode["on"]:
+        update_mode["on"] = True
+        update_mode["notified"] = False
+
+    if nothing_in_progress():
+        await message.reply_text(MSG_UPDATE_MODE_IS_ON_NEW)
+        await maybe_notify_update_ready(context.bot, force=True)
+    else:
+        await message.reply_text(update_status_text())
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Wraps the real button handler so PDF jobs count as "people still working"."""
+    global other_jobs_running
+
+    query = update.callback_query
+    action = (query.data or "").split(":", 1)[0] if query else ""
+    tracked = action in ("pdf", "pdfauto", "pdf3", "pdfdedup", "pdfx")
+
+    if tracked:
+        other_jobs_running += 1
+        update_mode["notified"] = False
+
+    try:
+        await handle_callback_inner(update, context)
+    finally:
+        if tracked:
+            other_jobs_running -= 1
+            await maybe_notify_update_ready(context.bot)
+
+
+async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+
+    if query is None or query.data is None:
+        return
+
+    user_id = query.from_user.id if query.from_user else None
+
+    if not is_allowed(user_id):
+        await query.answer(
+            MSG_NOT_AUTHORIZED_YOUR_TELEGRAM_USER.format(user_id=user_id),
+            show_alert=True,
+        )
+        return
+
+    if query.data.startswith("canceljob:"):
+        await handle_cancel_job(query, user_id)
+        return
+
+    if query.data.startswith("subsoon:"):
+        await query.answer(MSG_SUBSCRIPTIONS_COMING_SOON, show_alert=True)
+        return
+
+    if query.data.startswith("pdfx:"):
+        await handle_pdf_callback(query, context, user_id)
+        return
+
+    if query.data.startswith("pptx:"):
+        await handle_pptx_callback(query, context, user_id)
+        return
+
+    if query.data.startswith("toobig:"):
+        # A level that would make the file bigger: the button does nothing but explain.
+        await query.answer(MSG_LEVEL_WOULD_GROW_FILE, show_alert=True)
+        return
+
+    await query.answer()
+
+    try:
+        action, level, message_id_str = query.data.split(":", 2)
+        message_id = int(message_id_str)
+    except ValueError:
+        return
+
+    chat_id = query.message.chat_id if query.message else None
+
+    # Any tap on a menu counts as "still here": it restarts that video's idle timer.
+    if action not in ("payok", "payno", "subpick", "subcancel", "resetstats", "home", "joincheck"):
+        touched = pending_compressions.get(message_id)
+        if touched is not None:
+            touched["last_active"] = time.time()
+
+    if action == "merge":
+        await handle_merge_callback(query, context, level, message_id)
+        return
+
+    if action == "home":
+        page = level
+
+        if page == "usage":
+            await show_page(query, usage_page_text(user_id), lambda: usage_keyboard(user_id))
+        elif page == "plans":
+            await show_page(query, plans_text(user_id), lambda: plans_keyboard(user_id))
+        elif page == "subscribe":
+            await show_page(query, subscribe_page_text(user_id), subscribe_keyboard)
+        elif page == "about":
+            await show_page(query, about_text(), about_keyboard)
+        elif page == "invite":
+            await show_page(
+                query,
+                invite_page(context.bot, user_id, with_back=True)[0],
+                lambda: invite_page(context.bot, user_id, with_back=True)[1],
+            )
+        elif page == "howto":
+            await send_how_to_use(query, context)
+        else:
+            await show_page(query, home_text(query.from_user), home_keyboard)
+        return
+
+    if action == "subpick" and not SUBSCRIPTIONS_ENABLED:
+        await query.message.reply_text(MSG_SUBSCRIPTIONS_COMING_SOON)
+        return
+
+    if action == "home" and level == "subscribe" and not SUBSCRIPTIONS_ENABLED:
+        await query.message.reply_text(MSG_SUBSCRIPTIONS_COMING_SOON)
+        return
+
+    if action == "subpick":
+        if level not in ("plus", "pro") or user_id is None:
+            return
+
+        awaiting_payment_proof[user_id] = {"tier": level, "since": time.time()}
+        await with_style_fallback(lambda: query.edit_message_text(
+            payment_steps_text(level, user_id),
+            parse_mode="HTML",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            reply_markup=InlineKeyboardMarkup([[ui_button(BTN_CANCEL, callback_data="subcancel:_:0")]]),
+        ))
+        return
+
+    if action == "subcancel":
+        if user_id is not None:
+            awaiting_payment_proof.pop(user_id, None)
+        await show_page(query, home_text(query.from_user), home_keyboard)
+        return
+
+    if action in ("payok", "payno"):
+        if not is_admin(user_id):
+            return
+
+        target_id = message_id   # the third part of the button data is the person's ID here
+
+        if action == "payok":
+            if level not in ("plus", "pro"):
+                return
+
+            until, verb = grant_plan(target_id, level, 30)
+            told = await notify_user_granted(context.bot, target_id, level, until)
+            result = (
+                MSG_APPROVED_FOR_UNTIL.format(plan_level=tier_label(level), verb=verb, name=display_name_for(target_id), target_id=target_id, date_until=format_until(until)) + ("" if told else "\n(I couldn't message them.)")
+            )
+        else:
+            result = MSG_REJECTED_THE_PAYMENT_FROM.format(name=display_name_for(target_id), target_id=target_id)
+            with contextlib.suppress(Exception):
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text=(
+                        MSG_I_COULDN_T_CONFIRM_YOUR.format(dm_text=dm_text())
+                    ),
+                )
+
+        original_caption = query.message.caption or ""
+        try:
+            await query.edit_message_caption(caption=f"{original_caption}\n\n{result}")
+        except Exception:
+            await query.message.reply_text(result)
+        return
+
+    if action == "ramclean":
+        if not is_admin(user_id):
+            return
+
+        if level != "yes":
+            await query.edit_message_text(MSG_RAM_CLEAN_CANCELLED)
+            return
+
+        await perform_ram_clean(query)
+        return
+
+    if action == "resetstats":
+        if not is_admin(user_id):
+            return
+
+        if level != "yes":
+            await query.edit_message_text(MSG_CANCELLED_THE_STATISTICS_WERE_NOT)
+            return
+
+        try:
+            await context.bot.send_document(
+                chat_id=ADMIN_USER_ID,
+                document=stats_json_bytes(),
+                filename=f"stats_before_reset_{quota_today()}.json",
+                caption=MSG_A_COPY_OF_THE_STATISTICS,
+            )
+        except Exception:
+            logger.warning("Couldn't send the pre-reset statistics copy")
+
+        reset_stats_data()
+        await query.edit_message_text(MSG_STATISTICS_RESET_COUNTING_FROM_ZERO)
+        return
+
+    if action == "setlevel":
+        if level not in LEVELS or chat_id is None:
+            return
+        chat_default_level[chat_id] = level
+        await query.edit_message_text(
+            MSG_DEFAULT_STAR_SET_TO_NEW.format(level_label=LEVELS[level]['label'])
+        )
+        return
+
+    if action == "cancel":
+        refunded_text = ""
+        pending = pending_compressions.get(message_id)
+
+        # (If a job is already running for it, that job refunds itself.)
+        if pending is not None and message_id not in running_jobs:
+            owner_id = pending.get("owner_id")
+            charged = int(pending.get("charged_bytes") or pending.get("original_size") or 0)
+
+            if quota_applies(owner_id) and charged > 0:
+                quota_refund(owner_id, charged)
+                refunded_text = format_size(charged)
+
+        clear_pending(message_id)
+        await query.edit_message_text(
+            MSG_CANCELLED_FILES_REMOVED_REFUNDED.format(size=refunded_text)
+            if refunded_text
+            else MSG_CANCELLED_TEMPORARY_FILES_REMOVED
+        )
+        return
+
+    if action == "pdfmenu":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        await query.edit_message_text(
+            MSG_PICK_A_SCREENSHOT_INTERVAL_ONE,
+            reply_markup=pdf_interval_keyboard(message_id),
+        )
+        return
+
+    if action == "pdf":
+        try:
+            interval = int(level)
+        except ValueError:
+            return
+
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+
+        await query.edit_message_text(
+            MSG_EXTRACTING_A_FRAME_EVERY_S.format(interval=interval)
+        )
+
+        try:
+            pdf_path, frame_count = await extract_pdf_frames(
+                str(input_path), work_dir, interval
+            )
+
+            if pdf_path is None:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=MSG_COULDN_T_EXTRACT_ANY_FRAMES,
+                )
+                clear_pending(message_id)
+                return
+
+            caption = MSG_FRAME_S_ONE_EVERY_S.format(frame_count=frame_count, interval=interval)
+
+            await with_retries(
+                context.bot.send_document,
+                chat_id=chat_id,
+                document=str(pdf_path),
+                filename="frames.pdf",
+                caption=caption,
+            )
+
+            # Keep the downloaded video (and its work_dir) around —
+            # the user can still auto-delete similar frames or jump
+            # into compression. It's only deleted if another video
+            # arrives or they tap "Finish session".
+            pending["interval"] = interval
+            pending["frames_dir"] = str(work_dir / "frames")
+            open_pdf_sessions[chat_id] = message_id
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=MSG_WHAT_WOULD_YOU_LIKE_TO,
+                reply_markup=post_pdf_keyboard(message_id, dedup_available=frame_count > 1),
+            )
+
+        except Exception as error:
+            logger.exception("Error extracting PDF:")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=MSG_SOMETHING_WENT_WRONG_EXTRACTING_FRAM.format(error=error),
+            )
+            clear_pending(message_id)
+
+        return
+
+    if action == "pdfauto":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        status_message = query.message
+
+        # Widen the sampling interval for long videos so we never
+        # extract+compare more than SMART_CAPTURE_MAX_CANDIDATES raw
+        # frames, regardless of how long the video is.
+        interval = SMART_CAPTURE_BASE_INTERVAL
+        if duration:
+            interval = max(SMART_CAPTURE_BASE_INTERVAL, duration / SMART_CAPTURE_MAX_CANDIDATES)
+
+        scan_label = MSG_SCANNING_THE_VIDEO_FOR_CHANGES.format(interval=interval)
+        await status_message.edit_text(f"{scan_label}\n{render_progress_bar(0)}")
+
+        try:
+            candidate_paths = await extract_frames_at_interval(
+                str(input_path),
+                work_dir,
+                interval,
+                total_duration=duration,
+                progress_callback=make_progress_editor(status_message, scan_label),
+            )
+
+            if not candidate_paths:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=MSG_COULDN_T_EXTRACT_ANY_FRAMES,
+                )
+                clear_pending(message_id)
+                return
+
+            compare_label = MSG_SAMPLED_FRAME_S_COMPARING_FOR.format(count_candidate_paths=len(candidate_paths))
+            await status_message.edit_text(f"{compare_label}\n{render_progress_bar(0)}")
+
+            kept_paths, removed_paths, threshold_used = await dedup_frames(
+                candidate_paths,
+                progress_callback=make_progress_editor(status_message, compare_label),
+            )
+
+            for path in removed_paths:
+                path.unlink(missing_ok=True)
+
+            pdf_path = work_dir / "frames.pdf"
+            pdf_bytes = img2pdf.convert([str(path) for path in kept_paths])
+            pdf_path.write_bytes(pdf_bytes)
+
+            caption = (
+                MSG_FRAME_S_KEPT_OUT_OF.format(count_kept_paths=len(kept_paths), count_candidate_paths=len(candidate_paths), interval=interval, threshold_used=threshold_used)
+            )
+
+            await with_retries(
+                context.bot.send_document,
+                chat_id=chat_id,
+                document=str(pdf_path),
+                filename="frames.pdf",
+                caption=caption,
+            )
+
+            # Keep the downloaded video (and its work_dir) around —
+            # the user can still auto-delete similar frames or jump
+            # into compression. It's only deleted if another video
+            # arrives or they tap "Finish session".
+            # These frames are already de-duplicated with this threshold: a later
+            # "auto-delete similar frames" must reuse it instead of working out a
+            # new one from frames that are all different (which deleted real slides).
+            pending["dedup_threshold"] = threshold_used
+            pending["interval"] = interval
+            pending["frames_dir"] = str(work_dir / "frames")
+            open_pdf_sessions[chat_id] = message_id
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=MSG_WHAT_WOULD_YOU_LIKE_TO,
+                reply_markup=post_pdf_keyboard(message_id, dedup_available=len(kept_paths) > 1),
+            )
+
+        except Exception as error:
+            logger.exception("Error during smart PDF capture:")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=MSG_SOMETHING_WENT_WRONG_SCANNING_THE.format(error=error),
+            )
+            clear_pending(message_id)
+
+        return
+
+    if action == "pdf3":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(MSG_THAT_VIDEO_ISN_T_IN_2)
+            return
+
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        status_message = query.message
+
+        if not duration or duration <= 0:
+            await status_message.edit_text(MSG_PDF3_NEEDS_DURATION)
+            return
+
+        # Same sampling rule as "Auto-detect changes", based on the WHOLE video,
+        # so the total number of sampled frames stays capped across all 3 parts.
+        interval = max(SMART_CAPTURE_BASE_INTERVAL, duration / SMART_CAPTURE_MAX_CANDIDATES)
+
+        # 33% / 33% / 34% of the timeline.
+        boundaries = [0.0, duration * 0.33, duration * 0.66, duration]
+        previous_signature: bytes | None = None   # last kept frame of the previous part
+        previous_text: str | None = None          # its words (OCR), if tesseract is installed
+        total_kept = 0
+        failed_parts = 0
+
+        try:
+            for part in (1, 2, 3):
+                part_start = boundaries[part - 1]
+                part_end = boundaries[part]
+                part_length = part_end - part_start
+                start_text = format_duration(part_start)
+                end_text = format_duration(part_end)
+
+                part_dir = work_dir / f"part{part}"
+                part_dir.mkdir(exist_ok=True)
+
+                scan_label = MSG_PDF3_SCANNING_PART.format(part=part, interval=interval)
+                await status_message.edit_text(f"{scan_label}\n{render_progress_bar(0)}")
+
+                candidate_paths = await extract_frames_at_interval(
+                    str(input_path),
+                    part_dir,
+                    interval,
+                    total_duration=part_length,
+                    progress_callback=make_progress_editor(status_message, scan_label),
+                    start=part_start,
+                    length=part_length,
+                )
+
+                if not candidate_paths:
+                    failed_parts += 1
+                    cleanup_work_dir(part_dir)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=MSG_PDF3_PART_FAILED.format(part=part, start=start_text, end=end_text),
+                    )
+                    continue
+
+                compare_label = MSG_PDF3_COMPARING_PART.format(part=part, count=len(candidate_paths))
+                await status_message.edit_text(f"{compare_label}\n{render_progress_bar(0)}")
+
+                kept_paths, removed_paths, threshold_used = await dedup_frames(
+                    candidate_paths,
+                    progress_callback=make_progress_editor(status_message, compare_label),
+                )
+
+                for path in removed_paths:
+                    path.unlink(missing_ok=True)
+
+                # A slide that continues across the cut between two parts must not
+                # show up twice: compare this part's first frame with the previous
+                # part's last kept frame.
+                if previous_signature is not None and kept_paths:
+                    first_signature = await compute_frame_signature(str(kept_paths[0]))
+                    same_as_previous = (
+                        first_signature is not None
+                        and frames_are_near_identical(first_signature, previous_signature, threshold_used)
+                    )
+                    if same_as_previous and previous_text is not None:
+                        # Looks the same — but did the words change across the cut?
+                        if ocr_verdict(previous_text, await ocr_frame_text(str(kept_paths[0]))) is False:
+                            same_as_previous = False
+                    if same_as_previous and len(kept_paths) > 1:
+                        kept_paths[0].unlink(missing_ok=True)
+                        kept_paths.pop(0)
+
+                if not kept_paths:
+                    failed_parts += 1
+                    cleanup_work_dir(part_dir)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=MSG_PDF3_PART_FAILED.format(part=part, start=start_text, end=end_text),
+                    )
+                    continue
+
+                previous_signature = await compute_frame_signature(str(kept_paths[-1]))
+                previous_text = await ocr_frame_text(str(kept_paths[-1]))
+
+                await status_message.edit_text(MSG_PDF3_BUILDING_PART.format(part=part))
+
+                pdf_path = part_dir / f"frames_part{part}.pdf"
+                pdf_bytes = await asyncio.to_thread(
+                    img2pdf.convert, [str(path) for path in kept_paths]
+                )
+                pdf_path.write_bytes(pdf_bytes)
+                del pdf_bytes
+
+                with named_for_upload(pdf_path, f"frames_part{part}.pdf") as send_path:
+                    await with_retries(
+                        context.bot.send_document,
+                        chat_id=chat_id,
+                        document=str(send_path),
+                        filename=f"frames_part{part}.pdf",
+                        caption=MSG_PDF3_PART_CAPTION.format(
+                            part=part,
+                            start=start_text,
+                            end=end_text,
+                            kept=len(kept_paths),
+                            sampled=len(candidate_paths),
+                            interval=interval,
+                            threshold=threshold_used,
+                        ),
+                    )
+
+                total_kept += len(kept_paths)
+
+                # Free the space NOW (frames + this part's PDF) before the next part starts.
+                cleanup_work_dir(part_dir)
+
+            if failed_parts == 3:
+                await status_message.edit_text(MSG_COULDN_T_EXTRACT_ANY_FRAMES)
+                clear_pending(message_id)
+                return
+
+            await status_message.edit_text(MSG_PDF3_DONE)
+
+            # The video stays so they can still compress it or finish the session.
+            # The frames are gone (that was the point), so no "auto-delete similar frames".
+            pending["interval"] = interval
+            open_pdf_sessions[chat_id] = message_id
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=MSG_WHAT_WOULD_YOU_LIKE_TO,
+                reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
+            )
+
+        except Exception as error:
+            logger.exception("Error during 3-part PDF extraction:")
+            for part in (1, 2, 3):
+                cleanup_work_dir(work_dir / f"part{part}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=MSG_SOMETHING_WENT_WRONG_EXTRACTING_FRAM.format(error=error),
+            )
+            clear_pending(message_id)
+
+        return
+
+    if action == "pdfdedup":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        frames_dir = pending.get("frames_dir")
+
+        if not frames_dir:
+            await query.message.reply_text(
+                MSG_NO_EXTRACTED_FRAMES_TO_COMPARE
+            )
+            return
+
+        frame_paths = sorted(Path(frames_dir).glob("frame_*.jpg"))
+
+        if len(frame_paths) < 2:
+            await query.answer(MSG_NOTHING_TO_COMPARE_NOT_ENOUGH, show_alert=True)
+            return
+
+        chat_id = pending["chat_id"]
+
+        await query.edit_message_text(MSG_COMPARING_FRAMES_FOR_NEAR_DUPLICATES)
+
+        try:
+            kept_paths, removed_paths, threshold_used = await dedup_frames(
+                frame_paths, threshold=pending.get("dedup_threshold")
+            )
+            pending["dedup_threshold"] = threshold_used
+
+            if not removed_paths:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        MSG_NO_EXTREMELY_SIMILAR_FRAMES_FOUND.format(threshold_used=threshold_used)
+                    ),
+                    reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
+                )
+                return
+
+            for path in removed_paths:
+                path.unlink(missing_ok=True)
+
+            work_dir = pending["work_dir"]
+            pdf_path = Path(work_dir) / "frames.pdf"
+            pdf_bytes = img2pdf.convert([str(path) for path in kept_paths])
+            pdf_path.write_bytes(pdf_bytes)
+
+            with named_for_upload(pdf_path, "frames_deduped.pdf") as send_path:
+                await with_retries(
+                    context.bot.send_document,
+                    chat_id=chat_id,
+                    document=str(send_path),
+                    filename="frames_deduped.pdf",
+                    caption=(
+                        MSG_REMOVED_NEAR_DUPLICATE_FRAME_S.format(count_removed_paths=len(removed_paths), count_kept_paths=len(kept_paths), threshold_used=threshold_used)
+                    ),
+                    reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
+                )
+
+        except Exception as error:
+            logger.exception("Error deduplicating frames:")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=MSG_SOMETHING_WENT_WRONG_REMOVING_SIMILA.format(error=error),
+            )
+
+        return
+
+    if action == "pdfcompress":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        chat_id = pending["chat_id"]
+
+        # The "Compress video" button can sit on the PDF *document*
+        # message (after "auto-delete similar frames"), and a document
+        # has no text to edit — editing it raises an error that used to
+        # be swallowed silently, so nothing appeared to happen. So
+        # instead of editing the tapped message, drop its buttons (stops
+        # double-taps) and post a fresh status message to work with.
+        with contextlib.suppress(Exception):
+            await query.edit_message_reply_markup(reply_markup=None)
+
+        status_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=MSG_GETTING_SAMPLES_READY,
+        )
+
+        async def post_wait_status(text: str) -> None:
+            await status_message.edit_text(text)
+
+        await acquire_work_slot(post_wait_status, user_priority(user_id), user_plan_label(user_id))
+        try:
+            await analyze_and_show_level_menu(
+                context,
+                status_message=status_message,
+                chat_id=chat_id,
+                message_id=message_id,
+                input_path=input_path,
+                duration=duration,
+                work_dir=work_dir,
+                original_size=pending["original_size"],
+                pending=pending,
+            )
+        finally:
+            release_work_slot()
+        return
+
+    if action == "pdffinish":
+        clear_pending(message_id)
+
+        finished_text = MSG_SESSION_FINISHED_THE_STORED_VIDEO
+
+        try:
+            await query.edit_message_text(finished_text)
+        except Exception:
+            # Tapped from the PDF document message (no text to edit):
+            # remove its buttons and post the confirmation instead.
+            with contextlib.suppress(Exception):
+                await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text(finished_text)
+        return
+
+    if action == "audioextract":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(MSG_THAT_VIDEO_ISN_T_IN_2)
+            return
+
+        has_audio, _ = await probe_audio_stream(str(pending["input_path"]))
+
+        if not has_audio:
+            await query.message.reply_text(MSG_EXTRACT_AUDIO_NO_AUDIO)
+            return
+
+        # Name the audio file after the video (unless it has a generic bot-made name
+        # or the person already chose a name).
+        video_stem = Path(pending.get("filename") or "").stem
+        if video_stem and not pending.get("out_name") and not re.fullmatch(r"video_\d+", video_stem):
+            pending["out_name"] = sanitize_filename(video_stem)
+
+        # Can the audio be copied out untouched ("Send as is")? Only for AAC / MP3.
+        source_info = await probe_video_info(str(pending["input_path"]))
+        pending["extract_audio"] = True
+        pending["extract_copy_ext"] = EXTRACT_COPY_EXTENSIONS.get(
+            (source_info or {}).get("audio_codec") or ""
+        )
+
+        duration = pending.get("duration")
+        audio_estimates = {
+            audio_key: estimate_audio_bytes(AUDIO_LEVELS[audio_key]["bitrate"], duration)
+            for audio_key in AUDIO_LEVEL_ORDER
+        }
+
+        await query.edit_message_text(
+            MSG_EXTRACT_AUDIO_PICK_QUALITY,
+            reply_markup=audio_keyboard(
+                message_id, AUDIO_ONLY_LEVEL, audio_estimates, DEFAULT_AUDIO_LEVEL,
+                from_video=True, copy_ok=pending["extract_copy_ext"] is not None,
+            ),
+        )
+        return
+
+    if action == "audioedit":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        has_audio, source_audio_bitrate = await probe_audio_stream(str(pending["input_path"]))
+
+        if not has_audio:
+            await query.message.reply_text(
+                MSG_THIS_VIDEO_HAS_NO_AUDIO
+            )
+            return
+
+        duration = pending.get("duration")
+        original_size = pending.get("original_size")
+
+        # The video is copied untouched, so the result is roughly:
+        # original size - the original audio track + the new audio track.
+        source_audio_bytes = (
+            int(source_audio_bitrate * duration / 8)
+            if source_audio_bitrate and duration else None
+        )
+
+        audio_estimates: dict[str, int | None] = {}
+        for audio_key in AUDIO_LEVEL_ORDER:
+            new_audio_bytes = estimate_audio_bytes(AUDIO_LEVELS[audio_key]["bitrate"], duration)
+            if original_size and source_audio_bytes is not None and new_audio_bytes is not None:
+                audio_estimates[audio_key] = max(0, original_size - source_audio_bytes) + new_audio_bytes
+            else:
+                audio_estimates[audio_key] = None
+
+        await query.edit_message_text(
+            MSG_JUST_EDITING_THE_AUDIO_THE,
+            reply_markup=audio_keyboard(message_id, AUDIO_EDIT_LEVEL, audio_estimates, DEFAULT_AUDIO_LEVEL),
+        )
+        return
+
+    if action == "audioreplace":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        awaiting_audio_replacement[chat_id] = message_id
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                MSG_SEND_ME_THE_NEW_AUDIO
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(BTN_CANCEL, callback_data=f"audioreplacecancel:_:{message_id}")
+            ]]),
+        )
+        return
+
+    if action == "audioreplacecancel":
+        pending = pending_compressions.get(message_id)
+        chat_id = pending["chat_id"] if pending else query.message.chat_id
+
+        if awaiting_audio_replacement.get(chat_id) == message_id:
+            awaiting_audio_replacement.pop(chat_id, None)
+
+        try:
+            await query.edit_message_text(
+                MSG_AUDIO_REPLACEMENT_CANCELLED_PICK_ANO
+            )
+        except Exception:
+            await query.message.reply_text(MSG_AUDIO_REPLACEMENT_CANCELLED)
+        return
+
+    if action == "splitask":
+        await start_split_prompt(query, context, message_id)
+        return
+
+    if action == "videocover":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        awaiting_input[chat_id] = {"mid": message_id, "field": "videocover"}
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                MSG_SEND_ME_THE_IMAGE_TO
+                + ("\n(A cover is already set — a new image replaces it.)" if pending.get("cover_path") else "")
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(BTN_CANCEL, callback_data=f"ameta:stop:{message_id}")
+            ]]),
+        )
+        return
+
+    if action == "ameta":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_FILE_ISN_T_IN
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        field = level
+
+        if field == "open":
+            pending["meta_panel_id"] = None
+            await show_audio_meta_panel(context, chat_id, message_id)
+            return
+
+        if field in ("name", "artist", "album", "cover"):
+            awaiting_input[chat_id] = {"mid": message_id, "field": field}
+            prompts = {
+                "name": MSG_SEND_THE_NEW_FILE_NAME,
+                "artist": MSG_SEND_THE_ARTIST_NAME_NOW,
+                "album": MSG_SEND_THE_ALBUM_NAME_NOW,
+                "cover": MSG_SEND_THE_ALBUM_COVER_NOW,
+            }
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=prompts[field],
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(BTN_CANCEL, callback_data=f"ameta:stop:{message_id}")
+                ]]),
+            )
+            return
+
+        if field == "stop":
+            if awaiting_input.get(chat_id, {}).get("mid") == message_id:
+                awaiting_input.pop(chat_id, None)
+            try:
+                await query.edit_message_text(MSG_CANCELLED)
+            except Exception:
+                pass
+            return
+
+        if field == "clear":
+            for key in ("out_name", "artist", "album", "cover_path", "cover_thumb_path"):
+                pending.pop(key, None)
+            await show_audio_meta_panel(context, chat_id, message_id)
+            return
+
+        if field == "done":
+            if awaiting_input.get(chat_id, {}).get("mid") == message_id:
+                awaiting_input.pop(chat_id, None)
+            pending["meta_panel_id"] = None
+            try:
+                await query.edit_message_text(
+                    audio_meta_text(pending).split("\n\nTap a button")[0]
+                    + MSG_SAVED_NOW_PICK_THE_QUALITY
+                )
+            except Exception:
+                pass
+            return
+
+        return
+
+    if action == "audioset":
+        try:
+            chosen_level, chosen_audio = level.split("|", 1)
+        except ValueError:
+            return
+
+        if not is_flow_level(chosen_level) or chosen_audio not in AUDIO_LEVELS:
+            return
+
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_FILE_ISN_T_IN
+            )
+            return
+
+        if chosen_audio == ORIGINAL_AUDIO:
+            # Nothing to enhance or boost when the audio is kept as is: go straight to compressing.
+            if chosen_level not in LEVELS:
+                return
+
+            await run_compression(
+                update, context,
+                input_path=pending["input_path"],
+                work_dir=pending["work_dir"],
+                original_size=pending["original_size"],
+                level=chosen_level,
+                chat_id=pending["chat_id"],
+                source_message_id=message_id,
+                status_message=query.message,
+                duration=pending.get("duration"),
+                audio_level=ORIGINAL_AUDIO,
+            )
+            return
+
+        header = flow_header(chosen_level, chosen_audio)
+
+        await query.edit_message_text(
+            MSG_OPTIONAL_AUDIO_ENHANCEMENTS_TOGGLE_T.format(header=header),
+            reply_markup=enhancement_keyboard(message_id, chosen_level, chosen_audio, False, False),
+        )
+        return
+
+    if action == "enhset":
+        try:
+            chosen_level, chosen_audio, flags_str = level.split("|", 2)
+            noise_reduction = flags_str[0] == "1"
+            voice_enhancement = flags_str[1] == "1"
+        except (ValueError, IndexError):
+            return
+
+        if not is_flow_level(chosen_level) or chosen_audio not in AUDIO_LEVELS:
+            return
+
+        header = flow_header(chosen_level, chosen_audio)
+
+        await query.edit_message_text(
+            MSG_OPTIONAL_AUDIO_ENHANCEMENTS_TOGGLE_T.format(header=header),
+            reply_markup=enhancement_keyboard(
+                message_id, chosen_level, chosen_audio, noise_reduction, voice_enhancement
+            ),
+        )
+        return
+
+    if action == "enhpreview":
+        try:
+            chosen_level, chosen_audio, flags_str = level.split("|", 2)
+            noise_reduction = flags_str[0] == "1"
+            voice_enhancement = flags_str[1] == "1"
+        except (ValueError, IndexError):
+            return
+
+        if not is_flow_level(chosen_level) or chosen_audio not in AUDIO_LEVELS:
+            return
+
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_FILE_ISN_T_IN
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        audio_bitrate = AUDIO_LEVELS[chosen_audio]["bitrate"]
+        header = flow_header(chosen_level, chosen_audio)
+
+        await query.edit_message_text(
+            MSG_GENERATING_S_ENHANCEMENT_PREVIEWS_ON.format(ENHANCEMENT_PREVIEW_SECONDS=ENHANCEMENT_PREVIEW_SECONDS)
+        )
+
+        sample_duration = (
+            min(ENHANCEMENT_PREVIEW_SECONDS, duration) if duration else ENHANCEMENT_PREVIEW_SECONDS
+        )
+        seek = max(0.0, (duration - sample_duration) / 2) if duration else 0.0
+
+        # The same clip four ways, so they can be compared directly.
+        variants = [
+            ("original", "Original (no enhancement)", False, False),
+            ("noise", MSG_NOISE_REDUCTION_2, True, False),
+            ("voice", MSG_VOICE_ENHANCEMENT_2, False, True),
+            ("both", MSG_BOTH_TOGETHER, True, True),
+        ]
+
+        preview_semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
+
+        async def bounded_enhancement_preview(key, label, nr, ve):
+            preview_path = work_dir / f"preview_enh_{key}.m4a"
+            async with preview_semaphore:
+                ok = await generate_volume_preview(
+                    str(input_path), str(preview_path), seek, sample_duration, audio_bitrate, 0,
+                    noise_reduction=nr, voice_enhancement=ve,
+                )
+            return label, (preview_path if ok else None)
+
+        results = await asyncio.gather(
+            *(bounded_enhancement_preview(*variant) for variant in variants)
+        )
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=MSG_S_PREVIEW_OF_THE_SAME.format(sample_duration=sample_duration),
+        )
+
+        for label, preview_path in results:
+            if preview_path is None:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=MSG_COULDN_T_GENERATE_THE_PREVIEW.format(label=label)
+                )
+                continue
+
+            try:
+                await with_retries(
+                    context.bot.send_audio,
+                    chat_id=chat_id,
+                    audio=str(preview_path),
+                    title=label,
+                    caption=label,
+                )
+            finally:
+                preview_path.unlink(missing_ok=True)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=MSG_OPTIONAL_AUDIO_ENHANCEMENTS_TOGGLE_T.format(header=header),
+            reply_markup=enhancement_keyboard(
+                message_id, chosen_level, chosen_audio, noise_reduction, voice_enhancement
+            ),
+        )
+        return
+
+    if action == "enhcontinue":
+        try:
+            chosen_level, chosen_audio, flags_str = level.split("|", 2)
+            noise_reduction = flags_str[0] == "1"
+            voice_enhancement = flags_str[1] == "1"
+        except (ValueError, IndexError):
+            return
+
+        if not is_flow_level(chosen_level) or chosen_audio not in AUDIO_LEVELS:
+            return
+
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_FILE_ISN_T_IN
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        audio_bitrate = AUDIO_LEVELS[chosen_audio]["bitrate"]
+
+        enhancement_bits = []
+        if noise_reduction:
+            enhancement_bits.append(MSG_NOISE_REDUCTION_3)
+        if voice_enhancement:
+            enhancement_bits.append(MSG_VOICE_ENHANCEMENT_3)
+        enhancement_note = f" ({' + '.join(enhancement_bits)})" if enhancement_bits else ""
+
+        await query.edit_message_text(
+            MSG_GENERATING_S_PREVIEWS_AT_EACH.format(VOLUME_PREVIEW_SECONDS=VOLUME_PREVIEW_SECONDS, enhancement_note=enhancement_note)
+        )
+
+        sample_duration = min(VOLUME_PREVIEW_SECONDS, duration) if duration else VOLUME_PREVIEW_SECONDS
+        seek = max(0.0, (duration - sample_duration) / 2) if duration else 0.0
+
+        preview_semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
+
+        async def bounded_preview(boost: int) -> tuple[int, Path | None]:
+            preview_path = work_dir / f"preview_{boost}.m4a"
+            async with preview_semaphore:
+                ok = await generate_volume_preview(
+                    str(input_path), str(preview_path), seek, sample_duration, audio_bitrate, boost,
+                    noise_reduction=noise_reduction, voice_enhancement=voice_enhancement,
+                )
+            return boost, (preview_path if ok else None)
+
+        results = await asyncio.gather(*(bounded_preview(boost) for boost in VOLUME_BOOST_OPTIONS))
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=MSG_S_PREVIEW_AT_EACH_VOLUME.format(sample_duration=sample_duration, enhancement_note=enhancement_note),
+        )
+
+        for sample_number, (boost, preview_path) in enumerate(
+            sorted(results, key=lambda item: item[0]), start=1
+        ):
+            label = "No boost" if boost == 0 else f"+{boost}%"
+
+            if preview_path is None:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=MSG_COULDN_T_GENERATE_A_PREVIEW.format(label=label)
+                )
+                continue
+
+            try:
+                await with_retries(
+                    context.bot.send_audio,
+                    chat_id=chat_id,
+                    audio=str(preview_path),
+                    title=MSG_VOLUME_SAMPLE_TITLE.format(number=sample_number),
+                    performer=VOLUME_SAMPLE_PERFORMER,
+                    caption=MSG_HANDLE_CALLBACK_INNER.format(label=label),
+                )
+            finally:
+                preview_path.unlink(missing_ok=True)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=MSG_PICK_A_VOLUME_LEVEL,
+            reply_markup=volume_keyboard(
+                message_id, chosen_level, chosen_audio, noise_reduction, voice_enhancement
+            ),
+        )
+        return
+
+    if action == "volumeset":
+        try:
+            chosen_level, chosen_audio, boost_str, flags_str = level.split("|", 3)
+            boost = int(boost_str)
+            noise_reduction = flags_str[0] == "1"
+            voice_enhancement = flags_str[1] == "1"
+        except (ValueError, IndexError):
+            return
+
+        if (
+            not is_flow_level(chosen_level)
+            or chosen_audio not in AUDIO_LEVELS
+            or boost not in VOLUME_BOOST_OPTIONS
+        ):
+            return
+
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_FILE_ISN_T_IN
+            )
+            return
+
+        await run_compression(
+            update, context,
+            input_path=pending["input_path"],
+            work_dir=pending["work_dir"],
+            original_size=pending["original_size"],
+            level=None if chosen_level == AUDIO_ONLY_LEVEL else chosen_level,
+            chat_id=pending["chat_id"],
+            source_message_id=message_id,
+            status_message=query.message,
+            duration=pending.get("duration"),
+            audio_level=chosen_audio,
+            volume_boost_percent=boost,
+            noise_reduction=noise_reduction,
+            voice_enhancement=voice_enhancement,
+        )
+        return
+
+    if action == "audiosend":
+        pending = pending_compressions.get(message_id)
+
+        is_extraction = bool(pending and pending.get("extract_audio"))
+
+        if pending is None or (pending.get("media_type") != "audio" and not is_extraction):
+            await query.message.reply_text(MSG_THAT_FILE_ISN_T_IN)
+            return
+
+        if is_extraction and not pending.get("extract_copy_ext"):
+            await query.message.reply_text(MSG_EXTRACT_AUDIO_CANT_COPY)
+            return
+
+        if message_id in active_job_ids:
+            return   # already being processed: ignore a double tap
+
+        if awaiting_input.get(pending["chat_id"], {}).get("mid") == message_id:
+            awaiting_input.pop(pending["chat_id"], None)   # they moved on from a half-finished prompt
+
+        await run_compression(
+            update, context,
+            input_path=pending["input_path"],
+            work_dir=pending["work_dir"],
+            original_size=pending["original_size"],
+            level=AUDIO_COPY_LEVEL,
+            chat_id=pending["chat_id"],
+            source_message_id=message_id,
+            status_message=query.message,
+            duration=pending.get("duration"),
+            audio_level=ORIGINAL_AUDIO,
+        )
+        return
+
+    if action == "coveronly":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(MSG_THAT_VIDEO_ISN_T_IN_2)
+            return
+
+        cover_file = pending.get("cover_path")
+
+        if not cover_file or not Path(cover_file).exists():
+            await query.message.reply_text(MSG_THAT_VIDEO_ISN_T_IN_2)
+            return
+
+        if message_id in active_job_ids:
+            return   # already being processed: ignore a double tap
+
+        await run_compression(
+            update, context,
+            input_path=pending["input_path"],
+            work_dir=pending["work_dir"],
+            original_size=pending["original_size"],
+            level=COVER_ONLY_LEVEL,
+            chat_id=pending["chat_id"],
+            source_message_id=message_id,
+            status_message=query.message,
+            duration=pending.get("duration"),
+        )
+        return
+
+    if action == "levelback":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        menu_text = pending.get("menu_text")
+        if not menu_text:
+            return
+
+        level_menu_args = (
+            message_id,
+            pending.get("estimates", {}),
+            pending.get("default_level"),
+            pending.get("smart"),
+            pending.get("original_size"),
+        )
+
+        try:
+            await query.edit_message_text(
+                menu_text, reply_markup=estimate_keyboard(*level_menu_args)
+            )
+        except BadRequest:
+            await query.edit_message_text(
+                menu_text, reply_markup=estimate_keyboard(*level_menu_args, styled=False)
+            )
+        return
+
+    if level not in LEVELS:
+        return
+
+    if action == "smart":
+        pending = pending_compressions.get(message_id)
+        recommendation = pending.get("smart") if pending else None
+
+        if pending is None or recommendation is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        await run_compression(
+            update, context,
+            input_path=pending["input_path"],
+            work_dir=pending["work_dir"],
+            original_size=pending["original_size"],
+            level=recommendation["level"],
+            chat_id=pending["chat_id"],
+            source_message_id=message_id,
+            status_message=query.message,
+            duration=pending.get("duration"),
+            audio_level=recommendation["audio_level"],
+            max_fps=recommendation.get("max_fps"),
+            smart=True,
+        )
+        return
+
+    if action == "compress":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        duration = pending.get("duration")
+        level_settings = LEVELS[level]
+        total_estimate = pending.get("estimates", {}).get(level)
+
+        if level_grows_file(total_estimate, pending.get("original_size")):
+            await query.message.reply_text(MSG_LEVEL_WOULD_GROW_FILE)
+            return
+
+        # Back out roughly how much of that level's estimate is audio
+        # (using the level's own default audio bitrate) so each audio
+        # quality option can be re-estimated without any extra encoding.
+        default_audio_estimate = estimate_audio_bytes(level_settings["audio_bitrate"], duration)
+        video_only_estimate = None
+        if total_estimate is not None and default_audio_estimate is not None:
+            video_only_estimate = max(0, total_estimate - default_audio_estimate)
+
+        audio_estimates: dict[str, int | None] = {}
+        for audio_key in AUDIO_LEVEL_ORDER:
+            audio_bytes = estimate_audio_bytes(AUDIO_LEVELS[audio_key]["bitrate"], duration)
+            if video_only_estimate is not None and audio_bytes is not None:
+                audio_estimates[audio_key] = video_only_estimate + audio_bytes
+            else:
+                audio_estimates[audio_key] = None
+
+        # "Original" keeps the source audio as is: video estimate + the source's own audio size.
+        source_info = ((pending or {}).get("smart") or {}).get("info") or {}
+        if source_info.get("has_audio") is False:
+            source_audio_bytes = 0
+        elif source_info.get("audio_bps") and duration:
+            source_audio_bytes = int(source_info["audio_bps"] * duration / 8)
+        else:
+            source_audio_bytes = None
+        audio_estimates[ORIGINAL_AUDIO] = (
+            video_only_estimate + source_audio_bytes
+            if video_only_estimate is not None and source_audio_bytes is not None
+            else None
+        )
+
+        await query.edit_message_text(
+            MSG_SELECTED_NOW_PICK_AUDIO_QUALITY.format(level_settings_label=level_settings['label']),
+            reply_markup=audio_keyboard(message_id, level, audio_estimates, DEFAULT_AUDIO_LEVEL),
+        )
+        return
+
+
+# ============================================================
+# Error handler
+# ============================================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled Telegram error:", exc_info=context.error)
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+    logger.info("Starting Telegram Video Compressor...")
+    load_approved_users()
+    logger.info("Local Bot API URL: %s", TELEGRAM_API_URL)
+
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .base_url(f"{TELEGRAM_API_URL}/bot{{token}}")
+        .base_file_url(f"{TELEGRAM_API_URL}/file/bot{{token}}")
+        .local_mode(True)
+        # Defaults here are just a few seconds, which is nowhere near
+        # enough for large video downloads/uploads through the Local
+        # Bot API server — this is almost certainly why timeouts were
+        # happening in the first place.
+        .read_timeout(600)
+        .write_timeout(600)
+        .connect_timeout(60)
+        .pool_timeout(60)
+        .media_write_timeout(600)
         .post_init(post_init)
         .post_stop(post_stop)
+        .concurrent_updates(CONCURRENT_UPDATES if CONCURRENT_UPDATES > 0 else False)
         .build()
     )
-    app.add_handler(TypeHandler(Update, track_activity), group=-1)
-    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu))
-    app.add_handler(CommandHandler("how_to_use", howto_cmd))
-    app.add_handler(CommandHandler("settings", settings_cmd))
-    app.add_handler(CommandHandler("goal", goal_cmd))
-    app.add_handler(CommandHandler("prayer", prayer_cmd))
-    app.add_handler(CommandHandler("today", today_cmd))
-    app.add_handler(CommandHandler("pages", pages_cmd))
-    app.add_handler(CommandHandler("time", time_cmd))
-    app.add_handler(CommandHandler("progress", progress_cmd))
-    app.add_handler(CommandHandler("setpage", setpage_cmd))
-    app.add_handler(CommandHandler("timezone", timezone_cmd))
-    app.add_handler(CommandHandler("stop", stop_cmd))
-    app.add_handler(CommandHandler("backup", backup_cmd))
-    app.add_handler(CommandHandler("health", health_cmd))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.LOCATION, on_location))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text)
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("setlevel", setlevel))
+    application.add_handler(CommandHandler("merge", merge_command))
+    application.add_handler(CommandHandler("mergeaudio", mergeaudio_command))
+    application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("ram", ram_command))
+    application.add_handler(CommandHandler("ram_clean", ram_clean_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("reset_stats", reset_stats_command))
+    application.add_handler(CommandHandler("update", update_command))
+    # Runs before everything else (group -2): people must join the channel first.
+    application.add_handler(TypeHandler(Update, capture_referral), group=-3)
+    application.add_handler(TypeHandler(Update, require_channel_membership), group=-2)
+    # Then (group -1) keep the user list current.
+    application.add_handler(TypeHandler(Update, track_user), group=-1)
+    application.add_handler(CommandHandler("limit", limit_command))
+    application.add_handler(CommandHandler("plans", plans_command))
+    application.add_handler(CommandHandler("invite", invite_command))
+    application.add_handler(CommandHandler("subscribe", subscribe_command))
+    application.add_handler(CommandHandler("grant", grant_command))
+    application.add_handler(CommandHandler("revoke", revoke_command))
+    application.add_handler(CommandHandler("event", event_command))
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("subs", subs_command))
+    application.add_handler(CommandHandler("newlink", newlink_command))
+    application.add_handler(CommandHandler("links", links_command))
+    application.add_handler(CommandHandler("stoplink", stoplink_command))
+    application.add_handler(CommandHandler("resumelink", resumelink_command))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # Admin forwards a text post from the backup channel -> bot replies with the channel ID.
+    application.add_handler(
+        MessageHandler(filters.FORWARDED & filters.TEXT & ~filters.COMMAND, report_forwarded_channel_id)
     )
-    app.run_polling()
+    # The five menu buttons of the Telegram keyboard (must come BEFORE the plain-text handler below).
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex("^(?:" + "|".join(re.escape(label) for label in REPLY_MENU_LABELS) + ")$"),
+            reply_menu_button,
+        )
+    )
+    # Plain text = a new file name / album name, but only while a prompt is open.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
+    # Must come BEFORE the general button handler: the first matching
+    # handler wins, and access-request buttons have their own format.
+    application.add_handler(CallbackQueryHandler(handle_access_decision, pattern=r"^access:"))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_error_handler(error_handler)
+
+    logger.info("Bot is running.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    if RESTART_REQUESTED:
+        # run_polling() has returned: the bot stopped cleanly and its last backup is saved.
+        logger.info("Restarting the bot process (/ram_clean)...")
+        os.environ[RESTART_ENV_FLAG] = str(time.time())
+
+        try:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+        except OSError:
+            logger.exception("Couldn't restart in place — exiting so the host restarts the bot.")
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
