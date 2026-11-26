@@ -24,7 +24,7 @@ from xml.etree import ElementTree as _ET
 from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import img2pdf
 from telegram import (
@@ -119,6 +119,8 @@ MSG_HI_SEND_ME_A_VIDEO = (
     "3️⃣ Pick a level and an audio quality.\n"
     "4️⃣ Get your compressed file ✅\n"
     "\n"
+    "🔗 Or paste YouTube / Facebook video links (several at once) and I'll send you the videos.\n"
+    "\n"
     "💎 Subscriptions\n"
     "{plans}\n"
     "⚡ Each plan is served before the smaller ones: Pro → Plus → Free.\n"
@@ -180,6 +182,7 @@ MSG_ABOUT_THIS_BOT_COMPRESSES_VIDEOS = (
     "🎧 Compresses audio files too.\n"
     "🏷 Renames audio and sets artist / album / cover — with or without compression.\n"
     "📄 Turns a video into a PDF of its frames.\n"
+    "🔗 Downloads YouTube and Facebook videos from links — paste several and get them one by one.\n"
     "\n"
     "🔒 Your files are deleted as soon as they're processed{idle}.\n"
     "💎 Free to use with daily limits — see Subscribe for more."
@@ -1445,12 +1448,14 @@ async def report_forwarded_channel_id(update: Update, context: ContextTypes.DEFA
     message = update.effective_message
     user_id = update.effective_user.id if update.effective_user else None
 
-    if message is None or not is_admin(user_id):
+    if message is None:
         return
 
     origin_chat = getattr(getattr(message, "forward_origin", None), "chat", None)
 
-    if origin_chat is None or getattr(origin_chat, "type", None) != "channel":
+    if not is_admin(user_id) or origin_chat is None or getattr(origin_chat, "type", None) != "channel":
+        # Not the admin's channel-ID trick: it's an ordinary forwarded text (it may hold video links).
+        await handle_text_input(update, context)
         return
 
     await message.reply_text(
@@ -10364,6 +10369,15 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     chat_id = message.chat_id
     waiting = awaiting_input.get(chat_id)
 
+    # YouTube / Facebook links -> download them one by one. While the bot is waiting for a
+    # name / album, only a message made of nothing but links counts (so a real name never
+    # gets hijacked, and a stale prompt never swallows pasted links).
+    video_links = extract_video_links(message)
+
+    if video_links and (waiting is None or message_is_only_links(message)):
+        await handle_video_links(update, context, video_links)
+        return
+
     if waiting is None:
         # No name/album prompt pending: if a PDF session is open, numbers
         # like "2 5 11 16" mean "delete these pages from the PDF".
@@ -10447,6 +10461,644 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await apply_cover_image(update, context, message.photo[-1].file_id)
+
+
+# ============================================================
+# Video links (YouTube / Facebook)
+# ============================================================
+#
+# Paste one or more YouTube / Facebook video links in a message (as many as
+# DOWNLOAD_MAX_LINKS) and the bot downloads them ONE BY ONE and sends each video
+# as soon as it is ready, in the same order the links were pasted.
+#
+# • Every link takes the shared work slot (the same single slot that compressions
+#   use), so RAM stays under control and paying users are still served first.
+# • Link downloads do NOT count toward the daily limit by default
+#   (set DOWNLOAD_COUNTS_TOWARD_LIMIT=1 to make them count like any other file).
+# • The video is picked to fit Telegram's upload limit and the user's per-file
+#   limit, preferring H.264/MP4 so it plays right inside Telegram.
+# • A "Cancel" button under the status message stops the current link and skips
+#   the rest of that message's links.
+#
+# Needs:   pip install -U "yt-dlp[default]"      (the [default] part brings yt-dlp-ejs)
+#          + a JavaScript runtime on the server for YouTube (deno, or node 22+).
+# Optional variables:
+#   DOWNLOAD_MAX_LINKS        links taken from one message            (default 50)
+#   DOWNLOAD_MAX_HEIGHT       highest video height to fetch, 0 = any   (default 1080)
+#   DOWNLOAD_MAX_MINUTES      longest video allowed, 0 = any           (default 180)
+#   DOWNLOAD_COOKIES_FILE     cookies.txt (Netscape format) — helps with YouTube's
+#                             "confirm you're not a bot" check and private Facebook videos
+#   DOWNLOAD_JS_RUNTIME       e.g. "node" if you use node instead of deno
+#   DOWNLOAD_COUNTS_TOWARD_LIMIT  1 / 0                                (default 0)
+
+DOWNLOAD_MAX_LINKS = int(os.getenv("DOWNLOAD_MAX_LINKS", "50"))
+DOWNLOAD_MAX_HEIGHT = int(os.getenv("DOWNLOAD_MAX_HEIGHT", "1080"))
+DOWNLOAD_MAX_MINUTES = int(os.getenv("DOWNLOAD_MAX_MINUTES", "180"))
+DOWNLOAD_COOKIES_FILE = os.getenv("DOWNLOAD_COOKIES_FILE", "").strip()
+DOWNLOAD_JS_RUNTIME = os.getenv("DOWNLOAD_JS_RUNTIME", "").strip()
+DOWNLOAD_COUNTS_TOWARD_LIMIT = os.getenv("DOWNLOAD_COUNTS_TOWARD_LIMIT", "0").strip().lower() not in ("0", "false", "no")
+
+# Only links on these sites are picked up (anything else in a message is ignored).
+VIDEO_LINK_HOSTS = (
+    "youtube.com", "youtu.be", "youtube-nocookie.com",
+    "facebook.com", "fb.watch", "fb.com",
+)
+
+BTN_LINK_CANCEL = "🛑 Cancel"
+MSG_LINKS_NOT_SET_UP = "⚠️ Downloading from links isn't set up on this server yet."
+MSG_LINKS_FOUND = "🔗 Found {count} video links — I'll download them one by one and send each as soon as it's ready."
+MSG_LINKS_TOO_MANY = "\n⚠️ I take up to {max} links per message, so the last {skipped} won't be downloaded — send them again afterwards."
+MSG_LINK_PREFIX = "🎬 Video {index} of {total}\n"
+MSG_LINK_CHECKING = "🔍 Checking the link…"
+MSG_LINK_DOWNLOADING = "⬇️ Downloading…\n{title}\n{bar}\n{done} of {total}"
+MSG_LINK_DOWNLOADING_UNKNOWN = "⬇️ Downloading…\n{title}\n{done} so far"
+MSG_LINK_FINISHING = "⚙️ Finishing the file…\n{title}"
+MSG_LINK_SENDING = "📤 Sending…\n{title}"
+MSG_LINK_FAILED = "❌ Couldn't download this link:\n{url}\n\n{reason}"
+MSG_LINK_CANCELLED = "🛑 Cancelled."
+MSG_LINKS_SKIPPED_CANCELLED = "🛑 Cancelled — skipped {count} more link(s)."
+MSG_LINKS_SKIPPED_LIMIT = "⏹ Stopped — your daily limit is used up, so I skipped {count} more link(s)."
+MSG_LINKS_SUMMARY = "✅ Done — {ok} of {total} videos sent."
+MSG_LINK_TOO_LATE = "That download is already finished."
+MSG_LINK_REASON_PRIVATE = "This video is private, age-restricted or needs a login, so I can't get it. (Facebook: only public videos work.)"
+MSG_LINK_REASON_BLOCKED = "YouTube is blocking the server right now. Please try again a little later."
+MSG_LINK_REASON_UNAVAILABLE = "This video isn't available any more (removed, private, or blocked in the server's country)."
+MSG_LINK_REASON_UNSUPPORTED = "That isn't a link to a single video I can read. Send the direct link of one video."
+MSG_LINK_REASON_GENERIC = "Something went wrong while downloading ({detail})."
+MSG_LINK_PLAYLIST = "That link is a playlist / page, not a single video. Send the link of one video."
+MSG_LINK_LIVE = "That's a live stream — I can only download videos that have finished."
+MSG_LINK_TOO_LONG = "⛔ This video is {length} long, and I only take videos up to {max}."
+MSG_LINK_TOO_BIG = "⛔ This video would be about {size}, which is over Telegram's {limit} upload limit."
+MSG_LINK_EMPTY = "Nothing was downloaded — the site didn't give me a video file."
+
+_URL_RE = re.compile(r"https?://[^\s<>\"'“”‘’]+", re.IGNORECASE)
+_URL_TRAILING = ".,;:!?)]}>»…"
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_VIDEO_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".flv", ".avi")
+
+download_batches: dict[int, dict] = {}
+_download_batch_ids = itertools.count(1)
+
+
+class DownloadCancelled(Exception):
+    """The person tapped Cancel."""
+
+
+class LinkRefused(Exception):
+    """A clear, user-facing reason this link can't be served (not a bot error)."""
+
+    def __init__(self, text: str, stop_batch: bool = False) -> None:
+        super().__init__(text)
+        self.text = text
+        self.stop_batch = stop_batch
+
+
+def _is_video_link_host(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+
+    return any(host == site or host.endswith("." + site) for site in VIDEO_LINK_HOSTS)
+
+
+def _link_key(url: str) -> str:
+    return re.sub(r"^https?://", "", url.strip().lower()).rstrip("/")
+
+
+def extract_video_links(message) -> list[str]:
+    """YouTube / Facebook links in a message, in the order they were written, without duplicates."""
+    text = message.text or message.caption or ""
+    found: list[tuple[int, str]] = []
+
+    entities = message.entities if message.text else message.caption_entities
+    for entity in entities or []:
+        if entity.type == "text_link" and entity.url:
+            found.append((entity.offset, entity.url))
+        elif entity.type == "url":
+            raw = text.encode("utf-16-le")[entity.offset * 2:(entity.offset + entity.length) * 2].decode("utf-16-le")
+            found.append((entity.offset, raw if raw.lower().startswith("http") else "https://" + raw))
+
+    for match in _URL_RE.finditer(text):
+        offset = len(text[:match.start()].encode("utf-16-le")) // 2
+        found.append((offset, match.group(0).rstrip(_URL_TRAILING)))
+
+    links: list[str] = []
+    seen: set[str] = set()
+
+    for _, url in sorted(found, key=lambda item: item[0]):
+        if not _is_video_link_host(url) or _link_key(url) in seen:
+            continue
+
+        seen.add(_link_key(url))
+        links.append(url)
+
+    return links
+
+
+def message_is_only_links(message) -> bool:
+    """True when the message has nothing but links in it (so it can't be a name / album the bot is waiting for)."""
+    leftover = _URL_RE.sub("", message.text or "")
+    return not re.sub(r"[\s,;|•\-–—]+", "", leftover)
+
+
+def build_download_format(max_height: int, cap_bytes: int) -> str:
+    """
+    yt-dlp format picker: H.264 + AAC in MP4 first (plays inside Telegram), at most max_height,
+    each stream small enough to fit cap_bytes. The last choices drop the limits so a too-big
+    video is refused with a clear message instead of a vague "format not available".
+    """
+    height = f"[height<={max_height}]" if max_height > 0 else ""
+    size = f"[filesize<?{cap_bytes}][filesize_approx<?{cap_bytes}]"
+    return (
+        f"bv*[vcodec^=avc1]{height}{size}+ba[ext=m4a]{size}"
+        f"/b[vcodec^=avc1]{height}{size}"
+        f"/bv*{height}{size}+ba{size}"
+        f"/b{height}{size}"
+        f"/bv*{height}+ba/b{height}/b"
+    )
+
+
+def download_size_cap(user_id: int | None) -> int:
+    """Biggest file worth downloading for this person (Telegram limit, their plan, what's left of today)."""
+    cap = TELEGRAM_UPLOAD_LIMIT_BYTES
+
+    if user_id is not None and not is_unlimited(user_id) and TIERS[get_tier(user_id)]["max_file_mb"] > 0:
+        cap = min(cap, max_file_bytes(user_id))
+
+    if DOWNLOAD_COUNTS_TOWARD_LIMIT and quota_applies(user_id):
+        left = daily_limit_bytes(user_id) - quota_used_bytes(user_id)
+        if left > 0:
+            cap = min(cap, left)
+
+    return max(cap, 1)
+
+
+def estimate_download_bytes(info: dict) -> int | None:
+    total = 0
+
+    for fmt in info.get("requested_formats") or [info]:
+        size = fmt.get("filesize") or fmt.get("filesize_approx")
+        if not size:
+            return None
+        total += int(size)
+
+    return total or None
+
+
+def describe_download_error(error: Exception) -> str:
+    text = _ANSI_RE.sub("", str(error)).strip()
+    lower = text.lower()
+
+    if "not a bot" in lower or "http error 429" in lower or "too many requests" in lower:
+        return MSG_LINK_REASON_BLOCKED
+
+    if "requested format" in lower:
+        return MSG_LINK_REASON_GENERIC.format(detail="no suitable video format")
+
+    if any(word in lower for word in (
+        "private", "login", "log in", "sign in", "cookies", "age-restricted",
+        "confirm your age", "age verification", "members-only", "members only", "cannot parse data",
+    )):
+        return MSG_LINK_REASON_PRIVATE
+
+    if "unsupported url" in lower or "no video" in lower or "no video formats" in lower:
+        return MSG_LINK_REASON_UNSUPPORTED
+
+    if any(word in lower for word in ("unavailable", "removed", "deleted", "not available", "geo", "does not exist", "copyright")):
+        return MSG_LINK_REASON_UNAVAILABLE
+
+    detail = text.splitlines()[0] if text else type(error).__name__
+    detail = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?", "", detail)
+    return MSG_LINK_REASON_GENERIC.format(detail=detail[:160])
+
+
+def _ytdlp_options(work_dir: Path, fmt: str, hook) -> dict:
+    options: dict = {
+        "format": fmt,
+        "merge_output_format": "mp4",
+        "outtmpl": str(work_dir / "video.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "restrictfilenames": True,
+        "cachedir": False,
+        "socket_timeout": 30,
+        "retries": 5,
+        "fragment_retries": 5,
+        "concurrent_fragment_downloads": 4,
+        "progress_hooks": [hook],
+    }
+
+    if DOWNLOAD_COOKIES_FILE and Path(DOWNLOAD_COOKIES_FILE).is_file():
+        # A private copy: yt-dlp writes the cookie file back when it finishes.
+        cookies_copy = work_dir / "cookies.txt"
+        shutil.copyfile(DOWNLOAD_COOKIES_FILE, cookies_copy)
+        options["cookiefile"] = str(cookies_copy)
+
+    if DOWNLOAD_JS_RUNTIME:
+        options["js_runtimes"] = {DOWNLOAD_JS_RUNTIME: {}}
+
+    return options
+
+
+def _ytdlp_probe(url: str, options: dict) -> dict:
+    """Blocking (runs in a thread): read the video's details without downloading it."""
+    import yt_dlp
+
+    with yt_dlp.YoutubeDL({**options, "progress_hooks": []}) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return ydl.sanitize_info(info)
+
+
+def _ytdlp_download(url: str, options: dict) -> None:
+    """Blocking (runs in a thread): download the video into the work folder."""
+    import yt_dlp
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.extract_info(url, download=True)
+
+
+async def _acquire_slot_cancellable(batch: dict, post_status, priority: int, plan_label: str | None) -> bool:
+    """Wait for the shared work slot; False if the person cancelled while waiting in line."""
+    task = asyncio.ensure_future(acquire_work_slot(post_status, priority, plan_label))
+    batch["acquire_task"] = task
+
+    try:
+        await task
+        return True
+    except asyncio.CancelledError:
+        if batch["cancelled"]:
+            return False
+        raise
+    finally:
+        batch["acquire_task"] = None
+
+
+async def process_video_link(context, chat_id: int, user, url: str, index: int, total: int, batch: dict) -> str:
+    """
+    Download one link and send it. Returns "ok", "failed", "refused", "cancelled" or "limit"
+    ("limit" = the daily limit is used up, so the rest of the batch is pointless).
+    """
+    user_id = user.id if user else None
+    prefix = MSG_LINK_PREFIX.format(index=index, total=total) if total > 1 else ""
+    cancel_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(BTN_LINK_CANCEL, callback_data=f"dl:cancel:{batch['id']}")]]
+    )
+    no_preview = LinkPreviewOptions(is_disabled=True)
+
+    status_message = None
+    last_text: str | None = None
+    work_dir: Path | None = None
+    slot_held = False
+    charged = 0
+    title = ""
+
+    async def post_status(text: str, markup=cancel_markup) -> None:
+        nonlocal status_message, last_text
+        full = prefix + text
+
+        if status_message is not None and full == last_text:
+            return
+
+        if status_message is None:
+            status_message = await context.bot.send_message(
+                chat_id=chat_id, text=full, reply_markup=markup, link_preview_options=no_preview,
+            )
+        else:
+            await status_message.edit_text(full, reply_markup=markup, link_preview_options=no_preview)
+
+        last_text = full
+
+    async def show_final(text: str) -> None:
+        with contextlib.suppress(Exception):
+            await post_status(text, markup=None)
+
+        if status_message is None:
+            with contextlib.suppress(Exception):
+                await context.bot.send_message(chat_id=chat_id, text=prefix + text, link_preview_options=no_preview)
+
+    try:
+        # Out of daily limit already? Don't even wait in line.
+        if DOWNLOAD_COUNTS_TOWARD_LIMIT and quota_applies(user_id) and quota_used_bytes(user_id) >= daily_limit_bytes(user_id):
+            raise LinkRefused(quota_refusal_text(user_id, 0), stop_batch=True)
+
+        Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix=f"link_{batch['id']}_{index}_", dir=TEMP_DIR))
+
+        got_slot = await _acquire_slot_cancellable(
+            batch, post_status, user_priority(user_id), user_plan_label(user_id),
+        )
+
+        if not got_slot or batch["cancelled"]:
+            raise DownloadCancelled()
+
+        slot_held = True
+        await post_status(MSG_LINK_CHECKING)
+
+        cap = download_size_cap(user_id)
+        progress = {"done": 0, "total": None, "base": 0, "finished": 0, "streams": 1}
+
+        def hook(data: dict) -> None:
+            # Runs inside yt-dlp's download thread.
+            if batch["cancelled"]:
+                raise DownloadCancelled()
+
+            if data.get("status") == "downloading":
+                progress["done"] = int(data.get("downloaded_bytes") or 0)
+                progress["total"] = data.get("total_bytes") or data.get("total_bytes_estimate")
+            elif data.get("status") == "finished":
+                progress["base"] += int(data.get("total_bytes") or data.get("downloaded_bytes") or 0)
+                progress["done"] = 0
+                progress["total"] = None
+                progress["finished"] += 1
+
+        options = _ytdlp_options(work_dir, build_download_format(DOWNLOAD_MAX_HEIGHT, cap), hook)
+
+        # ---- look at the video first (cheap) so a hopeless one is refused before downloading ----
+        info = await asyncio.to_thread(_ytdlp_probe, url, options)
+
+        if batch["cancelled"]:
+            raise DownloadCancelled()
+
+        if info.get("_type") in ("playlist", "multi_video") or info.get("entries"):
+            raise LinkRefused(MSG_LINK_PLAYLIST)
+
+        if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
+            raise LinkRefused(MSG_LINK_LIVE)
+
+        title = (info.get("title") or "").strip()[:150]
+        length = info.get("duration")
+
+        if DOWNLOAD_MAX_MINUTES > 0 and length and length > DOWNLOAD_MAX_MINUTES * 60:
+            raise LinkRefused(MSG_LINK_TOO_LONG.format(
+                length=format_duration(length), max=format_duration(DOWNLOAD_MAX_MINUTES * 60),
+            ))
+
+        estimate = estimate_download_bytes(info)
+        progress["streams"] = len(info.get("requested_formats") or [info])
+
+        if estimate:
+            if estimate > TELEGRAM_UPLOAD_LIMIT_BYTES:
+                raise LinkRefused(MSG_LINK_TOO_BIG.format(
+                    size=format_size(estimate), limit=format_size(TELEGRAM_UPLOAD_LIMIT_BYTES),
+                ))
+
+            if file_too_large(user_id, estimate):
+                raise LinkRefused(file_too_large_text(user_id, estimate))
+
+            if DOWNLOAD_COUNTS_TOWARD_LIMIT and not quota_allows(user_id, estimate):
+                raise LinkRefused(quota_refusal_text(user_id, estimate))
+
+        # ---- download (progress message refreshed every few seconds) ----
+        def progress_text() -> str:
+            name = title or MSG_LINK_CHECKING
+
+            if progress["finished"] >= progress["streams"]:
+                return MSG_LINK_FINISHING.format(title=name)
+
+            done = progress["base"] + progress["done"]
+            expected = estimate or (progress["base"] + progress["total"] if progress["total"] else None)
+
+            if expected:
+                percent = min(99.0, done / expected * 100)
+                return MSG_LINK_DOWNLOADING.format(
+                    title=name, bar=render_progress_bar(percent), done=format_size(done), total=format_size(expected),
+                )
+
+            return MSG_LINK_DOWNLOADING_UNKNOWN.format(title=name, done=format_size(done))
+
+        async def refresh_status() -> None:
+            while True:
+                await asyncio.sleep(3)
+                with contextlib.suppress(Exception):
+                    await post_status(progress_text())
+
+        await post_status(progress_text())
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+        refresher = asyncio.create_task(refresh_status())
+
+        try:
+            await asyncio.to_thread(_ytdlp_download, url, options)
+        finally:
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await refresher
+
+        if batch["cancelled"]:
+            raise DownloadCancelled()
+
+        candidates = [
+            path for path in work_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in _VIDEO_SUFFIXES and path.stat().st_size > 0
+        ]
+
+        if not candidates:
+            raise LinkRefused(MSG_LINK_EMPTY)
+
+        video_path = max(candidates, key=lambda path: path.stat().st_size)
+
+        # Rewrite as MP4 with the index at the front (no re-encoding): plays while it downloads in Telegram.
+        await post_status(MSG_LINK_FINISHING.format(title=title))
+        final_path = work_dir / "final.mp4"
+        code, _, _ = await run_command([
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-c", "copy", "-movflags", "+faststart", str(final_path),
+        ])
+
+        if code == 0 and final_path.exists() and final_path.stat().st_size > 0:
+            video_path.unlink(missing_ok=True)
+            video_path = final_path
+        else:
+            final_path.unlink(missing_ok=True)
+
+        size = video_path.stat().st_size
+
+        if size > TELEGRAM_UPLOAD_LIMIT_BYTES:
+            raise LinkRefused(MSG_LINK_TOO_BIG.format(
+                size=format_size(size), limit=format_size(TELEGRAM_UPLOAD_LIMIT_BYTES),
+            ))
+
+        if file_too_large(user_id, size):
+            raise LinkRefused(file_too_large_text(user_id, size))
+
+        if DOWNLOAD_COUNTS_TOWARD_LIMIT:
+            if not quota_allows(user_id, size):
+                raise LinkRefused(quota_refusal_text(user_id, size))
+
+            quota_consume(user_id, size)
+            charged = size
+
+        # ---- send ----
+        await post_status(MSG_LINK_SENDING.format(title=title), markup=None)
+
+        duration = await get_duration(str(video_path)) or length
+        width, height = await get_video_dimensions(str(video_path))
+        thumb_path = work_dir / "thumb.jpg"
+        has_thumb = await generate_thumbnail(str(video_path), str(thumb_path), duration)
+
+        caption = f"🎬 {title}\n🔗 {url}" if title else f"🔗 {url}"
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+
+        await send_video_with_cover(
+            context.bot,
+            None,
+            chat_id=chat_id,
+            video=str(video_path),
+            supports_streaming=True,
+            width=width,
+            height=height,
+            duration=round(duration) if duration else None,
+            thumbnail=str(thumb_path) if has_thumb else None,
+            caption=caption[:1024],
+        )
+
+        charged = 0   # delivered: keep the charge
+        with contextlib.suppress(Exception):
+            if status_message is not None:
+                await status_message.delete()
+
+        return "ok"
+
+    except (DownloadCancelled, asyncio.CancelledError) as stop:
+        if isinstance(stop, asyncio.CancelledError) and not batch["cancelled"]:
+            raise   # the bot itself is shutting down
+
+        await show_final(MSG_LINK_CANCELLED)
+        return "cancelled"
+
+    except LinkRefused as refusal:
+        await show_final(refusal.text)
+        return "limit" if refusal.stop_batch else "refused"
+
+    except Exception as error:
+        if batch["cancelled"]:
+            await show_final(MSG_LINK_CANCELLED)
+            return "cancelled"
+
+        logger.exception("Error downloading %s:", url)
+        record_failure(user)
+        await show_final(MSG_LINK_FAILED.format(url=url, reason=describe_download_error(error)))
+        return "failed"
+
+    finally:
+        if charged:
+            quota_refund(user_id, charged)   # downloaded but never delivered: give the bytes back
+
+        if work_dir is not None:
+            cleanup_work_dir(work_dir)
+
+        if slot_held:
+            release_work_slot()
+
+
+async def handle_video_links(update: Update, context: ContextTypes.DEFAULT_TYPE, links: list[str]) -> None:
+    """Download every link of one message, one after the other, sending each video as it finishes."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    user = update.effective_user
+    user_id = user.id if user else None
+
+    try:
+        import yt_dlp  # noqa: F401  (only checking that it's installed)
+    except ImportError:
+        logger.error('Link downloads need yt-dlp: pip install -U "yt-dlp[default]"')
+        await message.reply_text(MSG_LINKS_NOT_SET_UP)
+        return
+
+    # /update mode: no NEW work (the admin is exempt).
+    if update_mode["on"] and not is_admin(user_id):
+        await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
+    skipped = max(0, len(links) - DOWNLOAD_MAX_LINKS)
+    links = links[:DOWNLOAD_MAX_LINKS]
+    total = len(links)
+
+    if total > 1 or skipped:
+        intro = MSG_LINKS_FOUND.format(count=total) if total > 1 else ""
+        if skipped:
+            intro += MSG_LINKS_TOO_MANY.format(max=DOWNLOAD_MAX_LINKS, skipped=skipped)
+        await message.reply_text(intro.strip())
+
+    # They moved on from any half-finished "send me the name / album" prompt.
+    awaiting_input.pop(chat_id, None)
+
+    batch_id = next(_download_batch_ids)
+    batch = {"id": batch_id, "owner_id": user_id, "cancelled": False, "acquire_task": None}
+    job_key = -(10 ** 9 + batch_id)   # negative and huge: can never clash with a message id
+    download_batches[batch_id] = batch
+    active_job_ids.add(job_key)
+
+    sent = 0
+
+    try:
+        for index, url in enumerate(links, start=1):
+            if batch["cancelled"]:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=MSG_LINKS_SKIPPED_CANCELLED.format(count=total - index + 1),
+                )
+                break
+
+            outcome = await process_video_link(context, chat_id, user, url, index, total, batch)
+
+            if outcome == "ok":
+                sent += 1
+            elif outcome == "cancelled":
+                if total - index > 0:
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=MSG_LINKS_SKIPPED_CANCELLED.format(count=total - index),
+                    )
+                break
+            elif outcome == "limit":
+                if total - index > 0:
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=MSG_LINKS_SKIPPED_LIMIT.format(count=total - index),
+                    )
+                break
+
+        else:
+            if total > 1:
+                await context.bot.send_message(chat_id=chat_id, text=MSG_LINKS_SUMMARY.format(ok=sent, total=total))
+    finally:
+        batch["cancelled"] = True   # nothing is waiting on this batch any more
+        download_batches.pop(batch_id, None)
+        active_job_ids.discard(job_key)
+        await maybe_notify_update_ready(context.bot)
+
+
+async def handle_download_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The "🛑 Cancel" button under a link download."""
+    query = update.callback_query
+
+    if query is None or not query.data:
+        return
+
+    parts = query.data.split(":")
+
+    try:
+        batch = download_batches.get(int(parts[2])) if len(parts) == 3 and parts[1] == "cancel" else None
+    except ValueError:
+        batch = None
+
+    if batch is None:
+        await query.answer(MSG_LINK_TOO_LATE)
+        return
+
+    clicker = query.from_user.id if query.from_user else None
+
+    if clicker != batch["owner_id"] and not is_admin(clicker):
+        await query.answer(MSG_NOT_YOUR_JOB, show_alert=True)
+        return
+
+    batch["cancelled"] = True
+    waiting = batch.get("acquire_task")
+
+    if waiting is not None and not waiting.done():
+        waiting.cancel()   # still in line: leave the queue right away
+
+    await query.answer(MSG_CANCELLING_JOB)
 
 
 # ============================================================
@@ -14143,6 +14795,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     # Must come BEFORE the general button handler: the first matching
     # handler wins, and access-request buttons have their own format.
+    application.add_handler(CallbackQueryHandler(handle_download_cancel, pattern=r"^dl:"))
     application.add_handler(CallbackQueryHandler(handle_access_decision, pattern=r"^access:"))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)
