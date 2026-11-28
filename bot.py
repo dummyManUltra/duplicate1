@@ -3,7 +3,10 @@ import sys
 import signal
 import json
 import asyncio
+import collections
+import hmac
 import logging
+import types
 import shutil
 import tempfile
 import time
@@ -120,6 +123,7 @@ MSG_HI_SEND_ME_A_VIDEO = (
     "4️⃣ Get your compressed file ✅\n"
     "\n"
     "🔗 Or paste YouTube / Facebook video links (several at once) and I'll send you the videos.\n"
+    "💬 Or forward videos to me on WhatsApp — link it with /whatsapp.\n"
     "\n"
     "💎 Subscriptions\n"
     "{plans}\n"
@@ -1165,6 +1169,7 @@ def build_database_zip() -> bytes:
         archive.writestr(REFERRALS_ENTRY_NAME, referrals_json_bytes())
         archive.writestr(EVENT_ENTRY_NAME, event_json_bytes())
         archive.writestr(PRICES_ENTRY_NAME, prices_json_bytes())
+        archive.writestr(WHATSAPP_ENTRY_NAME, whatsapp_json_bytes())
 
     return buffer.getvalue()
 
@@ -1174,7 +1179,7 @@ def database_fingerprint() -> str:
     return hashlib.sha256(
         approved_users_json_bytes() + b"|" + stats_json_bytes() + b"|" + quota_json_bytes()
         + b"|" + subscriptions_json_bytes() + b"|" + referrals_json_bytes() + b"|" + event_json_bytes()
-        + b"|" + prices_json_bytes()
+        + b"|" + prices_json_bytes() + b"|" + whatsapp_json_bytes()
     ).hexdigest()
 
 
@@ -1234,6 +1239,12 @@ def read_database_bytes(raw: bytes) -> int:
                     merge_prices_bytes(archive.read(PRICES_ENTRY_NAME))
                 except ValueError:
                     logger.warning("Database.zip has an unreadable %s — skipping the prices.", PRICES_ENTRY_NAME)
+
+            if WHATSAPP_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_whatsapp_bytes(archive.read(WHATSAPP_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the WhatsApp links.", WHATSAPP_ENTRY_NAME)
 
             return added
     except zipfile.BadZipFile as error:
@@ -1423,6 +1434,7 @@ async def post_init(application: Application) -> None:
         logger.info("Removed %d leftover item(s) from %s", swept, TEMP_DIR)
 
     await restore_from_pinned_backup(application.bot)
+    await whatsapp_start(application)      # after the restore, so linked numbers are known
     application.bot_data["backup_task"] = asyncio.create_task(backup_loop(application.bot))
     application.bot_data["idle_task"] = asyncio.create_task(idle_cleanup_loop(application.bot))
 
@@ -1436,6 +1448,8 @@ async def post_stop(application: Application) -> None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+    await whatsapp_stop()
 
     try:
         await asyncio.wait_for(backup_database_if_changed(application.bot), timeout=8)
@@ -11102,6 +11116,792 @@ async def handle_download_cancel(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ============================================================
+# WhatsApp bridge (official WhatsApp Cloud API)
+# ============================================================
+#
+# Forward (or send) a video to the bot's WhatsApp number and it lands in your Telegram chat:
+#   • "📤 Send as is"  -> the bot downloads it from WhatsApp and sends it to you on Telegram.
+#   • "🗜 Compress"    -> the bot downloads it and opens the normal compression menu in Telegram.
+#
+# How it works: the same Railway service that runs the Telegram bot also starts a small web server.
+# Meta (WhatsApp) calls it ("webhook") whenever someone messages the bot's WhatsApp number.
+#
+# One-time link: in Telegram send /whatsapp -> the bot shows a code -> send that code to the bot on
+# WhatsApp. From then on that WhatsApp number is tied to that Telegram account (kept in Database.zip).
+#
+# Variables to set in Railway (all of them are needed; without them WhatsApp stays switched off):
+#   WHATSAPP_TOKEN            permanent access token (Meta "system user" token)
+#   WHATSAPP_PHONE_NUMBER_ID  the "Phone number ID" shown in Meta's WhatsApp > API Setup page
+#   WHATSAPP_VERIFY_TOKEN     any secret text you invent; type the same text into Meta's webhook page
+#   WHATSAPP_APP_SECRET       Meta app > Settings > Basic > App secret (used to check calls really come from Meta)
+# Optional:
+#   WHATSAPP_BOT_NUMBER       the bot's WhatsApp number with country code, digits only (found automatically if empty)
+#   WHATSAPP_API_VERSION      Graph API version                     (default v25.0)
+#   WHATSAPP_WEBHOOK_PATH     path of the webhook                   (default /whatsapp/webhook)
+#   PORT                      the port to listen on (Railway sets this for you)
+
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
+WHATSAPP_BOT_NUMBER = re.sub(r"\D", "", os.getenv("WHATSAPP_BOT_NUMBER", ""))
+WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v25.0").strip() or "v25.0"
+WHATSAPP_WEBHOOK_PATH = os.getenv("WHATSAPP_WEBHOOK_PATH", "/whatsapp/webhook").strip() or "/whatsapp/webhook"
+WHATSAPP_PORT = int(os.getenv("PORT", "8080") or 8080)
+
+WHATSAPP_ENABLED = bool(WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID and WHATSAPP_VERIFY_TOKEN and WHATSAPP_APP_SECRET)
+WHATSAPP_GRAPH_URL = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}"
+WHATSAPP_ENTRY_NAME = "whatsapp_links.json"
+WHATSAPP_MAX_VIDEO_BYTES = 100 * 1024 * 1024        # WhatsApp's own limit for received files
+WHATSAPP_CODE_MINUTES = 10
+WHATSAPP_MAX_NUMBERS_PER_USER = 3
+WHATSAPP_MODES = ("ask", "send", "compress")
+
+# wa_id (the sender's phone number, digits only) -> {"telegram_id": int, "mode": "ask"|"send"|"compress", "linked_at": iso}
+whatsapp_links: dict[str, dict] = {}
+# code -> {"telegram_id": int, "expires": monotonic seconds}
+whatsapp_link_codes: dict[str, dict] = {}
+# wa_id -> [wrong tries, time the counting started]  (stops people guessing codes)
+_whatsapp_bad_codes: dict[str, list] = {}
+_whatsapp_hint_at: dict[str, float] = {}             # wa_id -> last time we sent the "how to link" help
+_whatsapp_seen_ids: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+_whatsapp_inflight: set[str] = set()                 # media ids being handled right now
+_whatsapp_tasks: set = set()                         # keeps background tasks alive
+_whatsapp_state: dict = {"client": None, "runner": None, "display_number": WHATSAPP_BOT_NUMBER}
+
+BTN_WA_UNLINK = "🗑 Unlink WhatsApp"
+MSG_WA_OFF = "💬 WhatsApp isn't set up on this bot yet."
+MSG_WA_CODE = (
+    "💬 Link your WhatsApp\n"
+    "\n"
+    "1️⃣ Tap this link (it opens WhatsApp with the code already typed):\n"
+    "{link}\n"
+    "\n"
+    "2️⃣ Press send. Or message {number} yourself with this code:\n"
+    "{code}\n"
+    "\n"
+    "⏳ The code works once, for {minutes} minutes.\n"
+    "\n"
+    "After that, forward any video to that WhatsApp chat and I'll send it to you here — as is or compressed."
+)
+MSG_WA_CODE_NO_NUMBER = (
+    "💬 Link your WhatsApp\n"
+    "\n"
+    "Send this code to the bot's WhatsApp number:\n"
+    "{code}\n"
+    "\n"
+    "⏳ The code works once, for {minutes} minutes.\n"
+    "\n"
+    "After that, forward any video to that WhatsApp chat and I'll send it to you here — as is or compressed."
+)
+MSG_WA_LINKED_LIST = "✅ Linked numbers: {numbers}\nDefault for new videos: {mode}\n\n"
+MSG_WA_UNLINKED = "🗑 Done — {count} WhatsApp number(s) unlinked."
+MSG_WA_NOW_LINKED_TG = "✅ WhatsApp number {number} is now linked.\nForward a video to the bot on WhatsApp and it will arrive here."
+MSG_WA_STATUS_START = "📥 Video from WhatsApp…"
+MSG_WA_STATUS_DOWNLOADING = "⬇️ Downloading your WhatsApp video ({size})…"
+MSG_WA_STATUS_SENDING = "📤 Sending…"
+MSG_WA_TG_FAILED = "❌ Couldn't get your WhatsApp video: {reason}"
+
+WA_HELP = (
+    "👋 This number is linked to your Telegram.\n"
+    "\n"
+    "🎬 Forward me a video and I'll send it to your Telegram chat — as is, or compressed.\n"
+    "\n"
+    "⚙️ What to do with new videos — reply with one word:\n"
+    "• ask — I ask every time\n"
+    "• send — always send as is\n"
+    "• compress — always open the compression menu\n"
+    "• unlink — disconnect this number\n"
+    "\n"
+    "Now: {mode}"
+)
+WA_NOT_LINKED = (
+    "👋 First link this number to your Telegram account:\n"
+    "1) Open the bot in Telegram and send /whatsapp\n"
+    "2) Send me the code it gives you here."
+)
+WA_LINKED_OK = "✅ Linked! Forward me a video and I'll send it to your Telegram.\nSend 'help' to see the options."
+WA_BAD_CODE = "❌ That code isn't valid (or it expired). Send /whatsapp in Telegram to get a new one."
+WA_TOO_MANY_TRIES = "⛔ Too many wrong codes. Try again in an hour."
+WA_OTHER_ACCOUNT = "⚠️ This number is already linked to another Telegram account. Send 'unlink' here first, then link again."
+WA_TOO_MANY_NUMBERS = "⚠️ That Telegram account already has {max} WhatsApp numbers linked. Unlink one first."
+WA_ASK_BODY = "🎬 Got your video. What should I do with it?"
+WA_BTN_SEND = "📤 Send as is"
+WA_BTN_COMPRESS = "🗜 Compress"
+WA_WORKING = "⏳ On it…"
+WA_DONE_SENT = "✅ Sent to your Telegram."
+WA_DONE_COMPRESS = "✅ Downloaded — pick the compression level in your Telegram chat."
+WA_FAILED = "❌ Couldn't do that: {reason}"
+WA_ALREADY = "⏳ I'm already working on that video."
+WA_ONLY_VIDEOS = "🎬 I only handle videos. Forward me a video (or send 'help')."
+WA_MODE_SET = "✅ Done — new videos: {mode}."
+WA_UNLINKED = "🗑 Unlinked. Send /whatsapp in Telegram if you want to link again."
+WA_TG_UNREACHABLE = "⚠️ I couldn't message you on Telegram. Open the bot there and press Start, then try again."
+WA_NOT_ALLOWED = "⛔ Your Telegram account isn't allowed to use the bot."
+WA_BUSY = "🛠 The bot is updating right now — try again in a few minutes."
+WA_TOO_BIG = "⛔ That video is too big for me ({size})."
+
+
+# ---------- saved data (Database.zip) ----------
+
+def whatsapp_json_bytes() -> bytes:
+    return json.dumps(whatsapp_links, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def merge_whatsapp_bytes(raw: bytes) -> int:
+    """Load linked numbers from a Database.zip. Returns how many were added. Raises ValueError if unusable."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"whatsapp links are not valid JSON ({error})") from error
+
+    if not isinstance(data, dict):
+        raise ValueError("not a whatsapp links file")
+
+    added = 0
+
+    for wa_id, entry in data.items():
+        if not isinstance(entry, dict) or not str(wa_id).isdigit():
+            continue
+
+        try:
+            telegram_id = int(entry.get("telegram_id"))
+        except (TypeError, ValueError):
+            continue
+
+        mode = entry.get("mode") if entry.get("mode") in WHATSAPP_MODES else "ask"
+
+        if str(wa_id) not in whatsapp_links:
+            added += 1
+
+        whatsapp_links[str(wa_id)] = {
+            "telegram_id": telegram_id,
+            "mode": mode,
+            "linked_at": str(entry.get("linked_at") or datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        }
+
+    return added
+
+
+def mask_whatsapp_number(wa_id: str) -> str:
+    return f"+{wa_id[:2]}•••{wa_id[-3:]}" if len(wa_id) > 6 else f"+{wa_id}"
+
+
+def whatsapp_numbers_of(telegram_id: int) -> list[str]:
+    return [wa_id for wa_id, entry in whatsapp_links.items() if entry.get("telegram_id") == telegram_id]
+
+
+def new_whatsapp_code(telegram_id: int) -> str:
+    """A fresh one-time code for this Telegram user (their older codes stop working)."""
+    for code, info in list(whatsapp_link_codes.items()):
+        if info["telegram_id"] == telegram_id or info["expires"] < time.monotonic():
+            whatsapp_link_codes.pop(code, None)
+
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+    while True:
+        code = "".join(secrets.choice(alphabet) for _ in range(8))
+        if any(ch.isdigit() for ch in code) and any(ch.isalpha() for ch in code):
+            break
+
+    whatsapp_link_codes[code] = {
+        "telegram_id": telegram_id,
+        "expires": time.monotonic() + WHATSAPP_CODE_MINUTES * 60,
+    }
+    return code
+
+
+# ---------- talking to WhatsApp ----------
+
+async def whatsapp_call(method: str, path: str, **kwargs):
+    """One Graph API call. Returns the parsed JSON, or None if it failed (the error is logged)."""
+    client = _whatsapp_state["client"]
+
+    if client is None:
+        return None
+
+    try:
+        response = await client.request(
+            method,
+            f"{WHATSAPP_GRAPH_URL}/{path}",
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            **kwargs,
+        )
+        if response.status_code >= 400:
+            logger.warning("WhatsApp API %s %s -> %s %s", method, path, response.status_code, response.text[:300])
+            return None
+        return response.json()
+    except Exception:
+        logger.exception("WhatsApp API call failed: %s %s", method, path)
+        return None
+
+
+async def whatsapp_send_text(wa_id: str, text: str, reply_to: str | None = None) -> None:
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": wa_id,
+        "type": "text",
+        "text": {"body": text[:4000], "preview_url": False},
+    }
+
+    if reply_to:
+        payload["context"] = {"message_id": reply_to}
+
+    await whatsapp_call("POST", f"{WHATSAPP_PHONE_NUMBER_ID}/messages", json=payload)
+
+
+async def whatsapp_send_choice(wa_id: str, media_id: str, reply_to: str | None) -> None:
+    """The two buttons under a received video."""
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": wa_id,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": WA_ASK_BODY},
+            "action": {"buttons": [
+                {"type": "reply", "reply": {"id": f"send:{media_id}", "title": WA_BTN_SEND}},
+                {"type": "reply", "reply": {"id": f"comp:{media_id}", "title": WA_BTN_COMPRESS}},
+            ]},
+        },
+    }
+
+    if reply_to:
+        payload["context"] = {"message_id": reply_to}
+
+    await whatsapp_call("POST", f"{WHATSAPP_PHONE_NUMBER_ID}/messages", json=payload)
+
+
+async def whatsapp_lookup_bot_number() -> None:
+    """Find the bot's own WhatsApp number (for the wa.me link) unless WHATSAPP_BOT_NUMBER was set."""
+    if _whatsapp_state["display_number"]:
+        return
+
+    data = await whatsapp_call("GET", WHATSAPP_PHONE_NUMBER_ID, params={"fields": "display_phone_number"})
+    number = re.sub(r"\D", "", str((data or {}).get("display_phone_number") or ""))
+
+    if number:
+        _whatsapp_state["display_number"] = number
+    else:
+        logger.warning("Couldn't read the bot's WhatsApp number — set WHATSAPP_BOT_NUMBER to get one-tap links.")
+
+
+async def whatsapp_download_media(media_id: str, destination: Path) -> tuple[int, str | None]:
+    """Download a received WhatsApp file. Returns (size in bytes, mime type)."""
+    info = await whatsapp_call("GET", media_id)
+
+    if not info or not info.get("url"):
+        raise RuntimeError("WhatsApp no longer has that video (they keep it for 7 days).")
+
+    declared = int(info.get("file_size") or 0)
+
+    if declared > WHATSAPP_MAX_VIDEO_BYTES:
+        raise RuntimeError(WA_TOO_BIG.format(size=format_size(declared)))
+
+    client = _whatsapp_state["client"]
+    written = 0
+
+    async with client.stream(
+        "GET", info["url"], headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, follow_redirects=True,
+    ) as response:
+        if response.status_code >= 400:
+            raise RuntimeError(f"WhatsApp refused the download ({response.status_code}).")
+
+        with open(destination, "wb") as handle:
+            async for chunk in response.aiter_bytes(1024 * 256):
+                written += len(chunk)
+
+                if written > WHATSAPP_MAX_VIDEO_BYTES:
+                    raise RuntimeError(WA_TOO_BIG.format(size=">100 MB"))
+
+                handle.write(chunk)
+
+    if written == 0:
+        raise RuntimeError("The download was empty.")
+
+    return written, info.get("mime_type")
+
+
+# ---------- the video itself: WhatsApp -> Telegram ----------
+
+async def whatsapp_video_to_telegram(application, wa_id: str, media_id: str, action: str) -> None:
+    """action: "send" (as is) or "compress" (open the compression menu in Telegram)."""
+    bot = application.bot
+    link = whatsapp_links.get(wa_id)
+
+    if link is None:
+        await whatsapp_send_text(wa_id, WA_NOT_LINKED)
+        return
+
+    telegram_id = link["telegram_id"]
+    chat_id = telegram_id          # private chat: same number
+
+    if not is_allowed(telegram_id):
+        await whatsapp_send_text(wa_id, WA_NOT_ALLOWED)
+        return
+
+    if update_mode["on"] and not is_admin(telegram_id):
+        await whatsapp_send_text(wa_id, WA_BUSY)
+        return
+
+    if media_id in _whatsapp_inflight:
+        await whatsapp_send_text(wa_id, WA_ALREADY)
+        return
+
+    _whatsapp_inflight.add(media_id)
+    context = types.SimpleNamespace(
+        bot=bot, application=application, bot_data=application.bot_data, user_data={}, chat_data={},
+    )
+
+    status_message = None
+    work_dir: Path | None = None
+    slot_held = False
+    charged = 0
+    job_id: int | None = None
+    kept = False          # True once the compression menu owns the files
+
+    try:
+        await whatsapp_send_text(wa_id, WA_WORKING)
+
+        try:
+            status_message = await bot.send_message(chat_id=chat_id, text=MSG_WA_STATUS_START)
+        except Exception:
+            await whatsapp_send_text(wa_id, WA_TG_UNREACHABLE)
+            return
+
+        job_id = status_message.message_id
+        active_job_ids.add(job_id)
+
+        async def post_status(text: str) -> None:
+            await status_message.edit_text(text)
+
+        await acquire_work_slot(post_status, user_priority(telegram_id), user_plan_label(telegram_id))
+        slot_held = True
+
+        Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix=f"wa_{job_id}_", dir=TEMP_DIR))
+        input_path = work_dir / "input"
+
+        await post_status(MSG_WA_STATUS_DOWNLOADING.format(size="…"))
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+        size, _mime = await whatsapp_download_media(media_id, input_path)
+        await post_status(MSG_WA_STATUS_DOWNLOADING.format(size=format_size(size)))
+
+        duration = await get_duration(str(input_path))
+        record_received("video")
+
+        if action == "send":
+            await post_status(MSG_WA_STATUS_SENDING)
+            width, height = await get_video_dimensions(str(input_path))
+            thumb_path = work_dir / "thumb.jpg"
+            has_thumb = await generate_thumbnail(str(input_path), str(thumb_path), duration)
+
+            # Telegram wants a real extension to treat it as a video.
+            video_path = work_dir / "whatsapp_video.mp4"
+            input_path.rename(video_path)
+
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+            await send_video_with_cover(
+                bot,
+                None,
+                chat_id=chat_id,
+                video=str(video_path),
+                supports_streaming=True,
+                width=width,
+                height=height,
+                duration=round(duration) if duration else None,
+                thumbnail=str(thumb_path) if has_thumb else None,
+                caption="💬 From WhatsApp",
+            )
+
+            with contextlib.suppress(Exception):
+                await status_message.delete()
+
+            await whatsapp_send_text(wa_id, WA_DONE_SENT)
+            return
+
+        # ---- compress: same rules and the same menu as a video sent in Telegram ----
+        if file_too_large(telegram_id, size):
+            raise RuntimeError(re.sub(r"\s+", " ", file_too_large_text(telegram_id, size)))
+
+        if not quota_allows(telegram_id, size):
+            raise RuntimeError(re.sub(r"\s+", " ", quota_refusal_text(telegram_id, size)))
+
+        quota_consume(telegram_id, size)
+        charged = size
+
+        awaiting_input.pop(chat_id, None)
+        open_session_message_id = open_pdf_sessions.get(chat_id)
+
+        if open_session_message_id is not None:
+            clear_pending(open_session_message_id)
+
+        pending_entry = {
+            "input_path": input_path,
+            "work_dir": work_dir,
+            "original_size": size,
+            "filename": "whatsapp_video.mp4",
+            "chat_id": chat_id,
+            "duration": duration,
+            "estimates": {},
+            "media_type": "video",
+            "file_id": None,                 # a WhatsApp video has no Telegram file to merge from
+            "owner_id": telegram_id,
+            "charged_bytes": charged,
+        }
+        await notify_evicted(bot, remember_pending(job_id, pending_entry))
+        kept = True
+
+        await analyze_and_show_level_menu(
+            context,
+            status_message=status_message,
+            chat_id=chat_id,
+            message_id=job_id,
+            input_path=input_path,
+            duration=duration,
+            work_dir=work_dir,
+            original_size=size,
+            pending=pending_entry,
+        )
+
+        await whatsapp_send_text(wa_id, WA_DONE_COMPRESS)
+
+    except Exception as error:
+        logger.exception("WhatsApp video %s failed:", media_id)
+        reason = str(error)[:200] or type(error).__name__
+
+        if charged:
+            quota_refund(telegram_id, charged)   # nothing came of it: give the bytes back
+
+        if kept:
+            pending_compressions.pop(job_id, None)
+            kept = False                          # the files are ours to delete again
+
+        stats["totals"]["failed"] += 1
+
+        with contextlib.suppress(Exception):
+            if status_message is not None:
+                await status_message.edit_text(MSG_WA_TG_FAILED.format(reason=reason))
+
+        await whatsapp_send_text(wa_id, WA_FAILED.format(reason=reason))
+
+    finally:
+        # Only the compression menu (kept=True) keeps its files, until the person uses it.
+        if work_dir is not None and not kept:
+            cleanup_work_dir(work_dir)
+
+        _whatsapp_inflight.discard(media_id)
+
+        if slot_held:
+            release_work_slot()
+
+        if job_id is not None:
+            active_job_ids.discard(job_id)
+
+        await maybe_notify_update_ready(bot)
+
+
+# ---------- messages arriving from WhatsApp ----------
+
+async def whatsapp_handle_text(application, wa_id: str, text: str, wamid: str | None) -> None:
+    body = (text or "").strip()
+    link = whatsapp_links.get(wa_id)
+
+    # ---- not linked yet: the only thing that works is a link code ----
+    if link is None:
+        match = re.search(r"\b(?=[A-Z0-9]*\d)([A-Z0-9]{8})\b", body.upper())
+        tries = _whatsapp_bad_codes.get(wa_id)
+
+        if tries and time.monotonic() - tries[1] > 3600:
+            _whatsapp_bad_codes.pop(wa_id, None)
+            tries = None
+
+        if tries and tries[0] >= 5:
+            await whatsapp_send_text(wa_id, WA_TOO_MANY_TRIES)
+            return
+
+        info = whatsapp_link_codes.get(match.group(1)) if match else None
+
+        if info is None or info["expires"] < time.monotonic():
+            if match:
+                tries = _whatsapp_bad_codes.setdefault(wa_id, [0, time.monotonic()])
+                tries[0] += 1
+                await whatsapp_send_text(wa_id, WA_BAD_CODE)
+            else:
+                last_hint = _whatsapp_hint_at.get(wa_id)
+
+                if last_hint is None or time.monotonic() - last_hint > 600:
+                    _whatsapp_hint_at[wa_id] = time.monotonic()
+                    await whatsapp_send_text(wa_id, WA_NOT_LINKED)
+            return
+
+        telegram_id = info["telegram_id"]
+
+        if len(whatsapp_numbers_of(telegram_id)) >= WHATSAPP_MAX_NUMBERS_PER_USER:
+            await whatsapp_send_text(wa_id, WA_TOO_MANY_NUMBERS.format(max=WHATSAPP_MAX_NUMBERS_PER_USER))
+            return
+
+        whatsapp_link_codes.pop(match.group(1), None)
+        _whatsapp_bad_codes.pop(wa_id, None)
+        whatsapp_links[wa_id] = {
+            "telegram_id": telegram_id,
+            "mode": "ask",
+            "linked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        await whatsapp_send_text(wa_id, WA_LINKED_OK)
+
+        with contextlib.suppress(Exception):
+            await application.bot.send_message(
+                chat_id=telegram_id, text=MSG_WA_NOW_LINKED_TG.format(number=mask_whatsapp_number(wa_id)),
+            )
+
+        await backup_database_if_changed(application.bot)
+        return
+
+    # ---- linked: one-word commands ----
+    word = body.lower().strip(" .!/")
+
+    if word in WHATSAPP_MODES:
+        link["mode"] = word
+        await whatsapp_send_text(wa_id, WA_MODE_SET.format(mode=word))
+        return
+
+    if word == "unlink":
+        whatsapp_links.pop(wa_id, None)
+        await whatsapp_send_text(wa_id, WA_UNLINKED)
+        return
+
+    await whatsapp_send_text(wa_id, WA_HELP.format(mode=link.get("mode", "ask")))
+
+
+async def whatsapp_handle_message(application, message: dict) -> None:
+    wa_id = re.sub(r"\D", "", str(message.get("from") or ""))
+    wamid = message.get("id")
+    kind = message.get("type")
+
+    if not wa_id:
+        return
+
+    try:
+        if kind == "text":
+            await whatsapp_handle_text(application, wa_id, (message.get("text") or {}).get("body", ""), wamid)
+            return
+
+        link = whatsapp_links.get(wa_id)
+
+        if link is None:
+            await whatsapp_handle_text(application, wa_id, "", wamid)      # shows the "how to link" help
+            return
+
+        if kind == "video" or (kind == "document" and str((message.get("document") or {}).get("mime_type", "")).startswith("video/")):
+            media = message.get("video") or message.get("document") or {}
+            media_id = str(media.get("id") or "")
+
+            if not media_id.isdigit():
+                return
+
+            mode = link.get("mode", "ask")
+
+            if mode == "send":
+                await whatsapp_video_to_telegram(application, wa_id, media_id, "send")
+            elif mode == "compress":
+                await whatsapp_video_to_telegram(application, wa_id, media_id, "compress")
+            else:
+                await whatsapp_send_choice(wa_id, media_id, wamid)
+
+            return
+
+        if kind == "interactive":
+            reply = (message.get("interactive") or {}).get("button_reply") or {}
+            action, _, media_id = str(reply.get("id") or "").partition(":")
+
+            if action in ("send", "comp") and media_id.isdigit():
+                await whatsapp_video_to_telegram(application, wa_id, media_id, "send" if action == "send" else "compress")
+            return
+
+        await whatsapp_send_text(wa_id, WA_ONLY_VIDEOS)
+    except Exception:
+        logger.exception("Error handling a WhatsApp message from %s", mask_whatsapp_number(wa_id))
+
+
+def whatsapp_signature_ok(raw_body: bytes, header: str | None) -> bool:
+    if not header or not header.startswith("sha256="):
+        return False
+
+    expected = hmac.new(WHATSAPP_APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header[len("sha256="):])
+
+
+async def whatsapp_webhook_verify(request):
+    """Meta calls this once, when you press "Verify and save" on the webhook page."""
+    from aiohttp import web
+
+    params = request.query
+
+    if (
+        params.get("hub.mode") == "subscribe"
+        and hmac.compare_digest(params.get("hub.verify_token", ""), WHATSAPP_VERIFY_TOKEN)
+    ):
+        return web.Response(text=params.get("hub.challenge", ""))
+
+    return web.Response(status=403, text="forbidden")
+
+
+async def whatsapp_webhook_receive(request):
+    """Meta calls this for every message sent to the bot's WhatsApp number."""
+    from aiohttp import web
+
+    raw = await request.read()
+
+    if not whatsapp_signature_ok(raw, request.headers.get("X-Hub-Signature-256")):
+        logger.warning("WhatsApp webhook call rejected: bad signature (is WHATSAPP_APP_SECRET right?)")
+        return web.Response(status=403, text="bad signature")
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return web.Response(status=400, text="bad json")
+
+    application = request.app["telegram_application"]
+
+    for entry in data.get("entry", []) or []:
+        for change in entry.get("changes", []) or []:
+            value = change.get("value") or {}
+
+            if (value.get("metadata") or {}).get("phone_number_id") not in (None, WHATSAPP_PHONE_NUMBER_ID):
+                continue
+
+            for message in value.get("messages", []) or []:
+                message_id = message.get("id")
+
+                # Meta repeats a call if we answer slowly: handle every message once.
+                if message_id in _whatsapp_seen_ids:
+                    continue
+
+                if message_id:
+                    _whatsapp_seen_ids[message_id] = None
+                    while len(_whatsapp_seen_ids) > 1000:
+                        _whatsapp_seen_ids.popitem(last=False)
+
+                task = asyncio.create_task(whatsapp_handle_message(application, message))
+                _whatsapp_tasks.add(task)
+                task.add_done_callback(_whatsapp_tasks.discard)
+
+    return web.Response(text="ok")    # answer fast; the work continues in the background
+
+
+async def whatsapp_start(application) -> None:
+    """Start the web server (called when the bot starts, after the backup is restored)."""
+    if not WHATSAPP_ENABLED:
+        logger.info("WhatsApp is off (set WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_VERIFY_TOKEN, WHATSAPP_APP_SECRET to turn it on).")
+        return
+
+    try:
+        from aiohttp import web
+    except ImportError:
+        logger.error("WhatsApp needs aiohttp: add 'aiohttp' to requirements.txt")
+        return
+
+    import httpx
+
+    _whatsapp_state["client"] = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=600.0))
+
+    server = web.Application(client_max_size=4 * 1024 * 1024)
+    server["telegram_application"] = application
+    server.router.add_get(WHATSAPP_WEBHOOK_PATH, whatsapp_webhook_verify)
+    server.router.add_post(WHATSAPP_WEBHOOK_PATH, whatsapp_webhook_receive)
+
+    async def health(_request):
+        return web.Response(text="ok")
+
+    server.router.add_get("/", health)
+    server.router.add_get("/health", health)
+
+    runner = web.AppRunner(server)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", WHATSAPP_PORT).start()
+    _whatsapp_state["runner"] = runner
+
+    logger.info("WhatsApp webhook listening on port %s at %s", WHATSAPP_PORT, WHATSAPP_WEBHOOK_PATH)
+    await whatsapp_lookup_bot_number()
+
+
+async def whatsapp_stop() -> None:
+    runner = _whatsapp_state.pop("runner", None)
+    client = _whatsapp_state.get("client")
+    _whatsapp_state["runner"] = None
+    _whatsapp_state["client"] = None
+
+    if runner is not None:
+        with contextlib.suppress(Exception):
+            await runner.cleanup()
+
+    if client is not None:
+        with contextlib.suppress(Exception):
+            await client.aclose()
+
+
+# ---------- the Telegram side: /whatsapp ----------
+
+async def whatsapp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/whatsapp: show the one-time code that links a WhatsApp number to this Telegram account."""
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    if not is_allowed(user.id):
+        await reject_unauthorized(message, user.id)
+        return
+
+    if not WHATSAPP_ENABLED:
+        await message.reply_text(MSG_WA_OFF)
+        return
+
+    code = new_whatsapp_code(user.id)
+    number = _whatsapp_state["display_number"]
+    keyboard = None
+    intro = ""
+
+    numbers = whatsapp_numbers_of(user.id)
+
+    if numbers:
+        mode = whatsapp_links[numbers[0]].get("mode", "ask")
+        intro = MSG_WA_LINKED_LIST.format(numbers=", ".join(mask_whatsapp_number(n) for n in numbers), mode=mode)
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(BTN_WA_UNLINK, callback_data="wa:unlink")]])
+
+    if number:
+        text = MSG_WA_CODE.format(
+            link=f"https://wa.me/{number}?text={code}", number=f"+{number}", code=code, minutes=WHATSAPP_CODE_MINUTES,
+        )
+    else:
+        text = MSG_WA_CODE_NO_NUMBER.format(code=code, minutes=WHATSAPP_CODE_MINUTES)
+
+    await message.reply_text(intro + text, reply_markup=keyboard)
+
+
+async def handle_whatsapp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The "🗑 Unlink WhatsApp" button."""
+    query = update.callback_query
+
+    if query is None or query.from_user is None:
+        return
+
+    if query.data == "wa:unlink":
+        numbers = whatsapp_numbers_of(query.from_user.id)
+
+        for wa_id in numbers:
+            whatsapp_links.pop(wa_id, None)
+
+        await query.answer()
+        await query.message.reply_text(MSG_WA_UNLINKED.format(count=len(numbers)))
+        return
+
+    await query.answer()
+
+
+# ============================================================
 # PDF files: merge / compress / rename + thumbnail
 # ============================================================
 #
@@ -11124,6 +11924,21 @@ PDF_COMPRESS_LEVELS: dict[str, tuple[str, str, str]] = {
     "balanced": ("🟡 Balanced", "/ebook", "good quality, much smaller"),
     "strong": ("🔴 Strong", "/screen", "smallest file, images get soft"),
 }
+
+# ---- "Screenshots" (flatten) ----
+# Every page is rendered to a picture (ghostscript) and the pictures are put back together
+# as a new PDF (img2pdf). The result has NO selectable text, links or bookmarks —
+# each page is just an image. JPEGs are embedded as they are (no second re-encode).
+# key -> (button label, render DPI, JPEG quality 1-100, short description)
+PDF_FLATTEN_LEVELS: dict[str, tuple[str, int, int, str]] = {
+    "sharp": ("💎 Sharp", 200, 90, "best quality, biggest file"),
+    "good": ("🟢 Good", 150, 80, "clear text, a good size"),
+    "small": ("🟡 Small", 110, 65, "readable, much smaller"),
+    "tiny": ("🔴 Tiny", 80, 50, "smallest file, text gets soft"),
+}
+PDF_FLATTEN_MAX_PAGES = int(os.getenv("PDF_FLATTEN_MAX_PAGES", "400"))
+PDFX_FLATTEN_BUTTON = "🖼 Screenshots (images only, no text)"
+PDFX_FLATTEN_DETAIL = "every page becomes a picture — text can't be selected or searched anymore"
 
 # ---- "Delete duplicate pages" ----
 # Pages are rendered to small pictures (ghostscript), compared the same way as the
@@ -11276,7 +12091,27 @@ def pdf_screen(session: dict) -> tuple[str, InlineKeyboardMarkup]:
             [InlineKeyboardButton(label, callback_data=f"pdfx:c_{key}:{sid}")]
             for key, (label, _preset, _detail) in PDF_COMPRESS_LEVELS.items()
         ]
+        rows.append([InlineKeyboardButton(PDFX_FLATTEN_BUTTON, callback_data=f"pdfx:flatmenu:{sid}")])
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"pdfx:menu:{sid}")])
+        text += f"\n\n{PDFX_FLATTEN_BUTTON} — {PDFX_FLATTEN_DETAIL}"
+        return text, InlineKeyboardMarkup(rows)
+
+    if mode == "flatten":
+        lines = [
+            f"{PDFX_FLATTEN_BUTTON}",
+            PDFX_FLATTEN_DETAIL.capitalize() + ".",
+            "",
+            "Pick the picture quality:",
+            "",
+        ]
+        for label, dpi, quality, detail in PDF_FLATTEN_LEVELS.values():
+            lines.append(f"{label} — {detail}")
+        text = "\n".join(lines) + "\n\n" + pdf_list_text(session)
+        rows = [
+            [InlineKeyboardButton(label, callback_data=f"pdfx:f_{key}:{sid}")]
+            for key, (label, _dpi, _quality, _detail) in PDF_FLATTEN_LEVELS.items()
+        ]
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"pdfx:compress:{sid}")])
         return text, InlineKeyboardMarkup(rows)
 
     if mode == "name":
@@ -11473,6 +12308,58 @@ def pdf_page_ranges(numbers: list[int]) -> str:
     return ",".join(ranges)
 
 
+async def flatten_pdf_to_images(
+    source: Path,
+    output: Path,
+    work_dir: Path,
+    dpi: int,
+    quality: int,
+) -> int:
+    """
+    Screenshot every page of `source` and combine the screenshots into `output`.
+    Page sizes are kept (same physical size as the original). Returns the page count.
+    Raises RuntimeError with a short, user-readable reason.
+    """
+    pages_dir = work_dir / "flat_pages"
+    shutil.rmtree(pages_dir, ignore_errors=True)
+    pages_dir.mkdir(parents=True)
+
+    try:
+        returncode, stderr = await run_tool(
+            [
+                "gs", "-dNOPAUSE", "-dBATCH", "-dQUIET", "-dSAFER",
+                "-sDEVICE=jpeg", f"-dJPEGQ={quality}", f"-r{dpi}",
+                "-dTextAlphaBits=4", "-dGraphicsAlphaBits=4",
+                f"-dLastPage={PDF_FLATTEN_MAX_PAGES + 1}",
+                f"-sOutputFile={pages_dir}/page_%04d.jpg", str(source),
+            ],
+            PDF_JOB_TIMEOUT,
+        )
+        pages = sorted(pages_dir.glob("page_*.jpg"))
+
+        if returncode != 0 or not pages:
+            raise RuntimeError(f"couldn't read the pages ({pdf_short_error(stderr)})")
+
+        if len(pages) > PDF_FLATTEN_MAX_PAGES:
+            raise RuntimeError(f"it has more than {PDF_FLATTEN_MAX_PAGES} pages, which is too many for this option")
+
+        # Pixels / DPI = the page's size in inches, so every page keeps its original size.
+        layout = img2pdf.get_fixed_dpi_layout_fun((dpi, dpi))
+
+        def build() -> None:
+            with open(output, "wb") as handle:
+                img2pdf.convert([str(path) for path in pages], layout_fun=layout, outputstream=handle)
+
+        await asyncio.to_thread(build)
+
+        if not output.exists():
+            raise RuntimeError("couldn't build the new PDF")
+
+        return len(pages)
+    finally:
+        shutil.rmtree(pages_dir, ignore_errors=True)
+
+
 async def dedup_pdf_pages(
     source: Path,
     output: Path,
@@ -11584,7 +12471,7 @@ async def run_pdf_job(
     action: str,
     level: str | None = None,
 ) -> None:
-    """action: 'merge' | 'compress' | 'dedup' | 'send'. Runs in the shared work slot, one file at a time."""
+    """action: 'merge' | 'compress' | 'flatten' | 'dedup' | 'send'. Runs in the shared work slot, one file at a time."""
     bot = context.bot
     owner_id = session["user_id"]
     session["running"] = True
@@ -11643,6 +12530,9 @@ async def run_pdf_job(
             if action == "compress" and not shutil.which("gs"):
                 raise RuntimeError(PDFX_NEED_GS)
 
+            if action == "flatten" and not shutil.which("gs"):
+                raise RuntimeError(PDFX_NEED_GS)
+
             if action == "dedup" and not (shutil.which("gs") and shutil.which("qpdf")):
                 raise RuntimeError(PDFX_NEED_DEDUP_TOOLS)
 
@@ -11694,6 +12584,21 @@ async def run_pdf_job(
                             caption += PDFX_DEDUP_NO_OCR_NOTE
                         send_path = output
                         filename = pdf_output_name(session, entry, " (no duplicates)", number, total)
+                    elif action == "flatten":
+                        flat_label, flat_dpi, flat_quality, _flat_detail = PDF_FLATTEN_LEVELS[level]
+                        await status(
+                            f"🖼 Taking screenshots of the pages of {number}/{total} "
+                            f"({flat_label.split(' ', 1)[1]})… this can take a few minutes"
+                        )
+                        page_count = await flatten_pdf_to_images(source, output, work_dir, flat_dpi, flat_quality)
+                        new_size = output.stat().st_size
+                        # The person asked for an image-only PDF, so it is sent even if it is bigger.
+                        caption = (
+                            f"🖼 {page_count} page{'s' if page_count != 1 else ''} as pictures · "
+                            f"{format_size(original_size)} → {format_size(new_size)}"
+                        )
+                        send_path = output
+                        filename = pdf_output_name(session, entry, " (images)", number, total)
                     elif action == "compress":
                         label, preset, _detail = PDF_COMPRESS_LEVELS[level]
                         await status(f"🗜 Compressing {number}/{total} ({label.split(' ', 1)[1]})… this can take a minute")
@@ -11845,6 +12750,10 @@ async def handle_pdf_callback(query, context: ContextTypes.DEFAULT_TYPE, user_id
         await run_pdf_job(context, chat_id, session, "merge")
     elif command == "dedup":
         await run_pdf_job(context, chat_id, session, "dedup")
+    elif command == "flatmenu":
+        await pdf_render(bot, chat_id, session, "flatten")
+    elif command.startswith("f_") and command[2:] in PDF_FLATTEN_LEVELS:
+        await run_pdf_job(context, chat_id, session, "flatten", command[2:])
     elif command == "sendnow":
         await run_pdf_job(context, chat_id, session, "send")
     elif command.startswith("c_") and command[2:] in PDF_COMPRESS_LEVELS:
@@ -14751,6 +15660,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("setlevel", setlevel))
     application.add_handler(CommandHandler("merge", merge_command))
+    application.add_handler(CommandHandler("whatsapp", whatsapp_command))
     application.add_handler(CommandHandler("mergeaudio", mergeaudio_command))
     application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("ram", ram_command))
@@ -14796,6 +15706,7 @@ def main() -> None:
     # Must come BEFORE the general button handler: the first matching
     # handler wins, and access-request buttons have their own format.
     application.add_handler(CallbackQueryHandler(handle_download_cancel, pattern=r"^dl:"))
+    application.add_handler(CallbackQueryHandler(handle_whatsapp_callback, pattern=r"^wa:"))
     application.add_handler(CallbackQueryHandler(handle_access_decision, pattern=r"^access:"))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)
